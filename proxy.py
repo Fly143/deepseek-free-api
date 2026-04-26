@@ -1,0 +1,1056 @@
+"""
+DeepSeek 网页 → API 代理（纯 HTTP 转发，无浏览器依赖）
+用法: python proxy.py → 打开 http://localhost:8000/admin → 粘贴 cURL → 保存 → 用
+"""
+import json, os, shlex, time, uuid, webbrowser, base64, re, secrets
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from curl_cffi import requests as cffi_requests
+
+# ── 工具调用处理模块 ─────────────────────────────────
+from tool_call import (
+    build_tool_prompt,
+    extract_tool_call,
+    get_tool_names,
+    convert_messages_for_deepseek,
+)
+
+# ── PoW (Proof of Work) Solver — 纯 Python 实现（无 WASM 依赖）────────
+from pow_native import DeepSeekPOW
+
+# Initialize PoW solver
+pow_solver = DeepSeekPOW()
+
+BASE_DIR = Path(__file__).parent
+CONFIG_FILE = BASE_DIR / "token.json"
+PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
+
+# ── cURL 解析 ──────────────────────────────────────────
+def parse_curl(curl: str) -> dict:
+    try:
+        tokens = shlex.split(curl)
+    except ValueError:
+        tokens = curl.replace("\\\n", " ").split()
+    out = {"url": "", "headers": {}, "body": ""}
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "curl": i += 1; continue
+        if t in ("-H", "--header") and i + 1 < len(tokens):
+            line = tokens[i + 1]
+            if ":" in line:
+                k, _, v = line.partition(":")
+                out["headers"][k.strip().lower()] = v.strip()
+            i += 2
+        elif t in ("--data-raw", "--data", "--data-binary", "-d") and i + 1 < len(tokens):
+            out["body"] = tokens[i + 1]; i += 2
+        elif t in ("-X", "--request"): i += 2 if i + 1 < len(tokens) else 1
+        elif t.startswith("-"): i += 1
+        else: out["url"] = t; i += 1
+    return out
+
+
+def build_config(parsed: dict) -> dict:
+    h = parsed["headers"]
+    token = ""
+    ah = h.get("authorization", "")
+    if ah.startswith("Bearer "): token = ah[7:]
+
+    session_id = ""
+    for src in [parsed.get("url", ""), parsed.get("body", "")]:
+        m = re.search(r"[sS]ession[_-]?[iI]d[=:\"]+([a-f0-9-]{36})", src)
+        if m: session_id = m.group(1); break
+    ref = h.get("referer", "")
+    m = re.search(r"/a/chat/s/([a-f0-9-]+)", ref)
+    if m: session_id = m.group(1)
+
+    return {
+        "token": token,
+        "session_id": session_id,
+        "headers": h,
+        "cookie": h.get("cookie", ""),
+        "url": parsed.get("url", ""),
+    }
+
+
+app = FastAPI(title="DeepSeek Proxy")
+
+
+@app.on_event("startup")
+async def startup_discover():
+    """启动时自动刷新模型列表。"""
+    print("[启动] 探测模型列表...")
+    _discover_models()
+
+# ── 管理页面 ─────────────────────────────────────────────
+ADMIN = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>DeepSeek Proxy</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;justify-content:center;align-items:flex-start;padding-top:40px}
+.c{background:#1e293b;border-radius:16px;padding:32px;width:600px;max-width:95vw;border:1px solid #334155}
+h1{font-size:22px;margin-bottom:20px}
+.s{display:flex;align-items:center;gap:8px;padding:12px 16px;border-radius:10px;margin-bottom:20px;font-size:14px}
+.ok{background:#064e3b;color:#6ee7b7}.no{background:#1e293b;color:#94a3b8}.err{background:#450a0a;color:#fca5a5}
+.d{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dg{background:#22c55e}.dy{background:#64748b}.dr{background:#ef4444}
+.step{margin-bottom:18px}.sl{font-size:13px;color:#94a3b8;margin-bottom:6px}
+.btn{padding:10px 20px;border-radius:8px;border:none;cursor:pointer;font-size:14px;font-weight:500}
+.bp{background:#2563eb;color:#fff;width:100%}.bp:hover{background:#1d4ed8}
+.bp:disabled{background:#1e3a5f;color:#64748b;cursor:not-allowed}
+input[type=text],input[type=password],input[type=tel],input[type=email]{width:100%;padding:12px 14px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;font-size:14px;font-family:inherit}
+input:focus{outline:none;border-color:#3b82f6}
+.row{display:flex;gap:12px;margin-bottom:14px}
+.row .ac{width:90px;flex-shrink:0}
+.row .ph{flex:1}
+.pw-row{margin-bottom:14px}
+.pw-row input{width:100%}
+.tab-bar{display:flex;gap:0;margin-bottom:16px;border-radius:8px;overflow:hidden;border:1px solid #334155}
+.tab{flex:1;padding:10px;text-align:center;font-size:13px;cursor:pointer;background:#0f172a;color:#94a3b8;transition:all .2s}
+.tab.active{background:#2563eb;color:#fff}
+.tab:hover:not(.active){background:#1e293b}
+.panel{display:none}.panel.active{display:block}
+hr{border:none;border-top:1px solid #334155;margin:24px 0}
+.cfg{background:#0f172a;border-radius:10px;padding:16px}
+.cr{display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:13px}
+.cr code{background:#1e293b;padding:2px 8px;border-radius:4px;font-size:13px;color:#7dd3fc;cursor:pointer}
+.info{font-size:12px;color:#94a3b8;margin-top:8px;padding:8px 12px;background:#0f172a;border-radius:8px;border-left:3px solid #3b82f6;display:none}
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:14px;z-index:999;display:none}
+.ts{display:block;background:#064e3b;color:#6ee7b7}.te{display:block;background:#7f1d1d;color:#fca5a5}
+a{color:#7dd3fc}
+.collapse{cursor:pointer;user-select:none;color:#64748b;font-size:12px;margin-top:8px}
+.collapse:hover{color:#94a3b8}
+.curl-box{display:none;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="c">
+<h1>DeepSeek Proxy</h1>
+<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st">等待配置</span></div>
+
+<div class="tab-bar">
+<div class="tab active" onclick="switchTab('phone')">手机号登录</div>
+<div class="tab" onclick="switchTab('email')">邮箱登录</div>
+</div>
+
+<div id="phonePanel" class="panel active">
+<div class="row">
+<input class="ac" type="tel" id="area_code" value="+86" placeholder="+86">
+<input class="ph" type="tel" id="mobile" placeholder="手机号" autocomplete="tel">
+</div>
+<div class="pw-row"><input type="password" id="pw1" placeholder="密码" autocomplete="current-password"></div>
+<button class="btn bp" id="btn1" onclick="doLogin('phone')">登录</button>
+</div>
+
+<div id="emailPanel" class="panel">
+<div class="pw-row"><input type="email" id="email" placeholder="邮箱地址" autocomplete="email"></div>
+<div class="pw-row"><input type="password" id="pw2" placeholder="密码" autocomplete="current-password"></div>
+<button class="btn bp" id="btn2" onclick="doLogin('email')">登录</button>
+</div>
+
+<div class="info" id="info"></div>
+
+<div class="collapse" onclick="toggleCurl()">高级: 手动粘贴 cURL ▾</div>
+<div class="curl-box" id="curlBox">
+<textarea id="curl" placeholder="粘贴 cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px"></textarea>
+<button class="btn bp" id="btn3" onclick="saveCurl()" style="margin-top:8px">保存 cURL</button>
+</div>
+
+<hr>
+<div class="step">
+<div class="sl" style="font-weight:600;color:#e2e8f0;">API 配置</div>
+<div class="cfg">
+<div class="cr"><span>API 地址</span><code onclick="cp(this)">http://localhost:""" + str(PROXY_PORT) + """/v1</code></div>
+<div class="cr"><span>API Key</span><code onclick="cp(this)">任意填写</code></div>
+
+</div>
+</div>
+<div class="step" style="margin-top:16px">
+<button class="btn" style="background:#334155;color:#e2e8f0;width:100%;font-size:13px" onclick="refreshModels()" id="refreshBtn">🔄 刷新模型列表</button>
+<div id="modelsInfo" style="margin-top:8px;font-size:12px;color:#64748b;display:none"></div>
+</div>
+</div>
+<div id="toast" class="toast"></div>
+<script>
+function Q(id){return document.getElementById(id)}
+function switchTab(type){
+document.querySelectorAll('.tab').forEach((t,i)=>{t.className='tab'+(i===(type==='phone'?0:1)?' active':'')});
+Q('phonePanel').className='panel'+(type==='phone'?' active':'');
+Q('emailPanel').className='panel'+(type==='email'?' active':'');
+}
+async function cs(){
+try{const r=await fetch('/api/config');const d=await r.json()
+if(d.configured){Q('s').className='s ok';Q('sd').className='d dg';Q('st').textContent='已配置 | '+d.masked}
+else{Q('s').className='s no';Q('sd').className='d dy';Q('st').textContent=d.error||'等待配置'}
+}catch(e){Q('s').className='s err';Q('st').textContent='连接失败'}
+}
+async function doLogin(type){
+let body={}
+if(type==='phone'){
+const m=Q('mobile').value.trim();const p=Q('pw1').value;const a=Q('area_code').value.trim()
+if(!m||!p){t('请输入手机号和密码',1);return}
+body={mobile:m,password:p,area_code:a,login_type:'phone'}
+var btn=Q('btn1')
+}else{
+const e=Q('email').value.trim();const p=Q('pw2').value
+if(!e||!p){t('请输入邮箱和密码',1);return}
+body={email:e,password:p,login_type:'email'}
+var btn=Q('btn2')
+}
+btn.disabled=true;btn.textContent='登录中...'
+Q('info').style.display='block';Q('info').innerHTML='正在登录 DeepSeek...'
+try{
+const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+const d=await r.json()
+if(d.ok){Q('info').innerHTML='登录成功 | Token: '+d.masked+' | Session: '+d.session_id;t('登录成功');cs()}
+else{Q('info').innerHTML='失败: '+d.error;t(d.error,1)}
+}catch(e){Q('info').innerHTML='错误: '+e.message;t(e.message,1)}
+btn.disabled=false;btn.textContent='登录'
+}
+function toggleCurl(){const b=Q('curlBox');b.style.display=b.style.display==='block'?'none':'block'}
+async function saveCurl(){
+const c=Q('curl').value.trim();if(!c){t('请先粘贴 cURL',1);return}
+const b=Q('btn3');b.disabled=true;b.textContent='保存中...'
+Q('info').style.display='block';Q('info').innerHTML='解析中...'
+try{
+const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({curl:c})})
+const d=await r.json()
+if(d.ok){Q('info').innerHTML='OK | '+d.masked+' | Session '+d.session_id;t('已保存');cs()}
+else{Q('info').innerHTML='失败: '+d.error;t(d.error,1)}
+}catch(e){Q('info').innerHTML='错误: '+e.message;t(e.message,1)}
+b.disabled=false;b.textContent='保存 cURL'
+}
+function cp(el){navigator.clipboard.writeText(el.textContent);t('已复制')}
+function t(m,e){const x=Q('toast');x.textContent=m;x.className='toast t'+(e?'e':'s');setTimeout(()=>x.className='toast',2500)}
+async function refreshModels(){
+const btn=Q('refreshBtn');const info=Q('modelsInfo')
+btn.disabled=true;btn.textContent='刷新中...';info.style.display='none'
+try{
+const r=await fetch('/v1/models/refresh',{method:'POST'})
+const d=await r.json()
+const names=d.data.map(m=>m.id).join(', ')
+info.style.display='block';info.innerHTML='✅ 发现 '+d.data.length+' 个模型: '+names;t('刷新成功')
+}catch(e){info.style.display='block';info.innerHTML='❌ 失败: '+e.message;t('刷新失败',1)}
+btn.disabled=false;btn.textContent='🔄 刷新模型列表'
+}
+cs()
+</script>
+</body>
+</html>"""
+
+
+from starlette.responses import RedirectResponse
+
+@app.get("/")
+async def root():
+    return RedirectResponse(url="/admin")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin():
+    from starlette.responses import Response
+    html = ADMIN
+    return Response(content=html, media_type="text/html", headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    })
+
+
+# ── 配置 API ─────────────────────────────────────────────
+
+def _load_config_sync() -> dict:
+    """同步加载 token.json 原始数据（供非 async 上下文使用）。"""
+    if not CONFIG_FILE.exists():
+        return {}
+    return json.loads(CONFIG_FILE.read_text("utf-8"))
+
+
+@app.get("/api/config")
+async def get_config():
+    if not CONFIG_FILE.exists():
+        return {"configured": False, "error": "未配置"}
+    d = _load_config_sync()
+    t = d.get("token", "")
+    return {
+        "configured": True,
+        "masked": t[:20] + "..." + t[-8:] if len(t) > 30 else "***",
+        "session_id": d.get("session_id", "N/A"),
+    }
+
+
+@app.post("/api/config")
+async def save_config(data: dict):
+    curl = data.get("curl", "").strip()
+    if not curl: raise HTTPException(400, "请提供 cURL")
+    parsed = parse_curl(curl)
+    cfg = build_config(parsed)
+    if not cfg["token"]: return {"ok": False, "error": "未从 cURL 提取到 Token，请确认 Authorization header"}
+    if not cfg["session_id"]: return {"ok": False, "error": "未从 cURL 提取到 Session ID"}
+    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False), "utf-8")
+    t = cfg["token"]
+    return {"ok": True, "masked": t[:20] + "..." + t[-8:], "session_id": cfg["session_id"]}
+
+
+# ── DeepSeek 登录 API ─────────────────────────────────────
+@app.post("/api/login")
+async def deepseek_login(data: dict):
+    login_type = data.get("login_type", "phone")
+    password = data.get("password", "").strip()
+    if not password:
+        raise HTTPException(400, "请提供密码")
+
+    # 构造登录 payload（参考 NIyueeE/ds-free-api: email 和 mobile 二选一）
+    login_payload = {"password": password, "device_id": secrets.token_hex(16), "os": "web"}
+    account_label = ""
+    email, mobile, area_code = "", "", "+86"
+
+    if login_type == "email":
+        email = data.get("email", "").strip()
+        if not email:
+            raise HTTPException(400, "请提供邮箱")
+        login_payload["email"] = email
+        login_payload["mobile"] = ""
+        login_payload["area_code"] = ""
+        account_label = email
+    else:
+        mobile = data.get("mobile", "").strip()
+        area_code = data.get("area_code", "+86").strip()
+        if not mobile:
+            raise HTTPException(400, "请提供手机号")
+        login_payload["mobile"] = mobile
+        login_payload["area_code"] = area_code
+        login_payload["email"] = ""
+        account_label = f"{area_code} {mobile}"
+
+    DS_HEADERS = {
+        "content-type": "application/json",
+        "origin": "https://chat.deepseek.com",
+        "referer": "https://chat.deepseek.com/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
+        "x-client-version": "1.0.0-always",
+        "x-client-platform": "web",
+    }
+
+    try:
+        # 1. 登录
+        login_resp = cffi_requests.post(
+            "https://chat.deepseek.com/api/v0/users/login",
+            json=login_payload,
+            headers=DS_HEADERS,
+            impersonate="chrome120",
+            timeout=30,
+        )
+
+        login_data = login_resp.json()
+        if login_resp.status_code != 200 or login_data.get("code", 0) != 0:
+            err_msg = login_data.get("msg", login_data.get("message", f"HTTP {login_resp.status_code}"))
+            return {"ok": False, "error": f"登录失败: {err_msg}"}
+
+        token = login_data.get("data", {}).get("biz_data", {}).get("user", {}).get("token", "")
+        if not token:
+            return {"ok": False, "error": "登录成功但未获取到 token"}
+
+        print(f"[Login] Token acquired for {account_label}: {token[:20]}...{token[-8:]}")
+
+        # 2. 创建会话
+        auth_headers = {**DS_HEADERS, "authorization": f"Bearer {token}"}
+        session_resp = cffi_requests.post(
+            "https://chat.deepseek.com/api/v0/chat_session/create",
+            json={},
+            headers=auth_headers,
+            impersonate="chrome120",
+            timeout=15,
+        )
+
+        session_id = ""
+        if session_resp.status_code == 200:
+            session_data = session_resp.json()
+            session_id = session_data.get("data", {}).get("biz_data", {}).get("id", "")
+            print(f"[Login] Session created: {session_id}")
+        else:
+            print(f"[Login] Session creation failed: {session_resp.status_code} {session_resp.text[:200]}")
+
+        # 3. 保存配置（含凭证供自动刷新）
+        cfg = {
+            "token": token,
+            "session_id": session_id,
+            "headers": {**DS_HEADERS, "authorization": f"Bearer {token}"},
+            "cookie": "",
+            "account": account_label,
+            "login_type": login_type,
+            # 保存凭证用于 token 过期后自动刷新
+            "_password": password,
+            "_email": email if login_type == "email" else "",
+            "_mobile": mobile if login_type == "phone" else "",
+            "_area_code": area_code if login_type == "phone" else "+86",
+        }
+        CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False), "utf-8")
+
+        masked = token[:20] + "..." + token[-8:]
+        return {"ok": True, "masked": masked, "session_id": session_id}
+
+    except Exception as e:
+        print(f"[Login] Error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+# ── Health ───────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    if CONFIG_FILE.exists(): return {"status": "ok", "configured": True}
+    return {"status": "waiting", "configured": False}
+
+
+# ── 模型映射（动态从 DeepSeek 探测）─────────────────
+MODEL_CONFIG_URL = "https://chat.deepseek.com/api/v0/client/settings?scope=model"
+
+_models_cache = {}       # model_id → (thinking, search, max_in, max_out)
+_models_cache_time = 0
+_MODELS_TTL = 3600       # 缓存1小时
+
+
+def _discover_models() -> dict:
+    """从 DeepSeek /api/v0/client/settings?scope=model 动态获取模型配置。
+
+    返回: {model_id: (thinking_enabled, search_enabled, max_input, max_output), ...}
+    失败返回 None。
+    """
+    global _models_cache, _models_cache_time
+
+    cfg = _load_config_sync()
+    if not cfg:
+        return None
+
+    token = cfg.get("token", "")
+    ua = cfg.get("headers", {}).get("user-agent", "Mozilla/5.0")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": ua,
+        "X-Client-Version": "1.0.0-always",
+        "X-Client-Platform": "web",
+    }
+
+    try:
+        resp = cffi_requests.get(MODEL_CONFIG_URL, headers=headers, timeout=10)
+        data = resp.json()
+        biz_data = data.get("data", {}).get("biz_data", {})
+        settings = biz_data.get("settings", {})
+        model_configs = settings.get("model_configs", {}).get("value", [])
+
+        if not model_configs:
+            print(f"[模型发现] model_configs 为空")
+            return None
+
+        models = {}
+        for mc in model_configs:
+            mt = mc.get("model_type")
+            if not mt or not mc.get("enabled"):
+                continue
+
+            ff = mc.get("file_feature") or {}
+            max_in = ff.get("token_limit", 890880)
+            max_out = ff.get("token_limit_with_thinking", 890880)
+            has_think = mc.get("think_feature") is not None
+            has_search = mc.get("search_feature") is not None
+
+            # 基础模型
+            name = f"deepseek-{mt}" if mt != "default" else "deepseek-default"
+            models[name] = (False, False, max_in, max_out)
+            print(f"[模型发现]   {name}: in={max_in}, out={max_out}, think={has_think}, search={has_search}")
+
+            # 思维链变体
+            if has_think:
+                tname = "deepseek-reasoner" if mt == "default" else f"deepseek-{mt}-reasoner"
+                models[tname] = (True, False, max_in, max_out)
+
+            # 搜索变体
+            if has_search:
+                sname = "deepseek-search" if mt == "default" else f"deepseek-{mt}-search"
+                models[sname] = (False, True, max_in, max_out)
+
+            # 思考+联网 组合变体
+            if has_think and has_search:
+                cname = "deepseek-reasoner-search" if mt == "default" else f"deepseek-{mt}-reasoner-search"
+                models[cname] = (True, True, max_in, max_out)
+
+        if models:
+            # 模型名称为纯英文ID，中文对照见 README.md
+            _models_cache = models
+            _models_cache_time = time.time()
+            print(f"[模型发现] 发现 {len(models)} 个模型: {list(models.keys())}")
+            return models
+
+    except Exception as e:
+        print(f"[模型发现] 失败: {e}")
+
+    return None
+
+
+def get_models() -> dict:
+    """获取模型映射（缓存优先，过期自动刷新。发现失败返回 {}）。"""
+    global _models_cache, _models_cache_time
+
+    if _models_cache and time.time() - _models_cache_time < _MODELS_TTL:
+        return _models_cache
+
+    discovered = _discover_models()
+    if discovered:
+        return discovered
+
+    # 探测失败 → 返回空（不骗人）
+    print("[模型发现] 探测失败，模型列表为空")
+    return {}
+
+
+# ── Token 自动刷新 ─────────────────────────────────────────
+def relogin(cfg: dict) -> dict | None:
+    """用保存的凭证重新登录，返回新 cfg 或 None"""
+    login_type = cfg.get("login_type", "")
+    password = cfg.get("_password", "")
+    if not password:
+        print("[Token] 无保存密码，无法自动刷新")
+        return None
+
+    login_payload = {"password": password, "device_id": secrets.token_hex(16), "os": "web"}
+    account_label = cfg.get("account", "")
+
+    if login_type == "email":
+        email = cfg.get("_email", "")
+        if not email:
+            return None
+        login_payload["email"] = email
+        login_payload["mobile"] = ""
+        login_payload["area_code"] = ""
+    elif login_type == "phone":
+        mobile = cfg.get("_mobile", "")
+        area_code = cfg.get("_area_code", "+86")
+        if not mobile:
+            return None
+        login_payload["mobile"] = mobile
+        login_payload["area_code"] = area_code
+        login_payload["email"] = ""
+    else:
+        return None
+
+    DS_HEADERS = {
+        "content-type": "application/json",
+        "origin": "https://chat.deepseek.com",
+        "referer": "https://chat.deepseek.com/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
+        "x-client-version": "1.0.0-always",
+        "x-client-platform": "web",
+    }
+
+    try:
+        print(f"[Token] 自动重新登录 {account_label}...")
+        login_resp = cffi_requests.post(
+            "https://chat.deepseek.com/api/v0/users/login",
+            json=login_payload,
+            headers=DS_HEADERS,
+            impersonate="chrome120",
+            timeout=30,
+        )
+        login_data = login_resp.json()
+        if login_resp.status_code != 200 or login_data.get("code", 0) != 0:
+            err_msg = login_data.get("msg", f"HTTP {login_resp.status_code}")
+            print(f"[Token] 自动登录失败: {err_msg}")
+            return None
+
+        token = login_data.get("data", {}).get("biz_data", {}).get("user", {}).get("token", "")
+        if not token:
+            print("[Token] 登录成功但未获取到 token")
+            return None
+
+        print(f"[Token] 新 token: {token[:20]}...{token[-8:]}")
+
+        # 创建新会话
+        auth_headers = {**DS_HEADERS, "authorization": f"Bearer {token}"}
+        session_resp = cffi_requests.post(
+            "https://chat.deepseek.com/api/v0/chat_session/create",
+            json={},
+            headers=auth_headers,
+            impersonate="chrome120",
+            timeout=15,
+        )
+        session_id = ""
+        if session_resp.status_code == 200:
+            session_data = session_resp.json()
+            session_id = session_data.get("data", {}).get("biz_data", {}).get("id", "")
+            print(f"[Token] 新 session: {session_id}")
+        else:
+            print(f"[Token] Session 创建失败: {session_resp.status_code}")
+
+        new_cfg = {
+            "token": token,
+            "session_id": session_id,
+            "headers": {**DS_HEADERS, "authorization": f"Bearer {token}"},
+            "cookie": "",
+            "account": account_label,
+            "login_type": login_type,
+            # 保留凭证供下次刷新
+            "_password": password,
+            "_email": cfg.get("_email", ""),
+            "_mobile": cfg.get("_mobile", ""),
+            "_area_code": cfg.get("_area_code", "+86"),
+        }
+        CONFIG_FILE.write_text(json.dumps(new_cfg, ensure_ascii=False), "utf-8")
+        return new_cfg
+
+    except Exception as e:
+        print(f"[Token] 自动登录异常: {e}")
+        return None
+
+
+def load_config_with_refresh() -> dict:
+    """加载配置，如果 token 失效则自动刷新"""
+    if not CONFIG_FILE.exists():
+        return {}
+    cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+    return cfg
+
+
+# ── OpenAI 兼容 API ──────────────────────────────────────
+@app.get("/v1/models")
+async def models():
+    data = []
+    for mid, (think, search, mi, mo) in get_models().items():
+        data.append({
+            "id": mid, "object": "model", "created": 1704067200,
+            "owned_by": "deepseek",
+            "max_input_tokens": mi, "max_output_tokens": mo,
+            "context_length": mi, "context_window": mi,
+            "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens", "stream"],
+        })
+    return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/{model_id}")
+async def model_detail(model_id: str):
+    info = get_models().get(model_id)
+    if not info:
+        raise HTTPException(404, f"模型 {model_id} 不存在")
+    think, search, mi, mo = info
+    return {
+        "id": model_id, "object": "model", "created": 1704067200,
+        "owned_by": "deepseek",
+        "max_input_tokens": mi, "max_output_tokens": mo,
+        "context_length": mi, "context_window": mi,
+    }
+
+
+@app.post("/v1/models/refresh")
+async def refresh_models():
+    """强制刷新模型列表"""
+    global _models_cache_time
+    _models_cache_time = 0  # 让下次 get_models() 重新探测
+    models = get_models()
+    data = []
+    for mid, (think, search, mi, mo) in models.items():
+        data.append({
+            "id": mid, "object": "model", "created": 1704067200,
+            "owned_by": "deepseek",
+            "max_input_tokens": mi, "max_output_tokens": mo,
+            "context_length": mi, "context_window": mi,
+            "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens", "stream"],
+        })
+    return {"object": "list", "data": data}
+
+
+def build_request_headers(cfg: dict, session_id: str) -> dict:
+    """Build headers for DeepSeek API request, excluding stale PoW and conflict headers."""
+    # Start from saved headers
+    req_headers = dict(cfg.get("headers", {}))
+
+    # Remove stale PoW - we'll generate fresh one
+    req_headers.pop("x-ds-pow-response", None)
+
+    # Remove headers that curl_cffi manages or that conflict
+    for h in ("host", "content-length", "transfer-encoding", "accept-encoding",
+              "content-type"):
+        req_headers.pop(h, None)
+
+    # Ensure required headers
+    req_headers["content-type"] = "application/json"
+    req_headers["origin"] = "https://chat.deepseek.com"
+    req_headers["referer"] = f"https://chat.deepseek.com/a/chat/s/{session_id}"
+
+    return req_headers
+
+
+def get_pow_response(target_path: str = "/api/v0/chat/completion") -> str | None:
+    """Get fresh PoW response from DeepSeek."""
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+        headers = build_request_headers(cfg, cfg["session_id"])
+
+        resp = cffi_requests.post(
+            "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
+            headers=headers,
+            json={"target_path": target_path},
+            impersonate="chrome120",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            challenge = data.get("data", {}).get("biz_data", {}).get("challenge", {})
+            if challenge:
+                pow_response = pow_solver.solve_challenge(challenge)
+                print(f"[PoW] Solved: {pow_response[:50]}...")
+                return pow_response
+            else:
+                print(f"[PoW] No challenge: {data}")
+        else:
+            print(f"[PoW] Request failed {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[PoW] Error: {e}")
+    return None
+
+
+
+
+
+
+
+
+@app.post("/v1/chat/completions")
+async def chat(request: Request):
+    if not CONFIG_FILE.exists():
+        raise HTTPException(503, detail="请先访问 http://localhost:{}/admin 登录账号".format(PROXY_PORT))
+
+    body = await request.json()
+    messages = body.get("messages", [])
+    model = body.get("model", "deepseek-default")
+    stream = body.get("stream", False)
+    tools = body.get("tools", None)
+
+    # Debug: log to console
+    print(f"[DEBUG] model={model}, stream={stream}, tools={'yes' if tools else 'no'}, msgs={len(messages)}")
+
+    # 模型映射
+    model_info = get_models().get(model, get_models().get("deepseek-default"))
+    thinking_enabled, search_enabled, _, _ = model_info
+
+    # 构建 prompt：使用 convert_messages_for_deepseek 处理完整多轮对话
+    prompt = convert_messages_for_deepseek(messages, tools)
+
+    # 如果有 tools 定义，将 TOOL_CALL 格式提示词注入到最后一条 [USER] 之前
+    tool_prompt = build_tool_prompt(tools) if tools else ""
+    if tool_prompt:
+        last_user_idx = prompt.rfind("\n[USER]\n")
+        if last_user_idx != -1:
+            prompt = prompt[:last_user_idx] + "\n\n" + tool_prompt + "\n" + prompt[last_user_idx:]
+        else:
+            prompt = tool_prompt + "\n\n" + prompt
+
+    cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+
+    return _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
+                    is_retry=False, has_tools=bool(tools), tools=tools)
+
+
+def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None):
+    """核心聊天逻辑，支持 token 过期后重试
+    
+    DeepSeek SSE 流结构（thinking_enabled=True 时）：
+    - data: {"v":{"response":{...}}} → 元数据，跳过
+    - data: {"p":"response/thinking_content","v":"嗯"} → thinking 第一段（有p）
+    - data: {"o":"APPEND","v":"，"} → thinking 后续段（无p，有o=APPEND）
+    - data: {"v":"用户"} → thinking 更多后续（只有v）
+    - data: {"p":"response/content","o":"APPEND","v":"你好"} → 正式内容第一段
+    - data: {"v":"！"} → 正式内容后续
+    - data: {"p":"response/status","v":"FINISHED"} → 状态，跳过
+    - event: title → 对话标题，跳过
+    - event: toast → 错误提示（如版本过低）
+    """
+    session_id = cfg["session_id"]
+    req_headers = build_request_headers(cfg, session_id)
+    pow_response = get_pow_response()
+    if pow_response:
+        req_headers["x-ds-pow-response"] = pow_response
+
+    # 不发送 model_type 字段——DeepSeek 服务端检测到 model_type=expert 时
+    # 会做客户端版本校验，导致 "Update to the latest version to use Expert" 错误。
+    # 只需 thinking_enabled=True 即可触发 Expert(DeepThink) 模式。
+    req_body = {
+        "chat_session_id": session_id,
+        "parent_message_id": None,
+        "prompt": prompt,
+        "ref_file_ids": [],
+        "thinking_enabled": thinking_enabled,
+        "search_enabled": search_enabled,
+    }
+
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    def _parse_sse(resp):
+        """Shared SSE parser — yields (type, value) tuples.
+        type: "content" | "thinking" | "error" | "done"
+        value: string content or error dict
+        """
+        phase = "thinking"
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="ignore")
+            line = line.strip()
+            if not line:
+                continue
+
+            # Skip event: lines
+            if line.startswith("event:"):
+                continue
+
+            # DeepSeek non-SSE error JSON
+            if line.startswith("{"):
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict) and "code" in obj and obj.get("code", 0) >= 40000:
+                        yield ("error", {"message": obj.get("msg", "unknown"), "code": obj.get("code")})
+                        return
+                except json.JSONDecodeError:
+                    pass
+                continue
+
+            ds = line[6:] if line.startswith("data: ") else line
+            if ds.strip() == "[DONE]":
+                yield ("done", "")
+                return
+
+            try:
+                obj = json.loads(ds)
+                if not isinstance(obj, dict):
+                    continue
+
+                # Toast error (v is dict with type=error)
+                val = obj.get("v")
+                if isinstance(val, dict):
+                    t_type = val.get("type", "")
+                    t_content = val.get("content", "")
+                    fr = val.get("finish_reason", "")
+                    if t_type == "error" and fr:
+                        yield ("error", {"message": t_content, "code": fr})
+                        return
+                    continue
+
+                path = obj.get("p", "")
+                v = obj.get("v", "")
+
+                if path == "response/content" and obj.get("o") == "APPEND":
+                    phase = "content"
+                    if isinstance(v, str) and v:
+                        yield ("content", v)
+                elif path == "response/thinking_content" and thinking_enabled:
+                    phase = "thinking"
+                    if isinstance(v, str) and v:
+                        yield ("thinking", v)
+                elif path:
+                    continue  # metadata, skip
+                elif isinstance(v, str) and v:
+                    if phase == "thinking" and thinking_enabled:
+                        yield ("thinking", v)
+                    else:
+                        yield ("content", v)
+            except json.JSONDecodeError:
+                continue
+
+    def do_stream():
+        """SSE streaming for OpenAI-compatible clients."""
+        try:
+            resp = cffi_requests.post(
+                "https://chat.deepseek.com/api/v0/chat/completion",
+                headers=req_headers,
+                json=req_body,
+                impersonate="chrome120",
+                stream=True,
+                timeout=120,
+            )
+
+            if resp.status_code == 401 and not is_retry:
+                print("[Token] 401, trying refresh...")
+                new_cfg = relogin(cfg)
+                if new_cfg:
+                    for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools):
+                        yield chunk
+                    return
+                yield f'data: {json.dumps({"error": {"message": "Token expired", "type": "auth_error", "code": 401}})}\n\n'
+                yield "data: [DONE]\n\n"
+                return
+
+            if resp.status_code != 200:
+                error_msg = f"DeepSeek returned {resp.status_code}: {resp.text[:300]}"
+                print(f"[Error] {error_msg}")
+                yield f'data: {json.dumps({"error": {"message": error_msg, "type": "server_error", "code": resp.status_code}})}\n\n'
+                yield "data: [DONE]\n\n"
+                return
+
+            if has_tools:
+                # Buffer all content, parse tool_calls at the end
+                buf_content = ""
+                for etype, val in _parse_sse(resp):
+                    if etype == "content":
+                        buf_content += val
+                    elif etype == "thinking":
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    elif etype == "error":
+                        yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
+                        yield "data: [DONE]\n\n"
+                        return
+                    elif etype == "done":
+                        break
+                # Parse tool_calls (extract_tool_call returns (list_or_None, cleaned_content))
+                tc_result, final_content = extract_tool_call(buf_content, get_tool_names(tools) if tools else None)
+                if tc_result:
+                    # role delta
+                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    # Send any natural language text before tool calls (but NOT the TOOL_CALL raw text)
+                    if final_content:
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"content": final_content}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    # tool_calls deltas
+                    for i, tc in enumerate(tc_result):
+                        delta = {"role": "assistant", "content": None,
+                                 "tool_calls": [{"index": i, "id": tc["id"], "type": "function",
+                                                 "function": {"name": tc["function"]["name"], "arguments": ""}}]}
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                        # arguments delta
+                        args = tc["function"]["arguments"]
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": args}}]}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    # finish
+                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                else:
+                    # No tool calls found, output buffered content
+                    if buf_content:
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"content": buf_content}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                yield "data: [DONE]\n\n"
+                return
+
+            # No tools: normal streaming
+            for etype, val in _parse_sse(resp):
+                if etype == "content":
+                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {"content": val}, "finish_reason": None}]}
+                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                elif etype == "thinking":
+                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
+                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                elif etype == "error":
+                    yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
+                    yield "data: [DONE]\n\n"
+                    return
+                elif etype == "done":
+                    yield "data: [DONE]\n\n"
+                    return
+
+        except Exception as e:
+            print(f"[Error] do_stream failed: {e}")
+            yield f'data: {json.dumps({"error": {"message": str(e), "type": "server_error"}})}\n\n'
+            yield "data: [DONE]\n\n"
+
+    def do_nonstream():
+        """Non-streaming: separate request, collect all content."""
+        full_content = ""
+        full_thinking = ""
+
+        try:
+            resp = cffi_requests.post(
+                "https://chat.deepseek.com/api/v0/chat/completion",
+                headers=req_headers,
+                json=req_body,
+                impersonate="chrome120",
+                stream=True,
+                timeout=120,
+            )
+
+            if resp.status_code == 401 and not is_retry:
+                print("[Token] 401 in nonstream, trying refresh...")
+                new_cfg = relogin(cfg)
+                if new_cfg:
+                    return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools)
+
+            if resp.status_code != 200:
+                raise HTTPException(502, detail={"error": {"message": f"DeepSeek returned {resp.status_code}", "type": "server_error"}})
+
+            for etype, val in _parse_sse(resp):
+                if etype == "content":
+                    full_content += val
+                elif etype == "thinking":
+                    full_thinking += val
+                elif etype == "error":
+                    raise HTTPException(502, detail={"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[nonstream] Error: {e}")
+            raise HTTPException(502, detail={"error": {"message": str(e), "type": "server_error"}})
+
+        # 如果有 tools，检查 content 中是否包含 tool_call 标签
+        finish_reason = "stop"
+        tc_result = None
+        final_content = full_content
+        if has_tools:
+            tc_result, final_content = extract_tool_call(full_content, get_tool_names(tools) if tools else None)
+            if tc_result:
+                finish_reason = "tool_calls"
+
+        msg = {"role": "assistant", "content": final_content}
+        if full_thinking:
+            msg["reasoning_content"] = full_thinking
+        if tc_result:
+            msg["tool_calls"] = tc_result
+            if final_content is None:
+                msg["content"] = None
+
+        return JSONResponse({
+            "id": chat_id, "object": "chat.completion", "created": created, "model": model,
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
+    if stream:
+        return StreamingResponse(do_stream(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+    return do_nonstream()
+
+
+def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, has_tools=False, tools=None):
+    """Token 刷新重试专用的流式生成器"""
+    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, has_tools=has_tools, tools=tools)
+    if isinstance(result, StreamingResponse):
+        yield from result.body_iterator
+    else:
+        yield f"data: {json.dumps({'error': {'message': 'Retry returned non-stream', 'type': 'server_error'}})}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+# ── 启动 ─────────────────────────────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    print(f"DeepSeek Proxy\n Admin: http://localhost:{PROXY_PORT}/admin\n API: http://localhost:{PROXY_PORT}/v1")
+    uvicorn.run(app, host="0.0.0.0", port=PROXY_PORT, log_level="info")

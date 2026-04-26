@@ -1,0 +1,20 @@
+{
+  "token": "",
+  "session_id": "",
+  "headers": {
+    "content-type": "application/json",
+    "origin": "https://chat.deepseek.com",
+    "referer": "https://chat.deepseek.com/",
+    "user-agent": "Mozilla/5.0",
+    "x-client-version": "1.0.0-always",
+    "x-client-platform": "web",
+    "authorization": "Bearer YOUR_TOKEN"
+  },
+  "cookie": "",
+  "account": "+86 1xxxxxxxxxx",
+  "login_type": "phone",
+  "_password": "",
+  "_email": "",
+  "_mobile": "",
+  "_area_code": "+86"
+}

@@ -45,10 +45,7 @@
 
 ## 特性
 
-- **OpenAI 完全兼容** — 标准 `/v1/chat/completions`（流式/非流式）
-- `/v1/models`
-- `/v1/models/{id}`
-- `/v1/models/refresh` 
+- **OpenAI 完全兼容** — 标准 `/v1/chat/completions`（流式/非流式），`/v1/models`，`/v1/models/{id}`，`/v1/models/refresh` 端点
 - **工具调用（Function Calling）** — 提示词注入 TOOL_CALL 指令 + 3 策略提取（正则/JSON/XML），支持流式与非流式
 - **动态模型发现** — 启动时从 DeepSeek 官方 API 实时探测模型列表，每小时自动刷新（含上下文大小等完整信息）
 - **PoW 自动求解** — Node.js WASM 主求解器 + Python 纯算法回退，请求前自动获取 challenge 并求解

@@ -807,6 +807,24 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         type: "content" | "thinking" | "error" | "done"
         value: string content or error dict
         """
+        # Pre-flight: check Content-Type — if DeepSeek returns HTML/text instead of SSE,
+        # treat the entire response as an error to avoid silent data loss
+        ct = resp.headers.get("content-type", "")
+        if ct and "text/event-stream" not in ct and "application/json" not in ct:
+            # Read a snippet of the body to include in the error
+            body_sample = ""
+            try:
+                body_sample = resp.text[:300] if hasattr(resp, "text") else ""
+            except Exception:
+                pass
+            yield ("error", {
+                "message": f"DeepSeek returned non-SSE response (Content-Type: {ct}): {body_sample}",
+                "code": "bad_content_type"
+            })
+            return
+
+        # Track non-JSON lines for error detection
+        non_json_line_count = 0
         phase = "thinking"
         for line in resp.iter_lines():
             if not line:
@@ -820,6 +838,23 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             # Skip event: lines
             if line.startswith("event:"):
                 continue
+
+            # Detect raw text/HTML error responses (DeepSeek sometimes returns plain text errors)
+            if line.startswith("<!DOCTYPE") or line.startswith("<html") or line.startswith("<HTML"):
+                yield ("error", {
+                    "message": f"DeepSeek returned HTML error: {line[:200]}",
+                    "code": "html_response"
+                })
+                return
+
+            # Detect plain text error keywords
+            lowline = line.lower()
+            if non_json_line_count >= 3:
+                yield ("error", {
+                    "message": f"DeepSeek returned non-SSE text (too many non-JSON lines): first={line[:200]}",
+                    "code": "non_sse_response"
+                })
+                return
 
             # DeepSeek non-SSE error JSON
             if line.startswith("{"):
@@ -872,6 +907,8 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     else:
                         yield ("content", v)
             except json.JSONDecodeError:
+                # Track non-JSON lines for error detection
+                non_json_line_count += 1
                 continue
 
     def do_stream():
@@ -1006,7 +1043,20 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools)
 
             if resp.status_code != 200:
-                raise HTTPException(502, detail={"error": {"message": f"DeepSeek returned {resp.status_code}", "type": "server_error"}})
+                # Capture response body sample for debugging
+                body_sample = ""
+                try:
+                    body_sample = resp.text[:500] if hasattr(resp, "text") else f"(no body, status={resp.status_code})"
+                except Exception:
+                    body_sample = f"(body unreadable, status={resp.status_code})"
+                print(f"[nonstream] DeepSeek {resp.status_code}: {body_sample[:200]}")
+                raise HTTPException(502, detail={
+                    "error": {
+                        "message": f"DeepSeek returned {resp.status_code}: {body_sample[:200]}",
+                        "type": "server_error",
+                        "code": resp.status_code
+                    }
+                })
 
             for etype, val in _parse_sse(resp):
                 if etype == "content":
@@ -1039,11 +1089,27 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             if final_content is None:
                 msg["content"] = None
 
-        return JSONResponse({
+        # Build and validate response — pre-serialize to catch any issues early
+        response_body = {
             "id": chat_id, "object": "chat.completion", "created": created, "model": model,
             "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+        }
+        try:
+            # Validate JSON serializability
+            json.dumps(response_body, ensure_ascii=False)
+        except (TypeError, ValueError) as serr:
+            print(f"[nonstream] JSON serialization failed: {serr}")
+            # Sanitize: replace non-serializable values with their string repr
+            safe_msg = {}
+            for k, v in msg.items():
+                try:
+                    json.dumps({k: v}, ensure_ascii=False)
+                    safe_msg[k] = v
+                except (TypeError, ValueError):
+                    safe_msg[k] = str(v)
+            response_body["choices"][0]["message"] = safe_msg
+        return JSONResponse(response_body)
 
     if stream:
         return StreamingResponse(do_stream(), media_type="text/event-stream",
@@ -1066,3 +1132,4 @@ if __name__ == "__main__":
     import uvicorn
     print(f"DeepSeek Proxy\n Admin: http://localhost:{PROXY_PORT}/admin\n API: http://localhost:{PROXY_PORT}/v1")
     uvicorn.run(app, host="0.0.0.0", port=PROXY_PORT, log_level="info")
+

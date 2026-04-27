@@ -1132,4 +1132,3 @@ if __name__ == "__main__":
     import uvicorn
     print(f"DeepSeek Proxy\n Admin: http://localhost:{PROXY_PORT}/admin\n API: http://localhost:{PROXY_PORT}/v1")
     uvicorn.run(app, host="0.0.0.0", port=PROXY_PORT, log_level="info")
-

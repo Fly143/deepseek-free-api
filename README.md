@@ -9,8 +9,7 @@
 本项目所修改代码均为ai完成，不含任何一句人工代码，望周知！
 
 > **参考项目：** [NIyueeE/ds-free-api](https://github.com/NIyueeE/ds-free-api)（Rust 版），本项目为 Python 重写。
-> Rust 原版使用浏览器自动化（Playwright/Chrome），本 Python 版改为**纯 HTTP 转发**（curl_cffi 模拟 Chrome TLS 指纹），资源占用更低。
-
+> Rust 原版使用浏览器自动化（Playwright/Chrome），本 Python 版改为**纯 HTTP 转发**（curl_cffi 模拟 Chrome TLS 指纹），资源占用更低，适合服务器和 Android Termux。
 
 ## 目录
 
@@ -45,7 +44,7 @@
 
 ## 特性
 
-- **OpenAI 完全兼容** — 标准 `/v1/chat/completions`（流式/非流式），`/v1/models`，`/v1/models/{id}`，`/v1/models/refresh` 端点
+- **OpenAI 完全兼容** — 标准 `/v1/chat/completions`（流式/非流式）、`/v1/models`、`/v1/models/{id}`、`/v1/models/refresh` 端点
 - **工具调用（Function Calling）** — 提示词注入 TOOL_CALL 指令 + 3 策略提取（正则/JSON/XML），支持流式与非流式
 - **动态模型发现** — 启动时从 DeepSeek 官方 API 实时探测模型列表，每小时自动刷新（含上下文大小等完整信息）
 - **PoW 自动求解** — Node.js WASM 主求解器 + Python 纯算法回退，请求前自动获取 challenge 并求解
@@ -559,4 +558,3 @@ MIT License
 
 **参考项目：**
 - [NIyueeE/ds-free-api](https://github.com/NIyueeE/ds-free-api) — Rust 原版，提供了 DeepSeek API 逆向思路和 PoW 算法参考
-

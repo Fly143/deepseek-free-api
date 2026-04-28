@@ -296,11 +296,7 @@ def convert_messages_for_deepseek(messages, tools=None):
             elif content:
                 out.append("[ASST]\n" + str(content) + "\n")
         elif role == "tool":
-            tool_name = msg.get("name", "")
-            if isinstance(content, list):
-                text = " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
-            else:
-                text = str(content) if content else ""
-            label = "TOOL_RESULT " + tool_name if tool_name else "TOOL_RESULT"
-            out.append("[" + label + "]\n" + text + "\n")
+            # Skip tool results — the assistant's summary already follows,
+            # and including raw JSON causes DeepSeek to echo/duplicate it.
+            pass
     return "\n".join(out)

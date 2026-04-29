@@ -25,6 +25,16 @@ pow_solver = DeepSeekPOW()
 
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "token.json"
+VISION_LOG = BASE_DIR / "vision.log"
+_DEBUG = os.getenv("DS_DEBUG", "").lower() in ("1", "true", "yes")
+
+def _vlog(msg: str):
+    """Log vision-related messages. File logging only when DS_DEBUG=1."""
+    ts = time.strftime("%H:%M:%S")
+    if _DEBUG:
+        with open(VISION_LOG, "a") as f:
+            f.write(f"[{ts}] {msg}\n")
+    print(f"[Vision] {msg}", flush=True)
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
 
 # ── cURL 解析 ──────────────────────────────────────────
@@ -333,7 +343,7 @@ async def deepseek_login(data: dict):
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
-        "x-client-version": "1.0.0-always",
+        "x-client-version": "2.0.2",
         "x-client-platform": "web",
     }
 
@@ -377,7 +387,8 @@ async def deepseek_login(data: dict):
         session_id = ""
         if session_resp.status_code == 200:
             session_data = session_resp.json()
-            session_id = session_data.get("data", {}).get("biz_data", {}).get("id", "")
+            biz = session_data.get("data", {}).get("biz_data", {})
+            session_id = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
             print(f"[Login] Session created: {session_id}")
         else:
             print(f"[Login] Session creation failed: {session_resp.status_code} {session_resp.text[:200]}")
@@ -439,7 +450,7 @@ def _discover_models() -> dict:
     headers = {
         "Authorization": f"Bearer {token}",
         "User-Agent": ua,
-        "X-Client-Version": "1.0.0-always",
+        "X-Client-Version": "2.0.0",
         "X-Client-Platform": "web",
     }
 
@@ -550,7 +561,7 @@ def relogin(cfg: dict) -> dict | None:
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
-        "x-client-version": "1.0.0-always",
+        "x-client-version": "2.0.2",
         "x-client-platform": "web",
     }
 
@@ -594,7 +605,8 @@ def relogin(cfg: dict) -> dict | None:
         session_id = ""
         if session_resp.status_code == 200:
             session_data = session_resp.json()
-            session_id = session_data.get("data", {}).get("biz_data", {}).get("id", "")
+            biz = session_data.get("data", {}).get("biz_data", {})
+            session_id = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
             print(f"[Token] 新 session: {session_id}")
         else:
             print(f"[Token] Session 创建失败: {session_resp.status_code}")
@@ -721,7 +733,234 @@ def get_pow_response(target_path: str = "/api/v0/chat/completion") -> str | None
         else:
                 print(f"[PoW] Request failed {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-            print(f"[PoW] Error: {e}")
+        print(f"[PoW] Error: {e}")
+    return None
+
+
+# ── 文件上传（Vision 模型支持）──────────────────────────────
+
+def upload_file_to_deepseek(file_data: bytes, filename: str, content_type: str = "image/png") -> str | None:
+    """Upload a file to DeepSeek and return the file_id.
+
+    Uses the /api/v0/file/upload_file endpoint with PoW authentication.
+    Returns file_id string or None on failure.
+    """
+    if not CONFIG_FILE.exists():
+        _vlog("upload: no config")
+        return None
+    cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+    session_id = cfg["session_id"]
+
+    # Get PoW for upload_file scene
+    pow_response = get_pow_response(target_path="/api/v0/file/upload_file")
+
+    req_headers = build_request_headers(cfg, session_id)
+    if pow_response:
+        req_headers["x-ds-pow-response"] = pow_response
+
+    # Remove content-type, let requests/curl set multipart boundary
+    req_headers.pop("content-type", None)
+
+    # curl_cffi doesn't support `files` param; use standard requests for upload
+    import requests as req
+    try:
+        resp = req.post(
+            "https://chat.deepseek.com/api/v0/file/upload_file",
+            headers=req_headers,
+            files={"file": (filename, file_data, content_type)},
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            file_id = (data.get("data", {})
+                            .get("biz_data", {})
+                            .get("id", "")
+                       or data.get("data", {})
+                              .get("id", ""))
+            if file_id:
+                _vlog(f"upload OK: {filename} -> {file_id}")
+                return file_id
+            _vlog(f"upload: no file_id in response: {resp.text[:300]}")
+        else:
+            _vlog(f"upload HTTP {resp.status_code}: {resp.text[:300]}")
+    except Exception as e:
+        _vlog(f"upload error: {e}")
+    return None
+
+
+def fork_file_to_vision(cfg: dict, file_id: str) -> str | None:
+    """Fork an uploaded file to the vision model type.
+
+    DeepSeek requires forking files to a specific model before they can be
+    referenced in chat. Returns the new forked file_id or None.
+    """
+    import requests as req
+    try:
+        headers = build_request_headers(cfg, cfg["session_id"])
+        resp = req.post(
+            "https://chat.deepseek.com/api/v0/file/fork_file_task",
+            headers=headers,
+            json={"file_id": file_id, "to_model_type": "vision"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            biz_data = data.get("data", {}).get("biz_data", {})
+            forked_id = biz_data.get("id") or biz_data.get("file_id")
+            if forked_id and forked_id != file_id:
+                _vlog(f"fork OK: {file_id} -> {forked_id}")
+                return forked_id
+        _vlog(f"fork failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        _vlog(f"fork error: {e}")
+    return None
+
+
+def wait_for_file_parsing(cfg: dict, file_ids: list[str], timeout: int = 30) -> list[str]:
+    """Wait for DeepSeek to finish parsing uploaded files.
+
+    Polls /api/v0/file/fetch_files until all files are parsed or timeout.
+    Returns list of successfully parsed file_ids.
+    """
+    import time as _time
+    if not file_ids:
+        return []
+    start = _time.time()
+    while _time.time() - start < timeout:
+        statuses = _fetch_file_statuses(cfg, file_ids)
+        if statuses is None:
+            _time.sleep(1)
+            continue
+        all_done = True
+        parsed_ids = []
+        for fid in file_ids:
+            s = statuses.get(fid, {})
+            status = str(s.get("status", "")).upper()
+            # Terminal states: file is processed (success or not, just done)
+            if status in ("SUCCESS", "COMPLETED", "CONTENT_EMPTY", "FAILED", "ERROR", "PARSE_FAILED"):
+                if status == "SUCCESS":
+                    parsed_ids.append(fid)
+                # Even non-success states mean the file is done processing
+            elif status in ("PENDING", "PARSING", "UPLOADING", "QUEUED"):
+                all_done = False
+                # If it's been more than 5s and still PARSING, accept it anyway
+                if _time.time() - start > 5:
+                    _vlog(f"file {fid} still {status} after 5s, accepting")
+                    parsed_ids.append(fid)
+            else:
+                # Unknown status — assume done
+                _vlog(f"file {fid} unknown status={status}, accepting")
+                parsed_ids.append(fid)
+        if all_done and parsed_ids:
+            print(f"[Vision] Files parsed: {parsed_ids}")
+            return parsed_ids
+        if parsed_ids and _time.time() - start > 5:
+            # Some files parsed, others still processing — return what we have
+            if parsed_ids:
+                return parsed_ids
+        _time.sleep(1)
+    print(f"[Vision] Parse timeout, got 0/{len(file_ids)} files")
+    return []
+
+
+def _fetch_file_statuses(cfg: dict, file_ids: list[str]) -> dict | None:
+    """Fetch parse status for uploaded files from DeepSeek."""
+    import requests as req
+    try:
+        session_id = cfg["session_id"]
+        headers = build_request_headers(cfg, session_id)
+        resp = req.get(
+            "https://chat.deepseek.com/api/v0/file/fetch_files",
+            headers=headers,
+            params={"file_ids": file_ids},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            files = (data.get("data", {}).get("biz_data", {}).get("files", [])
+                     or data.get("data", {}).get("files", []))
+            if not files:
+                # Sometimes response wraps differently
+                biz = data.get("data", {}).get("biz_data", {})
+                for key in ("file_statuses", "file_list", "items"):
+                    if key in biz:
+                        files = biz[key]
+                        break
+            statuses = {}
+            for f in files:
+                fid = f.get("id") or f.get("file_id") or f.get("_id")
+                if fid and fid in file_ids:
+                    statuses[fid] = f
+            return statuses if statuses else None
+        print(f"[Vision] fetch_files HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Vision] fetch_files error: {e}")
+    return None
+
+
+def extract_images_from_messages(messages: list) -> list[dict]:
+    """Extract image URLs/bytes from OpenAI-format messages.
+
+    Returns list of dicts: {data: bytes, content_type: str, filename: str}
+    Supports: image_url (url/base64), images (list), content array
+    """
+    import base64 as b64
+    images = []
+    for msg in messages:
+        content = msg.get("content", "")
+        # OpenAI multi-content format
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "image_url":
+                        url = part.get("image_url", {}).get("url", "")
+                        images.append(_parse_image_url(url))
+                    elif part.get("type") == "image":
+                        data = part.get("data", "") or part.get("source", {}).get("data", "")
+                        if data:
+                            images.append(_parse_image_url(data))
+        elif isinstance(content, str):
+            # Check for images array in msg
+            imgs = msg.get("images", [])
+            for img in imgs:
+                if isinstance(img, str):
+                    images.append(_parse_image_url(img))
+                elif isinstance(img, dict):
+                    data = img.get("data", "") or img.get("url", "")
+                    if data:
+                        images.append(_parse_image_url(data))
+    return [img for img in images if img is not None]
+
+
+def _parse_image_url(url_or_data: str) -> dict | None:
+    """Parse an image URL or base64 data string."""
+    import base64 as b64
+    if not url_or_data:
+        return None
+    s = url_or_data.strip()
+    # base64 data URI
+    if s.startswith("data:"):
+        header, encoded = s.split(",", 1)
+        ct = "image/png"
+        for part in header.split(";")[0].split(":")[1:]:
+            ct = part
+        try:
+            data = b64.b64decode(encoded)
+            ext = ct.split("/")[-1] if "/" in ct else "png"
+            return {"data": data, "content_type": ct, "filename": f"image.{ext}"}
+        except Exception:
+            print(f"[Vision] Failed to decode base64 image")
+            return None
+    # HTTP URL
+    if s.startswith("http://") or s.startswith("https://"):
+        try:
+            resp = cffi_requests.get(s, timeout=30, impersonate="chrome120")
+            if resp.status_code == 200:
+                ct = resp.headers.get("content-type", "image/png")
+                ext = ct.split("/")[-1] if "/" in ct else "png"
+                return {"data": resp.content, "content_type": ct, "filename": f"image.{ext}"}
+        except Exception as e:
+            print(f"[Vision] Failed to download image: {e}")
     return None
 
 
@@ -748,6 +987,51 @@ async def chat(request: Request):
     model_info = get_models().get(model, get_models().get("deepseek-default"))
     thinking_enabled, search_enabled, _, _ = model_info
 
+    # Vision 模型：提取、上传、fork 图片
+    is_vision = "vision" in model
+    ref_file_ids = []
+    cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+    if is_vision:
+        import time as _vtime
+        _t0 = _vtime.time()
+        _vlog(f"START model={model} msgs={len(messages)}")
+        images = extract_images_from_messages(messages)
+        _vlog(f"extracted {len(images)} images ({_vtime.time()-_t0:.1f}s)")
+        for i, img in enumerate(images):
+            _t1 = _vtime.time()
+            orig_fid = upload_file_to_deepseek(img["data"], img["filename"], img["content_type"])
+            _vlog(f"upload #{i} -> {orig_fid} ({_vtime.time()-_t1:.1f}s)")
+            if orig_fid:
+                _t2 = _vtime.time()
+                forked_fid = fork_file_to_vision(cfg, orig_fid)
+                _vlog(f"fork #{i} -> {forked_fid} ({_vtime.time()-_t2:.1f}s)")
+                if forked_fid:
+                    ref_file_ids.append(forked_fid)
+        if ref_file_ids:
+            _t3 = _vtime.time()
+            ref_file_ids = wait_for_file_parsing(cfg, ref_file_ids, timeout=10)
+            _vlog(f"parse_check -> {len(ref_file_ids)} ready ({_vtime.time()-_t3:.1f}s)")
+        _vlog(f"DONE: {len(images)} images -> {len(ref_file_ids)} ready ({_vtime.time()-_t0:.1f}s)")
+
+        # Create a FRESH session for vision to avoid parallel_chat_limit_by_queue
+        # from any lingering requests on the main session
+        try:
+            token = cfg.get("token", "")
+            if token:
+                auth_h = {**cfg.get("headers", {}), "authorization": f"Bearer {token}"}
+                sess_resp = cffi_requests.post(
+                    "https://chat.deepseek.com/api/v0/chat_session/create",
+                    json={}, headers=auth_h, impersonate="chrome120", timeout=15)
+                if sess_resp.status_code == 200:
+                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
+                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                    if new_sid:
+                        cfg = dict(cfg)
+                        cfg["session_id"] = new_sid
+                        _vlog(f"vision fresh session: {new_sid}")
+        except Exception as e:
+            _vlog(f"fresh session failed: {e}")
+
     # 构建 prompt：使用 convert_messages_for_deepseek 处理完整多轮对话
     prompt = convert_messages_for_deepseek(messages, tools)
 
@@ -760,13 +1044,49 @@ async def chat(request: Request):
         else:
             prompt = tool_prompt + "\n\n" + prompt
 
-    cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+    has_tools = bool(tools)
 
-    return _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
-                    is_retry=False, has_tools=bool(tools), tools=tools)
+    # Vision: DeepSeek vision in stream mode puts ALL output in thinking_content
+    # with no content events. Use non-stream internally, then wrap as SSE if client
+    # requested streaming.
+    client_wants_stream = stream
+    if is_vision:
+        stream = False
+
+    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
+                    is_retry=False, has_tools=has_tools, tools=tools,
+                    ref_file_ids=ref_file_ids)
+
+    # If client wanted stream but we used non-stream for vision, convert to SSE
+    if is_vision and client_wants_stream and isinstance(result, JSONResponse):
+        resp_body = json.loads(result.body)
+        msg = resp_body.get("choices", [{}])[0].get("message", {})
+        content = msg.get("content", "")
+        reasoning = msg.get("reasoning_content", "")
+        finish = resp_body.get("choices", [{}])[0].get("finish_reason", "stop")
+
+        def _vision_sse():
+            chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            created = int(time.time())
+            if reasoning:
+                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                     "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": None}]}
+                yield f"data: {json.dumps(r, ensure_ascii=False)}\n\n"
+            if content:
+                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                     "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]}
+                yield f"data: {json.dumps(r, ensure_ascii=False)}\n\n"
+            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
+            yield f"data: {json.dumps(r, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(_vision_sse(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return result
 
 
-def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None):
+def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None, ref_file_ids=None):
     """核心聊天逻辑，支持 token 过期后重试
     
     DeepSeek SSE 流结构（thinking_enabled=True 时）：
@@ -786,17 +1106,24 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
     if pow_response:
         req_headers["x-ds-pow-response"] = pow_response
 
-    # 不发送 model_type 字段——DeepSeek 服务端检测到 model_type=expert 时
-    # 会做客户端版本校验，导致 "Update to the latest version to use Expert" 错误。
-    # 只需 thinking_enabled=True 即可触发 Expert(DeepThink) 模式。
+    # model_type 字段：DeepSeek 根据此值路由到不同模型后端。
+    # 不发送则默认路由到 "default"，所以所有模型都应显式指定。
+    # 映射：模型名含 "expert" → "expert"，含 "vision" → "vision"，其余 → "default"
     req_body = {
         "chat_session_id": session_id,
         "parent_message_id": None,
         "prompt": prompt,
-        "ref_file_ids": [],
+        "ref_file_ids": ref_file_ids if ref_file_ids else [],
         "thinking_enabled": thinking_enabled,
         "search_enabled": search_enabled,
     }
+    if ref_file_ids:
+        req_body["model_type"] = "vision"
+        _vlog(f"chat request files={ref_file_ids} thinking={thinking_enabled}")
+    elif "expert" in model:
+        req_body["model_type"] = "expert"
+    else:
+        req_body["model_type"] = "default"
 
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -844,8 +1171,12 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             if not line:
                 continue
 
-            # Skip event: lines
+            # Skip event: lines (title, update_session, etc.)
             if line.startswith("event:"):
+                # Detect error hints embedded in event: hint lines
+                if line.startswith("event: hint"):
+                    # Read the next line for the data
+                    continue  # handled below via raw line processing
                 continue
 
             # Detect raw text/HTML error responses (DeepSeek sometimes returns plain text errors)
@@ -885,6 +1216,14 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 obj = json.loads(ds)
                 if not isinstance(obj, dict):
                     continue
+
+                # Error object: {"type": "error", "content": "...", "finish_reason": "..."}
+                obj_type = obj.get("type", "")
+                if obj_type == "error":
+                    content = obj.get("content", "")
+                    fr = obj.get("finish_reason", "")
+                    yield ("error", {"message": content, "code": fr})
+                    return
 
                 # Toast error (v is dict with type=error)
                 val = obj.get("v")
@@ -932,11 +1271,14 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 timeout=120,
             )
 
+            if ref_file_ids:
+                _vlog(f"chat stream response: status={resp.status_code} ct={resp.headers.get('content-type','?')}")
+
             if resp.status_code == 401 and not is_retry:
                 print("[Token] 401, trying refresh...")
                 new_cfg = relogin(cfg)
                 if new_cfg:
-                    for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools):
+                    for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids):
                         yield chunk
                     return
                 yield f'data: {json.dumps({"error": {"message": "Token expired", "type": "auth_error", "code": 401}})}\n\n'
@@ -1041,18 +1383,20 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 headers=req_headers,
                 json=req_body,
                 impersonate="chrome120",
-                stream=True,
+                stream=False,
                 timeout=120,
             )
+
+            if ref_file_ids:
+                _vlog(f"chat nonstream response: status={resp.status_code}")
 
             if resp.status_code == 401 and not is_retry:
                 print("[Token] 401 in nonstream, trying refresh...")
                 new_cfg = relogin(cfg)
                 if new_cfg:
-                    return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools)
+                    return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
 
             if resp.status_code != 200:
-                # Capture response body sample for debugging
                 body_sample = ""
                 try:
                     body_sample = resp.text[:500] if hasattr(resp, "text") else f"(no body, status={resp.status_code})"
@@ -1067,13 +1411,48 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     }
                 })
 
-            for etype, val in _parse_sse(resp):
-                if etype == "content":
-                    full_content += val
-                elif etype == "thinking":
-                    full_thinking += val
-                elif etype == "error":
-                    raise HTTPException(502, detail={"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})
+            # Parse SSE from resp.text (non-streaming response is complete SSE in body)
+            text = resp.text
+            lines = text.split("\n")
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data_str)
+                        # Error event: {"type": "error", "content": "...", "finish_reason": "..."}
+                        if isinstance(obj, dict) and obj.get("type") == "error":
+                            raise HTTPException(502, detail={"error": {
+                                "message": obj.get("content", "unknown"),
+                                "type": "server_error",
+                                "code": obj.get("finish_reason", "")
+                            }})
+                        # Toast error in v field
+                        val = obj.get("v")
+                        if isinstance(val, dict) and val.get("type") == "error":
+                            raise HTTPException(502, detail={"error": {
+                                "message": val.get("content", "unknown"),
+                                "type": "server_error",
+                                "code": val.get("finish_reason", "")
+                            }})
+                        # Content extraction
+                        path = obj.get("p", "")
+                        v = obj.get("v", "")
+                        if path == "response/content" and obj.get("o") == "APPEND" and isinstance(v, str):
+                            full_content += v
+                        elif path == "response/thinking_content" and isinstance(v, str):
+                            full_thinking += v
+                        elif not path and isinstance(v, str):
+                            # Ambiguous: could be content or thinking
+                            full_content += v
+                    except HTTPException:
+                        raise
+                    except Exception:
+                        pass
+                i += 1
 
         except HTTPException:
             raise
@@ -1126,9 +1505,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
     return do_nonstream()
 
 
-def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, has_tools=False, tools=None):
+def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, has_tools=False, tools=None, ref_file_ids=None):
     """Token 刷新重试专用的流式生成器"""
-    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, has_tools=has_tools, tools=tools)
+    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
     if isinstance(result, StreamingResponse):
         yield from result.body_iterator
     else:

@@ -45,11 +45,12 @@
 ## 特性
 
 - **OpenAI 完全兼容** — 标准 `/v1/chat/completions`（流式/非流式）、`/v1/models`、`/v1/models/{id}`、`/v1/models/refresh` 端点
-- **工具调用（Function Calling）** — 提示词注入 TOOL_CALL 指令 + 3 策略提取（正则/JSON/XML），支持流式与非流式
+- **工具调用（Function Calling）** — 提示词注入 TOOL_CALL 指令 + 8 策略提取（TOOL_CALL/JSON/XML/中文/execute_operation/自由文本/裸shell命令），支持流式与非流式
 - **动态模型发现** — 启动时从 DeepSeek 官方 API 实时探测模型列表，每小时自动刷新（含上下文大小等完整信息）
 - **PoW 自动求解** — Node.js WASM 主求解器 + Python 纯算法回退，请求前自动获取 challenge 并求解
 - **Token 自动刷新** — 检测到 401 时自动用保存的密码重新登录，无需人工干预
 - **深度思考** — 支持 DeepSeek 的 `<thought>` 标签，流式输出时分离为 `reasoning_content`
+- **Vision 图像理解** — 支持图片上传、解析、对话，Vision 模型同时支持工具调用
 - **联网搜索** — 支持 search 模型变体的 `search_enabled` 参数
 - **管理面板** — 内嵌单文件 Web UI，支持手机号/邮箱登录、cURL 导入
 - **纯 HTTP 方案** — 不依赖浏览器/Playwright/Chrome，用 curl_cffi 模拟 Chrome TLS 指纹
@@ -67,12 +68,16 @@
 │                 DeepSeek Free API Proxy (FastAPI)           │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
 │  │ 路由层   │  │  tool_call   │  │   curl_cffi 客户端    │ │
-│  │ /v1/*   │──│ (3策略提取)   │──│ (模拟Chrome指纹)      │ │
+│  │ /v1/*   │──│ (8策略提取)   │──│ (模拟Chrome指纹)      │ │
 │  └─────────┘  └──────────────┘  └──────────────────────┘ │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
 │  │ 模型发现 │  │   PoW 求解   │  │   Token 自动刷新      │ │
 │  │ (动态)   │  │ (Node+Python) │  │ (保存密码自动relogin) │ │
 │  └─────────┘  └──────────────┘  └──────────────────────┘ │
+│  ┌─────────┐  ┌──────────────┐                            │
+│  │ Vision  │  │ 文件上传/解析 │                            │
+│  │ 图像理解 │  │ (upload→fork) │                            │
+│  └─────────┘  └──────────────┘                            │
 └───────────────┬──────────────────────────────────────────┘
                 │  HTTPS (curl_cffi, Chrome指纹)
                 ▼
@@ -83,6 +88,7 @@
 │  /api/v0/chat_session/create                             │
 │  /api/v0/chat/create_pow_challenge                       │
 │  /api/v0/client/settings?scope=model                     │
+│  /api/v0/file/upload_file + fork_file_task               │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -292,7 +298,7 @@ def _discover_models():
 
 ### 当前可用模型
 
-模型列表**随 DeepSeek 官方动态变化**。当前探测到 2 个基础模型 × 4 变体 = 8 个模型：
+模型列表**随 DeepSeek 官方动态变化**。当前探测到 3 个基础模型 × 4 变体 = 12 个模型：
 
 | 模型 ID | 中文名称 | 说明 | 思考 | 联网 |
 |---------|---------|------|:----:|:----:|
@@ -304,15 +310,17 @@ def _discover_models():
 | `deepseek-expert-reasoner` | DeepSeek V4 Pro 思考 | V4 Pro + 深度思考 | ✓ | ✗ |
 | `deepseek-expert-search` | DeepSeek V4 Pro 联网 | V4 Pro + 联网搜索 | ✗ | ✓ |
 | `deepseek-expert-reasoner-search` | DeepSeek V4 Pro 思考+联网 | V4 Pro + 思考 + 联网 | ✓ | ✓ |
+| `deepseek-vision` | DeepSeek Vision 基础版 | 图像理解基础模型 | ✗ | ✗ |
+| `deepseek-vision-reasoner` | DeepSeek Vision 思考 | 图像理解 + 深度思考 | ✓ | ✗ |
 
 > **注意：**
 > - 如果 DeepSeek 推出新模型，代理会自动发现，无需改代码
-> - 不发送 `model_type` 字段 — DeepSeek 会对 `expert` 模型做客户端版本校验，通过 `thinking_enabled` 即可触发 Expert 模式
+> - 所有模型均显式指定 `model_type`（`default` / `expert` / `vision`），确保 DeepSeek 正确路由
 > - 模型名称为纯英文 ID，中文对照见上表
 
 ## 工具调用详解
 
-DeepSeek 网页端**不支持**原生 function calling。本代理通过**提示词注入 + 多策略提取**实现。
+DeepSeek 网页端**不支持**原生 function calling。本代理通过**提示词注入 + 8 策略提取**实现。
 
 ### 提示词注入
 
@@ -338,13 +346,19 @@ TOOL_CALL: search_web(query="latest AI news", page=1)
     city*(string): 城市名称
 ```
 
-### 3 种提取策略（按优先级）
+### 8 种提取策略（按优先级）
 
-| 策略 | 格式 | 说明 |
-|------|------|------|
-| 1 | `TOOL_CALL: name(key=value, ...)` | 大小写不敏感，支持嵌套括号，自动类型推断 |
-| 2 | ` ```json {"tool_call": {...}} ``` ` | JSON 代码块解析 |
-| 3 | `<function=name><parameter=k>v</parameter>` | XML 标签解析 |
+| # | 策略 | 格式 | 说明 |
+|---|------|------|------|
+| 1 | TOOL_CALL | `TOOL_CALL: name(key=value, ...)` | 大小写不敏感，支持嵌套括号，自动类型推断 |
+| 2 | JSON | `{"name":"x","arguments":{...}}` | 内嵌 JSON 对象解析 |
+| 3 | tool_call XML | tool_call XML 标签 | MiMo 原生格式 |
+| 4 | function_call | function_call JSON+XML | JSON 包裹在 XML 标签中 |
+| 4.5 | bare function XML | 裸 function XML 标签 | 无包裹的 function 标签 |
+| 5 | 中文格式 | [调用工具: NAME] | 模型从历史中学到的中文格式 |
+| 5.5 | execute_operation | execute_operation XML | DeepSeek 自由 XML 格式 |
+| 6 | 自由文本 | `name(args)` | 低优先级兜底，无 TOOL_CALL 前缀 |
+| 7 | 裸 shell 命令 | `ls -la` / `date` | 短文本中直接出现的 shell 命令 |</parameter>` | XML 标签解析 |
 
 > **注意：** `<thought>` 标签内的 TOOL_CALL 会被自动忽略（避免把思考内容误判为工具调用）。
 
@@ -453,8 +467,8 @@ ds-free-api/
 
 | 文件 | 职责 | 行数 |
 |------|------|------|
-| `proxy.py` | 应用入口、路由、SSE 解析、DeepSeek API 交互、Token 刷新、管理面板 UI | ~1052 |
-| `tool_call.py` | TOOL_CALL 提示词构建、3 策略提取、响应清理、多轮对话转换 | ~284 |
+| `proxy.py` | 应用入口、路由、SSE 解析、DeepSeek API 交互、Token 刷新、管理面板 UI | ~1524 |
+| `tool_call.py` | TOOL_CALL 提示词构建、8 策略提取、camelCase 匹配、响应清理、多轮对话转换 | ~1001 |
 | `pow_native.py` | PoW 求解器（Node.js 子进程 + Python 纯算法回退） | ~124 |
 | `deploy.sh` | 一键部署（环境检查、依赖安装、启动/停止/状态） | ~198 |
 
@@ -471,7 +485,7 @@ ds-free-api/
     "origin": "https://chat.deepseek.com",
     "referer": "https://chat.deepseek.com/",
     "user-agent": "Mozilla/5.0 ...",
-    "x-client-version": "1.0.0-always",
+    "x-client-version": "2.0.2",
     "x-client-platform": "web",
     "authorization": "Bearer YOUR_TOKEN"
   },
@@ -526,19 +540,18 @@ pip install fastapi uvicorn curl-cffi python-dotenv
 |------|------|
 | Token 有效期 | 约 24 小时过期，需要密码登录来自动刷新 |
 | 并发限制 | DeepSeek 免费版每账号限制约 2 并发请求 |
-| Expert 模型检查 | 不传 `model_type`，DeepSeek 会对 Expert 做客户端版本校验；通过 `thinking_enabled` 触发即可 |
 | 仅 Chat Completions | 不支持 Embeddings、Fine-tuning 等端点 |
 | PoW 耗时 | 每次请求需要先获取并求解 PoW challenge（Node.js 约 1-3 秒） |
 | 非流式走 SSE | DeepSeek 只提供 SSE 流，非流式请求会缓冲全部 SSE 后合并返回 |
-| 搜索 + Expert | Reasoner-Search 组合变体理论上存在但实际是否可用取决于 DeepSeek 服务端配置 |
+| Vision 非流式 | Vision 模型在流式模式下无 content 输出，内部用非流式获取后包装为 SSE |
 
 ## 常见问题
 
 **Q: 启动后访问 /admin 显示空白？**
 A: 管理面板是内嵌在 `proxy.py` 中的单文件 HTML，检查是否有 JavaScript 报错（F12 Console）。确保直接访问 `http://localhost:8000/admin`。
 
-**Q: 提示 "Update to the latest version to use Expert"？**
-A: DeepSeek 服务端对 Expert 模型有客户端版本验证。本代理不发送 `model_type` 字段，仅通过 `thinking_enabled=True` 触发 Expert 模式，可绕过此限制。
+**Q: 提示 "Update to the latest version to use Expert/Vision"？**
+A: `x-client-version` 需要与 DeepSeek 网页端保持一致（当前 `2.0.2`）。代理启动时已自动设置。
 
 **Q: PoW 求解失败？**
 A: 检查 Node.js 是否安装（`node --version`）。如果 Node.js 求解失败，代理会自动回退到 Python 纯算法求解（较慢但无需外部依赖）。
@@ -558,3 +571,4 @@ MIT License
 
 **参考项目：**
 - [NIyueeE/ds-free-api](https://github.com/NIyueeE/ds-free-api) — Rust 原版，提供了 DeepSeek API 逆向思路和 PoW 算法参考
+- [zhangjiabo522](https://github.com/zhangjiabo522) 、- [xstjmark21-cmyk](https://github.com/xstjmark21-cmyk) — 为 Vision 功能修改测试提供模型Token算力

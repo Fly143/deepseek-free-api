@@ -981,7 +981,11 @@ async def chat(request: Request):
     stream = body.get("stream", False)
     tools = body.get("tools", None)
 
-    # Debug: log to console
+    # Log client info for debugging
+    ua = request.headers.get("user-agent", "?")[:60]
+    msg = f"[REQ] model={model} stream={stream} msgs={len(messages)} tools={bool(tools)} ua={ua}"
+    print(msg, flush=True)
+    _vlog(msg)
 
     # 模型映射
     model_info = get_models().get(model, get_models().get("deepseek-default"))
@@ -1046,43 +1050,15 @@ async def chat(request: Request):
 
     has_tools = bool(tools)
 
-    # Vision: DeepSeek vision in stream mode puts ALL output in thinking_content
-    # with no content events. Use non-stream internally, then wrap as SSE if client
-    # requested streaming.
-    client_wants_stream = stream
-    if is_vision:
-        stream = False
+    # Try streaming for all models including vision with images.
+    # Old issue: vision stream put everything in thinking_content, but the new
+    # fragments format (THINK/RESPONSE) should handle this correctly now.
 
     result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
                     is_retry=False, has_tools=has_tools, tools=tools,
                     ref_file_ids=ref_file_ids)
 
-    # If client wanted stream but we used non-stream for vision, convert to SSE
-    if is_vision and client_wants_stream and isinstance(result, JSONResponse):
-        resp_body = json.loads(result.body)
-        msg = resp_body.get("choices", [{}])[0].get("message", {})
-        content = msg.get("content", "")
-        reasoning = msg.get("reasoning_content", "")
-        finish = resp_body.get("choices", [{}])[0].get("finish_reason", "stop")
-
-        def _vision_sse():
-            chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-            created = int(time.time())
-            if reasoning:
-                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                     "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": None}]}
-                yield f"data: {json.dumps(r, ensure_ascii=False)}\n\n"
-            if content:
-                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                     "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]}
-                yield f"data: {json.dumps(r, ensure_ascii=False)}\n\n"
-            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
-            yield f"data: {json.dumps(r, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(_vision_sse(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    # (Vision SSE wrapper removed — all models now stream directly via fragments format)
     return result
 
 
@@ -1133,12 +1109,16 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         """Shared SSE parser — yields (type, value) tuples.
         type: "content" | "thinking" | "error" | "done"
         value: string content or error dict
+
+        Handles two SSE formats:
+        1. Old format: response/thinking_content + response/content
+        2. New format: response/fragments/-1/content with fragment type tracking
+           (fragments have type THINK or RESPONSE)
         """
         # Pre-flight: check Content-Type — if DeepSeek returns HTML/text instead of SSE,
         # treat the entire response as an error to avoid silent data loss
         ct = resp.headers.get("content-type", "")
         if ct and "text/event-stream" not in ct and "application/json" not in ct:
-            # Read a snippet of the body to include in the error
             body_sample = ""
             try:
                 body_sample = resp.text[:300] if hasattr(resp, "text") else ""
@@ -1153,6 +1133,8 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         # Track non-JSON lines for error detection
         non_json_line_count = 0
         phase = "thinking"
+        # New format: track fragment type (THINK/RESPONSE) from metadata events
+        fragment_type = None  # None = old format (use phase), "THINK"/"RESPONSE" = new format
         _line_buf = b""
         def _read_lines():
             nonlocal _line_buf
@@ -1170,16 +1152,17 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         for line in _read_lines():
             if not line:
                 continue
+            # Debug: log raw SSE lines for thinking models
+            if thinking_enabled and line.startswith("data:") and "fragments" in line:
+                _vlog(f"SSE_LINE: {line[:500]}")
 
             # Skip event: lines (title, update_session, etc.)
             if line.startswith("event:"):
-                # Detect error hints embedded in event: hint lines
                 if line.startswith("event: hint"):
-                    # Read the next line for the data
                     continue  # handled below via raw line processing
                 continue
 
-            # Detect raw text/HTML error responses (DeepSeek sometimes returns plain text errors)
+            # Detect raw text/HTML error responses
             if line.startswith("<!DOCTYPE") or line.startswith("<html") or line.startswith("<HTML"):
                 yield ("error", {
                     "message": f"DeepSeek returned HTML error: {line[:200]}",
@@ -1187,8 +1170,6 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 })
                 return
 
-            # Detect plain text error keywords
-            lowline = line.lower()
             if non_json_line_count >= 3:
                 yield ("error", {
                     "message": f"DeepSeek returned non-SSE text (too many non-JSON lines): first={line[:200]}",
@@ -1225,37 +1206,89 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     yield ("error", {"message": content, "code": fr})
                     return
 
-                # Toast error (v is dict with type=error)
                 val = obj.get("v")
+
+                # Toast error (v is dict with type=error)
                 if isinstance(val, dict):
+                    # Check for error
                     t_type = val.get("type", "")
                     t_content = val.get("content", "")
                     fr = val.get("finish_reason", "")
                     if t_type == "error" and fr:
                         yield ("error", {"message": t_content, "code": fr})
                         return
+                    # New format: metadata with response.fragments → extract fragment type
+                    resp_data = val.get("response", {})
+                    if isinstance(resp_data, dict):
+                        frags = resp_data.get("fragments", [])
+                        if frags and isinstance(frags, list):
+                            last_frag = frags[-1]
+                            if isinstance(last_frag, dict) and last_frag.get("type"):
+                                fragment_type = last_frag["type"]
+                                if thinking_enabled:
+                                    _vlog(f"SSE: fragment_type={fragment_type}")
                     continue
 
                 path = obj.get("p", "")
-                v = obj.get("v", "")
 
+                # ── New format: response/fragments ──────────────────
+                # Fragment append event: {"p":"response/fragments","o":"APPEND","v":[{"id":N,"type":"RESPONSE","content":"...",...}]}
+                if path == "response/fragments" and obj.get("o") == "APPEND" and isinstance(val, list):
+                    if val:
+                        last_frag = val[-1] if isinstance(val[-1], dict) else {}
+                        new_type = last_frag.get("type", "")
+                        if new_type:
+                            fragment_type = new_type
+                            if thinking_enabled:
+                                _vlog(f"SSE: new fragment type={new_type}")
+                        # Extract initial content from fragment object
+                        frag_content = last_frag.get("content", "")
+                        if frag_content and isinstance(frag_content, str):
+                            if fragment_type == "THINK":
+                                yield ("thinking", frag_content)
+                            else:
+                                yield ("content", frag_content)
+                    continue
+
+                # Fragment content: {"p":"response/fragments/-1/content","o":"APPEND","v":"..."}
+                # or without "o": {"p":"response/fragments/-1/content","v":"..."}
+                if path == "response/fragments/-1/content":
+                    if fragment_type == "THINK":
+                        phase = "thinking"
+                        if isinstance(val, str) and val:
+                            yield ("thinking", val)
+                    else:  # RESPONSE or unknown
+                        phase = "content"
+                        if isinstance(val, str) and val:
+                            yield ("content", val)
+                    continue
+
+                # ── Old format: response/thinking_content + response/content ──
                 if path == "response/content" and obj.get("o") == "APPEND":
                     phase = "content"
-                    if isinstance(v, str) and v:
-                        yield ("content", v)
+                    if isinstance(val, str) and val:
+                        yield ("content", val)
                 elif path == "response/thinking_content" and thinking_enabled:
                     phase = "thinking"
-                    if isinstance(v, str) and v:
-                        yield ("thinking", v)
+                    if isinstance(val, str) and val:
+                        yield ("thinking", val)
                 elif path:
-                    continue  # metadata, skip
-                elif isinstance(v, str) and v:
-                    if phase == "thinking" and thinking_enabled:
-                        yield ("thinking", v)
+                    continue  # other metadata (status, elapsed_secs, BATCH, etc.)
+                elif isinstance(val, str) and val:
+                    # Pathless continuation lines: use fragment_type if new format, else phase
+                    if fragment_type is not None:
+                        # New format: use fragment type
+                        if fragment_type == "THINK":
+                            yield ("thinking", val)
+                        else:
+                            yield ("content", val)
                     else:
-                        yield ("content", v)
+                        # Old format: use phase
+                        if phase == "thinking" and thinking_enabled:
+                            yield ("thinking", val)
+                        else:
+                            yield ("content", val)
             except json.JSONDecodeError:
-                # Track non-JSON lines for error detection
                 non_json_line_count += 1
                 continue
 
@@ -1271,8 +1304,8 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 timeout=120,
             )
 
-            if ref_file_ids:
-                _vlog(f"chat stream response: status={resp.status_code} ct={resp.headers.get('content-type','?')}")
+            if ref_file_ids or thinking_enabled:
+                _vlog(f"chat stream response: status={resp.status_code} ct={resp.headers.get('content-type','?')} model={model} thinking={thinking_enabled}")
 
             if resp.status_code == 401 and not is_retry:
                 print("[Token] 401, trying refresh...")
@@ -1293,11 +1326,35 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 return
 
             if has_tools:
-                # Buffer all content, parse tool_calls at the end
+                # Buffer content for tool_call detection, suppress raw TOOL_CALL text.
+                # Stream content only after we're sure it's not a tool call.
                 buf_content = ""
+                _role_sent = False
+                _content_streaming = False  # True once we confirmed content is safe to stream
                 for etype, val in _parse_sse(resp):
                     if etype == "content":
                         buf_content += val
+                        if not _role_sent:
+                            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                            _role_sent = True
+                        if not _content_streaming:
+                            # Check if buffer looks like a tool call — if so, suppress
+                            stripped = buf_content.lstrip()
+                            if stripped.upper().startswith("TOOL_CALL") or stripped.upper().startswith("TOOL_"):
+                                continue  # Don't stream, keep buffering
+                            # Check if buffer is long enough to be confident it's normal text
+                            if len(buf_content) > 60:
+                                _content_streaming = True
+                                # Flush the safe buffer as one chunk
+                                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                     "choices": [{"index": 0, "delta": {"content": buf_content}, "finish_reason": None}]}
+                                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                        else:
+                            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                 "choices": [{"index": 0, "delta": {"content": val}, "finish_reason": None}]}
+                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                     elif etype == "thinking":
                         r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                              "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
@@ -1308,19 +1365,17 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                         return
                     elif etype == "done":
                         break
-                # Parse tool_calls (extract_tool_call returns (list_or_None, cleaned_content))
+                # Flush remaining buffer (short answers < 60 chars)
+                if buf_content and not _content_streaming:
+                    tc_result, _ = extract_tool_call(buf_content, get_tool_names(tools) if tools else None)
+                    if not tc_result:
+                        _content_streaming = True
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"content": buf_content}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                # Parse tool_calls from buffered content
                 tc_result, final_content = extract_tool_call(buf_content, get_tool_names(tools) if tools else None)
                 if tc_result:
-                    # role delta
-                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
-                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    # Send any natural language text before tool calls (but NOT the TOOL_CALL raw text)
-                    if final_content:
-                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                             "choices": [{"index": 0, "delta": {"content": final_content}, "finish_reason": None}]}
-                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    # tool_calls deltas
                     for i, tc in enumerate(tc_result):
                         delta = {"role": "assistant", "content": None,
                                  "tool_calls": [{"index": i, "id": tc["id"], "type": "function",
@@ -1328,21 +1383,14 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                         r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                              "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                        # arguments delta
                         args = tc["function"]["arguments"]
                         r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                              "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": args}}]}, "finish_reason": None}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    # finish
                     r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                          "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
                     yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                 else:
-                    # No tool calls found, output buffered content
-                    if buf_content:
-                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                             "choices": [{"index": 0, "delta": {"content": buf_content}, "finish_reason": None}]}
-                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                     r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                          "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                     yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
@@ -1350,12 +1398,20 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 return
 
             # No tools: normal streaming
+            _stream_think_count = 0
+            _stream_content_count = 0
+            # Send role delta first — many clients need this to start rendering
+            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
             for etype, val in _parse_sse(resp):
                 if etype == "content":
+                    _stream_content_count += 1
                     r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                          "choices": [{"index": 0, "delta": {"content": val}, "finish_reason": None}]}
                     yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                 elif etype == "thinking":
+                    _stream_think_count += 1
                     r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                          "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
                     yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
@@ -1364,6 +1420,8 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     yield "data: [DONE]\n\n"
                     return
                 elif etype == "done":
+                    if thinking_enabled:
+                        _vlog(f"STREAM_DONE: thinking_chunks={_stream_think_count} content_chunks={_stream_content_count}")
                     yield "data: [DONE]\n\n"
                     return
 
@@ -1373,7 +1431,8 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             yield "data: [DONE]\n\n"
 
     def do_nonstream():
-        """Non-streaming: separate request, collect all content."""
+        """Non-streaming: use stream=True internally (curl_cffi stream=False
+        returns incomplete SSE), buffer all events, return complete JSON response."""
         full_content = ""
         full_thinking = ""
 
@@ -1383,12 +1442,12 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 headers=req_headers,
                 json=req_body,
                 impersonate="chrome120",
-                stream=False,
+                stream=True,  # Always stream — curl_cffi stream=False truncates SSE
                 timeout=120,
             )
 
-            if ref_file_ids:
-                _vlog(f"chat nonstream response: status={resp.status_code}")
+            if ref_file_ids or thinking_enabled:
+                _vlog(f"chat nonstream(stream-internal) response: status={resp.status_code} ct={resp.headers.get('content-type','?')}")
 
             if resp.status_code == 401 and not is_retry:
                 print("[Token] 401 in nonstream, trying refresh...")
@@ -1411,54 +1470,32 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     }
                 })
 
-            # Parse SSE from resp.text (non-streaming response is complete SSE in body)
-            text = resp.text
-            lines = text.split("\n")
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        obj = json.loads(data_str)
-                        # Error event: {"type": "error", "content": "...", "finish_reason": "..."}
-                        if isinstance(obj, dict) and obj.get("type") == "error":
-                            raise HTTPException(502, detail={"error": {
-                                "message": obj.get("content", "unknown"),
-                                "type": "server_error",
-                                "code": obj.get("finish_reason", "")
-                            }})
-                        # Toast error in v field
-                        val = obj.get("v")
-                        if isinstance(val, dict) and val.get("type") == "error":
-                            raise HTTPException(502, detail={"error": {
-                                "message": val.get("content", "unknown"),
-                                "type": "server_error",
-                                "code": val.get("finish_reason", "")
-                            }})
-                        # Content extraction
-                        path = obj.get("p", "")
-                        v = obj.get("v", "")
-                        if path == "response/content" and obj.get("o") == "APPEND" and isinstance(v, str):
-                            full_content += v
-                        elif path == "response/thinking_content" and isinstance(v, str):
-                            full_thinking += v
-                        elif not path and isinstance(v, str):
-                            # Ambiguous: could be content or thinking
-                            full_content += v
-                    except HTTPException:
-                        raise
-                    except Exception:
-                        pass
-                i += 1
+            # Buffer all events from stream using _parse_sse
+            for etype, val in _parse_sse(resp):
+                if etype == "content":
+                    full_content += val
+                elif etype == "thinking":
+                    full_thinking += val
+                elif etype == "error":
+                    raise HTTPException(502, detail={"error": {
+                        "message": val["message"],
+                        "type": "server_error",
+                        "code": val.get("code", "")
+                    }})
+                elif etype == "done":
+                    break
 
         except HTTPException:
             raise
         except Exception as e:
             print(f"[nonstream] Error: {e}")
             raise HTTPException(502, detail={"error": {"message": str(e), "type": "server_error"}})
+
+        # Debug: log extracted thinking/content for thinking models
+        if thinking_enabled:
+            _vlog(f"NONSTREAM_RESULT: thinking={len(full_thinking)} chars, content={len(full_content)} chars")
+            _vlog(f"NONSTREAM_THINKING[:500]: {full_thinking[:500]}")
+            _vlog(f"NONSTREAM_CONTENT[:500]: {full_content[:500]}")
 
         # 如果有 tools，检查 content 中是否包含 tool_call 标签
         finish_reason = "stop"

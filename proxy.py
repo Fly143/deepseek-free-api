@@ -719,9 +719,9 @@ def get_pow_response(target_path: str = "/api/v0/chat/completion") -> str | None
             else:
                 print(f"[PoW] No challenge: {data}")
         else:
-            print(f"[PoW] Request failed {resp.status_code}: {resp.text[:200]}")
+                print(f"[PoW] Request failed {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        print(f"[PoW] Error: {e}")
+            print(f"[PoW] Error: {e}")
     return None
 
 
@@ -743,7 +743,6 @@ async def chat(request: Request):
     tools = body.get("tools", None)
 
     # Debug: log to console
-    print(f"[DEBUG] model={model}, stream={stream}, tools={'yes' if tools else 'no'}, msgs={len(messages)}")
 
     # 模型映射
     model_info = get_models().get(model, get_models().get("deepseek-default"))
@@ -799,6 +798,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         "search_enabled": search_enabled,
     }
 
+
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
@@ -826,12 +826,21 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         # Track non-JSON lines for error detection
         non_json_line_count = 0
         phase = "thinking"
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            if isinstance(line, bytes):
-                line = line.decode("utf-8", errors="ignore")
-            line = line.strip()
+        _line_buf = b""
+        def _read_lines():
+            nonlocal _line_buf
+            for chunk in resp.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                _line_buf += chunk
+                while b"\n" in _line_buf:
+                    raw_line, _line_buf = _line_buf.split(b"\n", 1)
+                    yield raw_line.decode("utf-8", errors="ignore").strip()
+            # flush remaining buffer
+            if _line_buf.strip():
+                yield _line_buf.decode("utf-8", errors="ignore").strip()
+
+        for line in _read_lines():
             if not line:
                 continue
 

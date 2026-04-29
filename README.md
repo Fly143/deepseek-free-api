@@ -7,6 +7,7 @@
 将 **DeepSeek 网页端免费对话**（chat.deepseek.com）反代为 **OpenAI 兼容 API**，支持工具调用（Function Calling）、动态模型发现、PoW 自动求解、Token 自动刷新。
 
 本项目所修改代码均为ai完成，不含任何一句人工代码，望周知！
+
 [zhangjiabo522](https://github.com/zhangjiabo522) — 大力感谢热心群友为 Vision 功能修改测试提供模型Token算力
 
 > **参考项目：** [NIyueeE/ds-free-api](https://github.com/NIyueeE/ds-free-api)（Rust 版），本项目为 Python 重写。

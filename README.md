@@ -115,11 +115,6 @@ git clone https://github.com/Fly143/deepseek-free-api.git
 cd ds-free-api
 chmod +x deploy.sh
 
-# 方式二：解压 tar.gz 包
-tar xzf ds-free-api.tar.gz
-cd ds-free-api
-chmod +x deploy.sh
-
 # 前台启动（Ctrl+C 停止）
 ./deploy.sh
 

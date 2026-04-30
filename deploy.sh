@@ -146,7 +146,7 @@ fi
 info "依赖安装完成"
 
 # ── 6. 检查关键文件 ──
-for f in proxy.py tool_call.py pow_native.py pow_solver.js; do
+for f in proxy.py pow_native.py pow_solver.js; do
     [ -f "$f" ] || error "缺少 $f，请确认部署包完整"
 done
 info "文件检查通过"

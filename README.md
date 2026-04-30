@@ -110,7 +110,12 @@ pkg install nodejs
 # Linux:
 # sudo apt install nodejs
 
-# 解压并部署
+# 方式一：直接克隆（推荐）
+git clone https://github.com/Fly143/deepseek-free-api.git
+cd ds-free-api
+chmod +x deploy.sh
+
+# 方式二：解压 tar.gz 包
 tar xzf ds-free-api.tar.gz
 cd ds-free-api
 chmod +x deploy.sh

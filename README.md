@@ -52,7 +52,8 @@
 - **PoW 自动求解** — Node.js WASM 主求解器 + Python 纯算法回退，请求前自动获取 challenge 并求解
 - **Token 自动刷新** — 检测到 401 时自动用保存的密码重新登录，无需人工干预
 - **深度思考** — 支持 DeepSeek 的 `<thought>` 标签，流式输出时分离为 `reasoning_content`
-- **Vision 图像理解** — 支持图片上传、解析、对话，Vision 模型同时支持工具调用
+- **Vision 图像理解** — 支持图片上传、解析、对话
+- **文本文件上传** — 支持 .txt/.md/.py 等文本文件直接上传对话，走 ref_file_ids（和网页端一致）
 - **联网搜索** — 支持 search 模型变体的 `search_enabled` 参数
 - **管理面板** — 内嵌单文件 Web UI，支持手机号/邮箱登录、cURL 导入
 - **纯 HTTP 方案** — 不依赖浏览器/Playwright/Chrome，用 curl_cffi 模拟 Chrome TLS 指纹
@@ -76,10 +77,11 @@
 │  │ 模型发现 │  │   PoW 求解   │  │   Token 自动刷新      │ │
 │  │ (动态)   │  │ (Node+Python) │  │ (保存密码自动relogin) │ │
 │  └─────────┘  └──────────────┘  └──────────────────────┘ │
-│  ┌─────────┐  ┌──────────────┐                            │
-│  │ Vision  │  │ 文件上传/解析 │                            │
-│  │ 图像理解 │  │ (upload→fork) │                            │
-│  └─────────┘  └──────────────┘                            │
+│  ┌─────────┐  ┌──────────────────────────┐              │
+│  │ Vision  │  │ 文件上传/解析             │              │
+│  │ 图像理解 │  │ (图片: upload→fork→wait)  │              │
+│  └─────────┘  │ (文本: upload→wait)       │              │
+│               └──────────────────────────┘              │
 └───────────────┬──────────────────────────────────────────┘
                 │  HTTPS (curl_cffi, Chrome指纹)
                 ▼
@@ -211,7 +213,51 @@ curl http://localhost:8000/v1/chat/completions \
 
 流式响应中思考内容会出现在 `delta.reasoning_content` 字段，正式内容在 `delta.content`。
 
-   214### 4. 模型刷新
+### 4. 文件上传（文本 & 图片）
+
+**文本文件上传**（所有模型均支持，不 fork，走 `ref_file_ids`）：
+
+```bash
+# 准备文件 base64
+FILE_B64=$(base64 -w0 三体简介.txt)
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-default",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "这个文件是什么内容？"},
+        {"type": "file", "file": {"filename": "三体简介.txt", "file_data": "'"$FILE_B64"'"}}
+      ]
+    }]
+  }'
+```
+
+**Vision 图片上传**（需 Vision 模型，上传后 fork 到 vision 类型）：
+
+```bash
+# 准备图片 base64
+IMG_B64=$(base64 -w0 photo.png)
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-vision",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "描述这张图片"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$IMG_B64"'"}}
+      ]
+    }]
+  }'
+```
+
+> **注意：** 文本文件不 fork，直接等 DeepSeek 解析完成后引用原始 `file_id`；图片需要 fork 到 `"vision"` 才能被 Vision 模型读取。
+
+### 5. 模型刷新
 
 ```bash
 # 强制刷新模型列表（无需等待1小时缓存过期）

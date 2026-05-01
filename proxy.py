@@ -471,9 +471,14 @@ def _discover_models() -> dict:
             if not mt or not mc.get("enabled"):
                 continue
 
-            ff = mc.get("file_feature") or {}
-            max_in = ff.get("token_limit", 890880)
-            max_out = ff.get("token_limit_with_thinking", 890880)
+            # 上下文大小：优先从 input_character_limit 推算 (V4 系列 ≈ 1M tokens)，
+            # 对 Expert 等 UI 限制偏小的模型硬编码 1M
+            icl = mc.get("input_character_limit", 0) or 0
+            if icl >= 1_000_000:
+                max_in = int(icl * 0.4)      # 2621440 × 0.4 ≈ 1048576 (1M)
+            else:
+                max_in = 1_048_576            # Expert 等硬编码 1M
+            max_out = max_in                  # DeepSeek V4 输出上限即上下文大小
             has_think = mc.get("think_feature") is not None
             has_search = mc.get("search_feature") is not None
 

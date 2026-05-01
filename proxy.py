@@ -7,7 +7,17 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+import tiktoken
 from curl_cffi import requests as cffi_requests
+
+# ── Tokenizer ───────────────────────────────────
+_enc = tiktoken.get_encoding("cl100k_base")
+
+def _count_tokens(text: str) -> int:
+    return len(_enc.encode(text or ""))
+
+# ── 用量统计 ───────────────────────────────────
+from usage_store import add_usage, get_usage, clear_usage
 
 # ── 工具调用处理模块 ─────────────────────────────────
 from tool_call import (
@@ -132,6 +142,21 @@ hr{border:none;border-top:1px solid #334155;margin:24px 0}
 .info{font-size:12px;color:#94a3b8;margin-top:8px;padding:8px 12px;background:#0f172a;border-radius:8px;border-left:3px solid #3b82f6;display:none}
 .toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:14px;z-index:999;display:none}
 .ts{display:block;background:#064e3b;color:#6ee7b7}.te{display:block;background:#7f1d1d;color:#fca5a5}
+/* Usage table */
+.ut{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}
+.ut th,.ut td{padding:10px 12px;text-align:right;border-bottom:1px solid #334155}
+.ut th{color:#94a3b8;font-weight:500;font-size:11px;white-space:nowrap}
+.ut td{font-variant-numeric:tabular-nums}
+.ut tr:last-child td{border-bottom:none}
+.ut .ml{text-align:left}
+.ut .tr{font-weight:600;border-top:2px solid #2563eb}
+.ut .tr td{padding-top:14px;color:#93c5fd}
+.ue{text-align:center;color:#64748b;padding:40px 20px}
+/* Period buttons */
+.pb{padding:8px 16px;border-radius:8px;border:1px solid #334155;background:transparent;color:#e2e8f0;font-size:13px;cursor:pointer}
+.pb:hover{background:#1e293b;border-color:#2563eb}
+.pb.ac{background:#2563eb;color:#fff;border-color:#2563eb}
+.period-btn.active{background:#2563eb;color:#fff}
 a{color:#7dd3fc}
 .collapse{cursor:pointer;user-select:none;color:#64748b;font-size:12px;margin-top:8px}
 .collapse:hover{color:#94a3b8}
@@ -146,6 +171,7 @@ a{color:#7dd3fc}
 <div class="tab-bar">
 <div class="tab active" onclick="switchTab('phone')">手机号登录</div>
 <div class="tab" onclick="switchTab('email')">邮箱登录</div>
+<div class="tab" onclick="switchTab('usage')">用量统计</div>
 </div>
 
 <div id="phonePanel" class="panel active">
@@ -165,6 +191,7 @@ a{color:#7dd3fc}
 
 <div class="info" id="info"></div>
 
+<div id="apiSection">
 <div class="collapse" onclick="toggleCurl()">高级: 手动粘贴 cURL ▾</div>
 <div class="curl-box" id="curlBox">
 <textarea id="curl" placeholder="粘贴 cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px"></textarea>
@@ -185,13 +212,30 @@ a{color:#7dd3fc}
 <div id="modelsInfo" style="margin-top:8px;font-size:12px;color:#64748b;display:none"></div>
 </div>
 </div>
+</div>
+
+<div id="usagePanel" class="panel">
+<div id="usageContent"></div>
+<div style="margin-top:14px">
+<button class="pb ac" onclick="switchPeriod('total')" id="pbTotal">全部</button>
+<button class="pb" onclick="switchPeriod('week')" id="pbWeek">本周</button>
+<button class="pb" onclick="switchPeriod('today')" id="pbToday">今日</button>
+<button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:6px 12px;margin-left:8px" onclick="loadUsage()">刷新</button>
+<button class="btn" style="background:#7f1d1d;color:#fca5a5;font-size:12px;padding:6px 12px;margin-left:4px" onclick="clearUsage()">清空</button>
+</div>
+</div>
+</div>
 <div id="toast" class="toast"></div>
 <script>
 function Q(id){return document.getElementById(id)}
 function switchTab(type){
-document.querySelectorAll('.tab').forEach((t,i)=>{t.className='tab'+(i===(type==='phone'?0:1)?' active':'')});
+var ti={'phone':0,'email':1,'usage':2};
+document.querySelectorAll('.tab').forEach((t,i)=>{t.className='tab'+(i===ti[type]?' active':'')});
 Q('phonePanel').className='panel'+(type==='phone'?' active':'');
 Q('emailPanel').className='panel'+(type==='email'?' active':'');
+if(Q('usagePanel'))Q('usagePanel').className='panel'+(type==='usage'?' active':'');
+var as=Q('apiSection');if(as)as.style.display=type==='usage'?'none':'';
+if(type==='usage')loadUsage();
 }
 async function cs(){
 try{const r=await fetch('/api/config');const d=await r.json()
@@ -247,6 +291,30 @@ const names=d.data.map(m=>m.id).join(', ')
 info.style.display='block';info.innerHTML='✅ 发现 '+d.data.length+' 个模型: '+names;t('刷新成功')
 }catch(e){info.style.display='block';info.innerHTML='❌ 失败: '+e.message;t('刷新失败',1)}
 btn.disabled=false;btn.textContent='🔄 刷新模型列表'
+}
+// === 用量统计 ===
+var _up='total';
+function f(n){return n.toLocaleString()}
+async function loadUsage(){
+try{
+const r=await fetch('/api/usage');const d=await r.json();
+const p=d[_up]||d.total||{};const m=p.models||{};const t=p.total||{};
+const e=Object.entries(m).sort((a,b)=>b[1].total_tokens-a[1].total_tokens);
+if(!e.length&&!t.requests){Q('usageContent').innerHTML='<div class=ue>📊 暂无用量数据</div>';return}
+let h='<table class=ut><thead><tr><th class=ml>模型</th><th>请求</th><th>输入</th><th>输出</th><th>总计</th></tr></thead><tbody>';
+for(const[k,v]of e){h+=`<tr><td class=ml>${k}</td><td>${f(v.requests)}</td><td>${f(v.prompt_tokens)}</td><td>${f(v.completion_tokens)}</td><td>${f(v.total_tokens)}</td></tr>`}
+h+=`<tr class=tr><td class=ml>📋 合计</td><td>${f(t.requests)}</td><td>${f(t.prompt_tokens)}</td><td>${f(t.completion_tokens)}</td><td>${f(t.total_tokens)}</td></tr></tbody></table>`;
+Q('usageContent').innerHTML=h
+}catch(e){Q('usageContent').innerHTML='<div class=ue>加载失败: '+e.message+'</div>'}
+}
+function switchPeriod(p){
+_up=p;
+['total','week','today'].forEach(x=>{var b=Q('pb'+x.charAt(0).toUpperCase()+x.slice(1));if(b)b.className='pb'+(x===p?' ac':'')});
+loadUsage()
+}
+async function clearUsage(){
+if(!confirm('确定清空全部用量数据？'))return;
+try{await fetch('/api/usage',{method:'DELETE'});t('已清空');loadUsage()}catch(e){t('清空失败',1)}
 }
 cs()
 </script>
@@ -422,6 +490,26 @@ async def deepseek_login(data: dict):
 async def health():
     if CONFIG_FILE.exists(): return {"status": "ok", "configured": True}
     return {"status": "waiting", "configured": False}
+
+
+# ─── 用量统计 API ─────────────────────────────────────────────
+
+@app.get("/api/usage")
+async def usage_stats():
+    return get_usage()
+
+
+@app.delete("/api/usage")
+async def clear_usage_stats():
+    clear_usage()
+    return {"ok": True}
+
+
+# ─── 模型列表（免鉴权，供管理页面使用） ───────────────────────
+
+@app.get("/api/models")
+async def admin_models():
+    return {"models": list(get_models().keys())}
 
 
 # ── 模型映射（动态从 DeepSeek 探测）─────────────────
@@ -1101,6 +1189,7 @@ async def chat(request: Request):
 
     # 构建 prompt：使用 convert_messages_for_deepseek 处理完整多轮对话
     prompt = convert_messages_for_deepseek(messages, tools)
+    prompt_tokens = _count_tokens(prompt)
 
     # 如果有 tools 定义，将 TOOL_CALL 格式提示词注入到最后一条 [USER] 之前
     tool_prompt = build_tool_prompt(tools) if tools else ""
@@ -1122,6 +1211,27 @@ async def chat(request: Request):
                     ref_file_ids=ref_file_ids)
 
     # (Vision SSE wrapper removed — all models now stream directly via fragments format)
+
+    # 用量统计：非流式直接计数，流式包装生成器
+    if stream and hasattr(result, 'body_iterator'):
+        orig_iter = result.body_iterator
+        async def _counted_stream():
+            completion_text = ""
+            async for chunk in orig_iter:
+                s = chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else str(chunk)
+                if s.startswith("data: ") and not s.startswith("data: [DONE]"):
+                    try:
+                        obj = json.loads(s[6:])
+                        delta = obj.get("choices", [{}])[0].get("delta", {})
+                        c = delta.get("content", "") or ""
+                        r = delta.get("reasoning_content", "") or ""
+                        completion_text += (c + r)
+                    except: pass
+                yield chunk
+            add_usage(model, prompt_tokens, _count_tokens(completion_text))
+        result.body_iterator = _counted_stream()
+    else:
+        add_usage(model, prompt_tokens, 0)
     return result
 
 

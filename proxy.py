@@ -937,6 +937,46 @@ def extract_images_from_messages(messages: list) -> list[dict]:
     return [img for img in images if img is not None]
 
 
+def extract_text_files_from_messages(messages: list) -> list[dict]:
+    """Extract text files from OpenAI-format messages.
+
+    Returns list of dicts: {data: bytes, filename: str, content_type: str}
+    Handles type="file" content parts with base64 file_data or data fields.
+    """
+    import base64 as b64
+    files = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "file":
+                    file_obj = part.get("file", {})
+                    if isinstance(file_obj, dict):
+                        filename = file_obj.get("filename", "file.txt")
+                        file_data = file_obj.get("file_data", "") or file_obj.get("data", "")
+                        if file_data:
+                            try:
+                                data = b64.b64decode(file_data)
+                                ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "txt"
+                                ct_map = {
+                                    "md": "text/markdown", "py": "text/x-python",
+                                    "json": "application/json", "yaml": "text/yaml",
+                                    "yml": "text/yaml", "txt": "text/plain",
+                                    "csv": "text/csv", "xml": "text/xml",
+                                    "html": "text/html", "js": "text/javascript",
+                                    "css": "text/css", "sh": "text/x-shellscript",
+                                }
+                                content_type = ct_map.get(ext, "text/plain")
+                                files.append({
+                                    "data": data,
+                                    "filename": filename,
+                                    "content_type": content_type,
+                                })
+                            except Exception:
+                                continue
+    return files
+
+
 def _parse_image_url(url_or_data: str) -> dict | None:
     """Parse an image URL or base64 data string."""
     import base64 as b64
@@ -996,12 +1036,30 @@ async def chat(request: Request):
     model_info = get_models().get(model, get_models().get("deepseek-default"))
     thinking_enabled, search_enabled, _, _ = model_info
 
+    cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+    ref_file_ids = []
+    import time as _vtime
+
+    # 文本文件：上传到 DeepSeek（不 fork，等解析完直接用原始 file_id）
+    text_files = extract_text_files_from_messages(messages)
+    if text_files:
+        _t0 = _vtime.time()
+        _vlog(f"TEXT_FILES: found {len(text_files)} files")
+        raw_ids = []
+        for i, tf in enumerate(text_files):
+            _t1 = _vtime.time()
+            orig_fid = upload_file_to_deepseek(tf["data"], tf["filename"], tf["content_type"])
+            _vlog(f"text_upload #{i} -> {orig_fid} ({_vtime.time()-_t1:.1f}s)")
+            if orig_fid:
+                raw_ids.append(orig_fid)
+        if raw_ids:
+            text_ids = wait_for_file_parsing(cfg, raw_ids, timeout=30)
+            ref_file_ids.extend(text_ids)
+            _vlog(f"TEXT_DONE: {len(text_ids)}/{len(raw_ids)} ready ({_vtime.time()-_t0:.1f}s)")
+
     # Vision 模型：提取、上传、fork 图片
     is_vision = "vision" in model
-    ref_file_ids = []
-    cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
     if is_vision:
-        import time as _vtime
         _t0 = _vtime.time()
         _vlog(f"START model={model} msgs={len(messages)}")
         images = extract_images_from_messages(messages)
@@ -1088,8 +1146,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         req_headers["x-ds-pow-response"] = pow_response
 
     # model_type 字段：DeepSeek 根据此值路由到不同模型后端。
-    # 不发送则默认路由到 "default"，所以所有模型都应显式指定。
-    # 映射：模型名含 "expert" → "expert"，含 "vision" → "vision"，其余 → "default"
+    # 映射：模型名含 "vision" → "vision"，含 "expert" → "expert"，其余 → "default"
     req_body = {
         "chat_session_id": session_id,
         "parent_message_id": None,
@@ -1098,9 +1155,10 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         "thinking_enabled": thinking_enabled,
         "search_enabled": search_enabled,
     }
-    if ref_file_ids:
+    if "vision" in model:
         req_body["model_type"] = "vision"
-        _vlog(f"chat request files={ref_file_ids} thinking={thinking_enabled}")
+        if ref_file_ids:
+            _vlog(f"chat request files={ref_file_ids} thinking={thinking_enabled}")
     elif "expert" in model:
         req_body["model_type"] = "expert"
     else:

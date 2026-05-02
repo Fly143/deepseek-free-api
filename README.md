@@ -114,7 +114,7 @@ pkg install nodejs
 
 # 直接克隆（推荐）
 git clone https://github.com/Fly143/deepseek-free-api.git
-cd ds-free-api
+cd deepseek-free-api
 chmod +x deploy.sh
 
 # 前台启动（Ctrl+C 停止）

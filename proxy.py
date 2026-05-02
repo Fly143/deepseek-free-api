@@ -212,7 +212,6 @@ a{color:#7dd3fc}
 <div id="modelsInfo" style="margin-top:8px;font-size:12px;color:#64748b;display:none"></div>
 </div>
 </div>
-</div>
 
 <div id="usagePanel" class="panel">
 <div id="usageContent"></div>

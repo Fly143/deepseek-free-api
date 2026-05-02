@@ -50,7 +50,7 @@
 ## 特性
 
 - **OpenAI 完全兼容** — 标准 `/v1/chat/completions`（流式/非流式）、`/v1/models`、`/v1/models/{id}`、`/v1/models/refresh` 端点
-- **工具调用（Function Calling）** — 提示词注入 TOOL_CALL 指令 + 8 策略提取（TOOL_CALL/JSON/XML/中文/execute_operation/自由文本/裸shell命令），支持流式与非流式
+- **工具调用（Function Calling）** — DSML XML + CDATA 格式（参照 ds2api），流式筛分实时分离正文/工具调用 + fallback 全量解析，DeepSeek V3/R1 原生对话标记
 - **动态模型发现** — 启动时从 DeepSeek 官方 API 实时探测模型列表，每小时自动刷新（含上下文大小等完整信息）
 - **PoW 自动求解** — Node.js WASM 主求解器 + Python 纯算法回退，请求前自动获取 challenge 并求解
 - **Token 自动刷新** — 检测到 401 时自动用保存的密码重新登录，无需人工干预
@@ -74,8 +74,8 @@
 ┌──────────────────────────────────────────────────────────┐
 │                 DeepSeek Free API Proxy (FastAPI)           │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
-│  │ 路由层   │  │  tool_call   │  │   curl_cffi 客户端    │ │
-│  │ /v1/*   │──│ (8策略提取)   │──│ (模拟Chrome指纹)      │ │
+│  │ 路由层   │  │  tool_call   │  │  tool_sieve  │  │  tool_dsml   │  │   curl_cffi 客户端    │ │
+│  │ /v1/*   │──│ (DSML提示词) │──│ (流式筛分)   │──│ (DSML解析)   │──│ (模拟Chrome指纹)      │ │
 │  └─────────┘  └──────────────┘  └──────────────────────┘ │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
 │  │ 模型发现 │  │   PoW 求解   │  │   Token 自动刷新      │ │
@@ -374,63 +374,47 @@ def _discover_models():
 
 ## 工具调用详解
 
-DeepSeek 网页端**不支持**原生 function calling。本代理通过**提示词注入 + 8 策略提取**实现。
+DeepSeek 网页端**不支持**原生 function calling。本代理通过 **DSML XML + CDATA 提示词注入** + **流式筛分** + **DSML 解析**实现，参照 [ds2api](https://github.com/CJackHwang/ds2api)。
 
 ### 提示词注入
 
-将 OpenAI tools 定义转换为 TOOL_CALL 指令格式，注入到最后一条 `[USER]` 消息之前：
+注入 DSML 格式的工具调用指令（`build_dsml_tool_prompt`）：
 
-```text
-## 可用工具
-当用户请求需要调用工具时，你必须在回复中包含一行 TOOL_CALL 指令。
-格式: TOOL_CALL: 工具名(参数1=值1, 参数2="值2")
-
-规则:
-- TOOL_CALL 必须在单独一行
-- 括号内参数用逗号分隔，字符串值用引号包裹
-- 整数/布尔值不要加引号
-- 如果不需要调用工具，直接回答，不输出 TOOL_CALL
-
-示例:
-TOOL_CALL: get_weather(city="北京")
-TOOL_CALL: search_web(query="latest AI news", page=1)
-
-可用工具列表:
-- get_weather: 查询指定城市的天气
-    city*(string): 城市名称
+```xml
+<|DSML|tool_calls>
+  <|DSML|invoke name="get_weather">
+    <|DSML|parameter name="city"><![CDATA[北京]]></|DSML|parameter>
+  </|DSML|invoke>
+</|DSML|tool_calls>
 ```
 
-### 8 种提取策略（按优先级）
+包含完整的格式规则、错误示例和正确示例。
 
-| # | 策略 | 格式 | 说明 |
-|---|------|------|------|
-| 1 | TOOL_CALL | `TOOL_CALL: name(key=value, ...)` | 大小写不敏感，支持嵌套括号，自动类型推断 |
-| 2 | JSON | `{"name":"x","arguments":{...}}` | 内嵌 JSON 对象解析 |
-| 3 | tool_call XML | tool_call XML 标签 | MiMo 原生格式 |
-| 4 | function_call | function_call JSON+XML | JSON 包裹在 XML 标签中 |
-| 4.5 | bare function XML | 裸 function XML 标签 | 无包裹的 function 标签 |
-| 5 | 中文格式 | [调用工具: NAME] | 模型从历史中学到的中文格式 |
-| 5.5 | execute_operation | execute_operation XML | DeepSeek 自由 XML 格式 |
-| 6 | 自由文本 | `name(args)` | 低优先级兜底，无 TOOL_CALL 前缀 |
-| 7 | 裸 shell 命令 | `ls -la` / `date` | 短文本中直接出现的 shell 命令 |</parameter>` | XML 标签解析 |
+### 流式筛分（`tool_sieve.py`）
 
-> **注意：** `<thought>` 标签内的 TOOL_CALL 会被自动忽略（避免把思考内容误判为工具调用）。
+有工具调用且 `stream: true` 时，`StreamSieve` 引擎逐字扫描 DeepSeek 响应流，实时分离正文和 DSML 工具调用：
+- **正文** → 即时转为 `delta.content` 逐块输出
+- **DSML 块** → 缓冲至闭合后解析为 `tool_calls`
 
-### 参数类型推断
+筛分未命中时自动 fallback 到全量缓冲解析，确保可靠性。
 
-自动将参数值转换为正确类型：
-- `"true"` / `"false"` → 布尔值
-- `"null"` / `"none"` → None
-- 纯数字 → `int` 或 `float`
-- 其余 → 保留字符串
+### DSML 解析（`tool_dsml.py`）
 
-### 多轮对话支持
+参照 ds2api 的字符级扫描引擎：
+- **前缀剥离** — 逐字符消费 `|`、空格、`dsml` 标记，保留标准 XML
+- **CDATA 处理** — `SanitizeLooseCDATA` 修复未闭合 CDATA
+- **XML 解析** — 递归解析 `<invoke>` → `<parameter>` 标签
+- **camelCase 适配** — 自动将模型输出的 camelCase 工具名转换为 snake_case
 
-`convert_messages_for_deepseek()` 函数处理完整的多轮对话历史：
-- `system` → `[SYS]`
-- `user` → `[USER]`
-- `assistant` + `tool_calls` → `[ASST]` + `TOOL_CALL:` 行
-- `tool` → `[TOOL_RESULT name]`
+### DeepSeek 原生对话标记
+
+`convert_messages_for_deepseek` 使用 DeepSeek V3/R1 原生标记（参照 ds2api 的 `MessagesPrepare`）：
+
+```
+<｜begin▁of▁sentence｜><｜System｜>系统消息<｜end▁of▁instructions｜><｜User｜>用户消息<｜Assistant｜>
+```
+
+相比旧版 `[SYS]`/`[USER]` ASCII 标签，原生标记使模型更稳定地输出 DSML 格式。
 
 ## 无工具分支 (no-tools)
 
@@ -550,7 +534,9 @@ curl http://localhost:8000/health
 ```
 ds-free-api/
 ├── proxy.py              # 主程序：FastAPI 应用、SSE 解析、OpenAI 端点、管理面板
-├── tool_call.py          # 工具调用模块：提示词注入、3策略提取、响应清理
+├── tool_call.py          # 工具调用模块：DSML 提示词构建、DSML 解析入口、多轮对话转换
+├── tool_dsml.py          # DSML 解析器：字符级前缀剥离、CDATA 处理、XML 参数解析
+├── tool_sieve.py         # 流式筛分引擎：实时分离正文/DSML 工具调用
 ├── pow_native.py         # PoW 求解器：Node.js WASM 主求解 + Python 回退
 ├── pow_solver.js         # Node.js PoW 求解脚本（调用 WASM）
 ├── sha3_wasm_bg.wasm     # SHA3 WASM 二进制
@@ -565,7 +551,9 @@ ds-free-api/
 | 文件 | 职责 | 行数 |
 |------|------|------|
 | `proxy.py` | 应用入口、路由、SSE 解析、DeepSeek API 交互、Token 刷新、管理面板 UI | ~1524 |
-| `tool_call.py` | TOOL_CALL 提示词构建、8 策略提取、camelCase 匹配、响应清理、多轮对话转换 | ~1001 |
+| `tool_call.py` | DSML 提示词构建、DSML 解析入口、camelCase 匹配、多轮对话转换 | ~247 |
+| `tool_dsml.py` | 字符级 DSML 前缀剥离、CDATA 修复、XML 解析、工具历史格式化 | ~350 |
+| `tool_sieve.py` | 流式筛分：实时分离正文/DSML 块，fallback 全量解析 | ~180 |
 | `pow_native.py` | PoW 求解器（Node.js 子进程 + Python 纯算法回退） | ~124 |
 | `deploy.sh` | 一键部署（环境检查、依赖安装、启动/停止/状态） | ~198 |
 
@@ -668,4 +656,5 @@ MIT License
 
 **参考项目：**
 - [NIyueeE/ds-free-api](https://github.com/NIyueeE/ds-free-api) — Rust 原版，提供了 DeepSeek API 逆向思路和 PoW 算法参考
+- [CJackHwang/ds2api](https://github.com/CJackHwang/ds2api) — DSML 工具调用格式、流式筛分架构、DeepSeek 原生对话标记 均参考此项目
 - [xstjmark21-cmyk](https://github.com/xstjmark21-cmyk) — 为 Vision 功能修改测试提供模型Token算力

@@ -5,13 +5,10 @@ DeepSeek 网页 → API 代理（纯 HTTP 转发，无浏览器依赖）
 import json, os, shlex, time, uuid, webbrowser, base64, re, secrets
 from pathlib import Path
 
-import tiktoken
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+import tiktoken
 from curl_cffi import requests as cffi_requests
-
-# ── PoW (Proof of Work) Solver — 纯 Python 实现（无 WASM 依赖）────────
-from pow_native import DeepSeekPOW
 
 # ── Tokenizer ───────────────────────────────────
 _enc = tiktoken.get_encoding("cl100k_base")
@@ -21,6 +18,21 @@ def _count_tokens(text: str) -> int:
 
 # ── 用量统计 ───────────────────────────────────
 from usage_store import add_usage, get_usage, clear_usage
+
+# ── 工具调用处理模块 ─────────────────────────────────
+from tool_call import (
+    build_tool_prompt,
+    extract_tool_call,
+    get_tool_names,
+    convert_messages_for_deepseek,
+)
+
+# ── 流式筛分 + DSML 解析 ────────────────────────────
+from tool_sieve import StreamSieve, SieveEvent
+from tool_dsml import parse_dsml_tool_calls as _parse_dsml
+
+# ── PoW (Proof of Work) Solver — 纯 Python 实现（无 WASM 依赖）────────
+from pow_native import DeepSeekPOW
 
 # Initialize PoW solver
 pow_solver = DeepSeekPOW()
@@ -38,33 +50,6 @@ def _vlog(msg: str):
             f.write(f"[{ts}] {msg}\n")
     print(f"[Vision] {msg}", flush=True)
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
-
-# ── 消息转换（无工具调用版）──────────────────────────
-
-def _messages_to_prompt(messages: list) -> str:
-    """将 OpenAI 格式消息转为 DeepSeek 纯文本 prompt，不含工具调用。"""
-    parts = []
-    for msg in messages:
-        role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")
-        content = ""
-        if isinstance(msg, dict):
-            c = msg.get("content", "")
-            if isinstance(c, str):
-                content = c
-            elif isinstance(c, list):
-                content = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
-        else:
-            content = getattr(msg, "content", "") or ""
-        
-        if role == "system":
-            parts.append(f"[SYS]\n{content}")
-        elif role == "user":
-            parts.append(f"[USER]\n{content}")
-        elif role == "assistant":
-            parts.append(f"[ASST]\n{content}")
-        elif role == "tool":
-            continue  # 无工具模式跳过 tool 消息
-    return "\n".join(parts)
 
 # ── cURL 解析 ──────────────────────────────────────────
 def parse_curl(curl: str) -> dict:
@@ -161,10 +146,6 @@ hr{border:none;border-top:1px solid #334155;margin:24px 0}
 .info{font-size:12px;color:#94a3b8;margin-top:8px;padding:8px 12px;background:#0f172a;border-radius:8px;border-left:3px solid #3b82f6;display:none}
 .toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:14px;z-index:999;display:none}
 .ts{display:block;background:#064e3b;color:#6ee7b7}.te{display:block;background:#7f1d1d;color:#fca5a5}
-a{color:#7dd3fc}
-.collapse{cursor:pointer;user-select:none;color:#64748b;font-size:12px;margin-top:8px}
-.collapse:hover{color:#94a3b8}
-.curl-box{display:none;margin-top:10px}
 /* Usage table */
 .ut{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}
 .ut th,.ut td{padding:10px 12px;text-align:right;border-bottom:1px solid #334155}
@@ -181,6 +162,10 @@ a{color:#7dd3fc}
 .pb:hover{background:#1e293b;border-color:#2563eb}
 .pb.ac{background:#2563eb;color:#fff;border-color:#2563eb}
 .period-btn.active{background:#2563eb;color:#fff}
+a{color:#7dd3fc}
+.collapse{cursor:pointer;user-select:none;color:#64748b;font-size:12px;margin-top:8px}
+.collapse:hover{color:#94a3b8}
+.curl-box{display:none;margin-top:10px}
 </style>
 </head>
 <body>
@@ -253,7 +238,6 @@ document.querySelectorAll('.tab').forEach((t,i)=>{t.className='tab'+(i===ti[type
 Q('phonePanel').className='panel'+(type==='phone'?' active':'');
 Q('emailPanel').className='panel'+(type==='email'?' active':'');
 if(Q('usagePanel'))Q('usagePanel').className='panel'+(type==='usage'?' active':'');
-// 用量统计tab隐藏API配置
 var as=Q('apiSection');if(as)as.style.display=type==='usage'?'none':'';
 if(type==='usage')loadUsage();
 }
@@ -763,7 +747,7 @@ async def models():
             "owned_by": "deepseek",
             "max_input_tokens": mi, "max_output_tokens": mo,
             "context_length": mi, "context_window": mi,
-            "supported_parameters": ["temperature", "max_tokens", "stream"],
+            "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens", "stream"],
         })
     return {"object": "list", "data": data}
 
@@ -795,7 +779,7 @@ async def refresh_models():
             "owned_by": "deepseek",
             "max_input_tokens": mi, "max_output_tokens": mo,
             "context_length": mi, "context_window": mi,
-            "supported_parameters": ["temperature", "max_tokens", "stream"],
+            "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens", "stream"],
         })
     return {"object": "list", "data": data}
 
@@ -1132,10 +1116,11 @@ async def chat(request: Request):
     messages = body.get("messages", [])
     model = body.get("model", "deepseek-default")
     stream = body.get("stream", False)
+    tools = body.get("tools", None)
 
     # Log client info for debugging
     ua = request.headers.get("user-agent", "?")[:60]
-    msg = f"[REQ] model={model} stream={stream} msgs={len(messages)} ua={ua}"
+    msg = f"[REQ] model={model} stream={stream} msgs={len(messages)} tools={bool(tools)} ua={ua}"
     print(msg, flush=True)
     _vlog(msg)
 
@@ -1206,17 +1191,31 @@ async def chat(request: Request):
         except Exception as e:
             _vlog(f"fresh session failed: {e}")
 
-    # 构建 prompt：纯文本转换，无工具调用
-    prompt = _messages_to_prompt(messages)
+    # 构建 prompt：使用 convert_messages_for_deepseek 处理完整多轮对话
+    prompt = convert_messages_for_deepseek(messages, tools)
     prompt_tokens = _count_tokens(prompt)
+
+    # 如果有 tools 定义，将工具提示词注入到最后一个 USER 标记之前
+    tool_prompt = build_tool_prompt(tools) if tools else ""
+    if tool_prompt:
+        # 原生格式：找最后一个 <｜User｜>
+        last_user_idx = prompt.rfind("<｜User｜>")
+        if last_user_idx != -1:
+            prompt = prompt[:last_user_idx] + tool_prompt + "\n" + prompt[last_user_idx:]
+        else:
+            prompt = tool_prompt + "\n" + prompt
+
+    has_tools = bool(tools)
 
     # Try streaming for all models including vision with images.
     # Old issue: vision stream put everything in thinking_content, but the new
     # fragments format (THINK/RESPONSE) should handle this correctly now.
 
     result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
-                    is_retry=False,
+                    is_retry=False, has_tools=has_tools, tools=tools,
                     ref_file_ids=ref_file_ids)
+
+    # (Vision SSE wrapper removed — all models now stream directly via fragments format)
 
     # 用量统计：非流式直接计数，流式包装生成器
     if stream and hasattr(result, 'body_iterator'):
@@ -1236,29 +1235,12 @@ async def chat(request: Request):
                 yield chunk
             add_usage(model, prompt_tokens, _count_tokens(completion_text))
         result.body_iterator = _counted_stream()
-    elif not stream:
-        # 非流式：从响应中提取内容
-        try:
-            if hasattr(result, 'body'):
-                body = json.loads(result.body.decode()) if isinstance(result.body, bytes) else result
-            else:
-                body = result
-            content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
-            reasoning = body.get("choices", [{}])[0].get("message", {}).get("reasoning_content", "")
-            completion_tokens = _count_tokens((content or "") + (reasoning or ""))
-            # Update the usage in response
-            body["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
-            result = JSONResponse(body)
-            add_usage(model, prompt_tokens, completion_tokens)
-        except Exception as e:
-            print(f"[Usage] non-stream counting failed: {e}")
-            add_usage(model, prompt_tokens, 0)
-
-    # (Vision SSE wrapper removed — all models now stream directly via fragments format)
+    else:
+        add_usage(model, prompt_tokens, 0)
     return result
 
 
-def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, ref_file_ids=None):
+def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None, ref_file_ids=None):
     """核心聊天逻辑，支持 token 过期后重试
     
     DeepSeek SSE 流结构（thinking_enabled=True 时）：
@@ -1413,16 +1395,24 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     if t_type == "error" and fr:
                         yield ("error", {"message": t_content, "code": fr})
                         return
-                    # New format: metadata with response.fragments → extract fragment type
+                    # New format: metadata with response.fragments → extract fragment type & content
                     resp_data = val.get("response", {})
                     if isinstance(resp_data, dict):
                         frags = resp_data.get("fragments", [])
                         if frags and isinstance(frags, list):
-                            last_frag = frags[-1]
-                            if isinstance(last_frag, dict) and last_frag.get("type"):
-                                fragment_type = last_frag["type"]
-                                if thinking_enabled:
-                                    _vlog(f"SSE: fragment_type={fragment_type}")
+                            for frag in frags:
+                                if isinstance(frag, dict):
+                                    ftype = frag.get("type", "")
+                                    if ftype:
+                                        fragment_type = ftype
+                                        if thinking_enabled:
+                                            _vlog(f"SSE: fragment_type={fragment_type}")
+                                    fcontent = frag.get("content", "")
+                                    if fcontent and isinstance(fcontent, str):
+                                        if fragment_type == "THINK":
+                                            yield ("thinking", fcontent)
+                                        else:
+                                            yield ("content", fcontent)
                     continue
 
                 path = obj.get("p", "")
@@ -1459,15 +1449,19 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                             yield ("content", val)
                     continue
 
-                # ── Old format: response/thinking_content + response/content ──
-                if path == "response/content" and obj.get("o") == "APPEND":
-                    phase = "content"
-                    if isinstance(val, str) and val:
-                        yield ("content", val)
+                # ── Old format: response/content + response/thinking_content ──
+                if path == "response/content":
+                    o_val = obj.get("o")
+                    if o_val is None or o_val == "APPEND":
+                        phase = "content"
+                        if isinstance(val, str) and val:
+                            yield ("content", val)
                 elif path == "response/thinking_content" and thinking_enabled:
-                    phase = "thinking"
-                    if isinstance(val, str) and val:
-                        yield ("thinking", val)
+                    o_val = obj.get("o")
+                    if o_val is None or o_val == "APPEND":
+                        phase = "thinking"
+                        if isinstance(val, str) and val:
+                            yield ("thinking", val)
                 elif path:
                     continue  # other metadata (status, elapsed_secs, BATCH, etc.)
                 elif isinstance(val, str) and val:
@@ -1507,7 +1501,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 print("[Token] 401, trying refresh...")
                 new_cfg = relogin(cfg)
                 if new_cfg:
-                    for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, ref_file_ids):
+                    for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids):
                         yield chunk
                     return
                 yield f'data: {json.dumps({"error": {"message": "Token expired", "type": "auth_error", "code": 401}})}\n\n'
@@ -1521,7 +1515,105 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 yield "data: [DONE]\n\n"
                 return
 
-            # Normal streaming
+            if has_tools:
+                # 输出 tool_calls SSE 事件的辅助函数
+                def _emit_tool_calls(tc_result, _cid, _created, _model):
+                    if tc_result:
+                        for i, tc in enumerate(tc_result):
+                            delta = {"role": "assistant", "content": None,
+                                     "tool_calls": [{"index": i, "id": tc["id"], "type": "function",
+                                                     "function": {"name": tc["function"]["name"], "arguments": ""}}]}
+                            r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
+                                 "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                            args = tc["function"]["arguments"]
+                            r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
+                                 "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": args}}]}, "finish_reason": None}]}
+                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                        r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
+                             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    else:
+                        r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
+                             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+
+                # 流式筛分 + 并行缓冲：筛分实时播正文，同时攒完整内容做 fallback
+                def _parse_fn(text):
+                    return extract_tool_call(text, get_tool_names(tools) if tools else [])
+
+                sieve = StreamSieve(parse_fn=_parse_fn)
+                _role_sent = False
+                _full_buf = ""  # 并行缓冲完整内容，flush 时 fallback 解析
+
+                for etype, val in _parse_sse(resp):
+                    if etype == "content":
+                        _full_buf += val
+                        for evt in sieve.feed(val):
+                            if evt.type == "text":
+                                if isinstance(evt.data, str) and evt.data:
+                                    if not _role_sent:
+                                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+                                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                                        _role_sent = True
+                                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                         "choices": [{"index": 0, "delta": {"content": evt.data}, "finish_reason": None}]}
+                                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    elif etype == "thinking":
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    elif etype == "error":
+                        yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
+                        yield "data: [DONE]\n\n"
+                        return
+                    elif etype == "done":
+                        break
+
+                # Flush + fallback：筛分没抓到就用全量解析
+                _had_tool_calls = False
+                for evt in sieve.flush():
+                    if evt.type == "text":
+                        if isinstance(evt.data, str) and evt.data:
+                            if not _role_sent:
+                                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+                                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                                _role_sent = True
+                            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                 "choices": [{"index": 0, "delta": {"content": evt.data}, "finish_reason": None}]}
+                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    elif evt.type == "tool_calls":
+                        _had_tool_calls = True
+                        for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
+                            yield chunk
+
+                # Fallback: 筛分没抓到，用全量缓冲重试
+                if not _had_tool_calls and _full_buf:
+                    tc_result, _ = extract_tool_call(_full_buf, get_tool_names(tools) if tools else [])
+                    if tc_result:
+                        if not _role_sent:
+                            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                            _role_sent = True
+                        _had_tool_calls = True
+                        for chunk in _emit_tool_calls(tc_result, chat_id, created, model):
+                            yield chunk
+
+                if not _role_sent:
+                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                elif not _had_tool_calls:
+                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                yield "data: [DONE]\n\n"
+                return
+
+            # No tools: normal streaming
             _stream_think_count = 0
             _stream_content_count = 0
             # Send role delta first — many clients need this to start rendering
@@ -1577,7 +1669,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 print("[Token] 401 in nonstream, trying refresh...")
                 new_cfg = relogin(cfg)
                 if new_cfg:
-                    return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, ref_file_ids=ref_file_ids)
+                    return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
 
             if resp.status_code != 200:
                 body_sample = ""
@@ -1621,11 +1713,22 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             _vlog(f"NONSTREAM_THINKING[:500]: {full_thinking[:500]}")
             _vlog(f"NONSTREAM_CONTENT[:500]: {full_content[:500]}")
 
-        # Build the message (no tool call extraction in no-tools mode)
+        # 如果有 tools，检查 content 中是否包含 tool_call 标签
         finish_reason = "stop"
-        msg = {"role": "assistant", "content": full_content}
+        tc_result = None
+        final_content = full_content
+        if has_tools:
+            tc_result, final_content = extract_tool_call(full_content, get_tool_names(tools) if tools else None)
+            if tc_result:
+                finish_reason = "tool_calls"
+
+        msg = {"role": "assistant", "content": final_content}
         if full_thinking:
             msg["reasoning_content"] = full_thinking
+        if tc_result:
+            msg["tool_calls"] = tc_result
+            if final_content is None:
+                msg["content"] = None
 
         # Build and validate response — pre-serialize to catch any issues early
         response_body = {
@@ -1655,9 +1758,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
     return do_nonstream()
 
 
-def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, ref_file_ids=None):
+def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, has_tools=False, tools=None, ref_file_ids=None):
     """Token 刷新重试专用的流式生成器"""
-    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, ref_file_ids=ref_file_ids)
+    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
     if isinstance(result, StreamingResponse):
         yield from result.body_iterator
     else:

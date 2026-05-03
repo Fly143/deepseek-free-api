@@ -133,20 +133,20 @@ info "工作目录: $WORK_DIR"
 # ── 5. 安装 Python 依赖 ──
 info "安装依赖..."
 if command -v pip3 &>/dev/null; then
-    pip3 install --quiet --break-system-packages fastapi uvicorn curl-cffi python-dotenv 2>/dev/null || \
-    pip3 install --quiet fastapi uvicorn curl-cffi python-dotenv 2>/dev/null || \
-    pip3 install fastapi uvicorn curl-cffi python-dotenv
+    pip3 install --quiet --break-system-packages fastapi uvicorn curl-cffi python-dotenv tiktoken 2>/dev/null || \
+    pip3 install --quiet fastapi uvicorn curl-cffi python-dotenv tiktoken 2>/dev/null || \
+    pip3 install fastapi uvicorn curl-cffi python-dotenv tiktoken
 elif command -v pip &>/dev/null; then
-    pip install --quiet --break-system-packages fastapi uvicorn curl-cffi python-dotenv 2>/dev/null || \
-    pip install --quiet fastapi uvicorn curl-cffi python-dotenv 2>/dev/null || \
-    pip install fastapi uvicorn curl-cffi python-dotenv
+    pip install --quiet --break-system-packages fastapi uvicorn curl-cffi python-dotenv tiktoken 2>/dev/null || \
+    pip install --quiet fastapi uvicorn curl-cffi python-dotenv tiktoken 2>/dev/null || \
+    pip install fastapi uvicorn curl-cffi python-dotenv tiktoken
 else
     error "未找到 pip，请先安装: python3 -m ensurepip"
 fi
 info "依赖安装完成"
 
 # ── 6. 检查关键文件 ──
-for f in proxy.py pow_native.py pow_solver.js; do
+for f in proxy.py tool_call.py pow_native.py pow_solver.js; do
     [ -f "$f" ] || error "缺少 $f，请确认部署包完整"
 done
 info "文件检查通过"

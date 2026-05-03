@@ -18,6 +18,7 @@ def _count_tokens(text: str) -> int:
 
 # ── 用量统计 ───────────────────────────────────
 from usage_store import add_usage, get_usage, clear_usage
+from session_store import needs_renewal, on_new_session, add_tokens, get_usage_status
 
 # ── 工具调用处理模块 ─────────────────────────────────
 from tool_call import (
@@ -1195,6 +1196,29 @@ async def chat(request: Request):
     prompt = convert_messages_for_deepseek(messages, tools)
     prompt_tokens = _count_tokens(prompt)
 
+    # 会话管理：token 超限时自动建新 DeepSeek session
+    if needs_renewal():
+        status = get_usage_status()
+        print(f"[Session] Tokens {status['prompt_tokens']}/{status['threshold']} exceeded, creating new session...")
+        try:
+            token = cfg.get("token", "")
+            if token:
+                auth_h = {**cfg.get("headers", {}), "authorization": f"Bearer {token}"}
+                sess_resp = cffi_requests.post(
+                    "https://chat.deepseek.com/api/v0/chat_session/create",
+                    json={}, headers=auth_h, impersonate="chrome120", timeout=15)
+                if sess_resp.status_code == 200:
+                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
+                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                    if new_sid:
+                        cfg = dict(cfg)
+                        cfg["session_id"] = new_sid
+                        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+                        on_new_session("default", new_sid, model)
+                        print(f"[Session] New session: {new_sid}")
+        except Exception as e:
+            print(f"[Session] Failed to create new session: {e}")
+
     # 如果有 tools 定义，将工具提示词注入到最后一个 USER 标记之前
     tool_prompt = build_tool_prompt(tools) if tools else ""
     if tool_prompt:
@@ -1234,9 +1258,11 @@ async def chat(request: Request):
                     except: pass
                 yield chunk
             add_usage(model, prompt_tokens, _count_tokens(completion_text))
+            add_tokens("default", cfg.get("session_id", ""), prompt_tokens)
         result.body_iterator = _counted_stream()
     else:
         add_usage(model, prompt_tokens, 0)
+        add_tokens("default", cfg.get("session_id", ""), prompt_tokens)
     return result
 
 

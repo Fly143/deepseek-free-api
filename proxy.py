@@ -1395,16 +1395,24 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     if t_type == "error" and fr:
                         yield ("error", {"message": t_content, "code": fr})
                         return
-                    # New format: metadata with response.fragments → extract fragment type
+                    # New format: metadata with response.fragments → extract fragment type & content
                     resp_data = val.get("response", {})
                     if isinstance(resp_data, dict):
                         frags = resp_data.get("fragments", [])
                         if frags and isinstance(frags, list):
-                            last_frag = frags[-1]
-                            if isinstance(last_frag, dict) and last_frag.get("type"):
-                                fragment_type = last_frag["type"]
-                                if thinking_enabled:
-                                    _vlog(f"SSE: fragment_type={fragment_type}")
+                            for frag in frags:
+                                if isinstance(frag, dict):
+                                    ftype = frag.get("type", "")
+                                    if ftype:
+                                        fragment_type = ftype
+                                        if thinking_enabled:
+                                            _vlog(f"SSE: fragment_type={fragment_type}")
+                                    fcontent = frag.get("content", "")
+                                    if fcontent and isinstance(fcontent, str):
+                                        if fragment_type == "THINK":
+                                            yield ("thinking", fcontent)
+                                        else:
+                                            yield ("content", fcontent)
                     continue
 
                 path = obj.get("p", "")
@@ -1441,15 +1449,19 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                             yield ("content", val)
                     continue
 
-                # ── Old format: response/thinking_content + response/content ──
-                if path == "response/content" and obj.get("o") == "APPEND":
-                    phase = "content"
-                    if isinstance(val, str) and val:
-                        yield ("content", val)
+                # ── Old format: response/content + response/thinking_content ──
+                if path == "response/content":
+                    o_val = obj.get("o")
+                    if o_val is None or o_val == "APPEND":
+                        phase = "content"
+                        if isinstance(val, str) and val:
+                            yield ("content", val)
                 elif path == "response/thinking_content" and thinking_enabled:
-                    phase = "thinking"
-                    if isinstance(val, str) and val:
-                        yield ("thinking", val)
+                    o_val = obj.get("o")
+                    if o_val is None or o_val == "APPEND":
+                        phase = "thinking"
+                        if isinstance(val, str) and val:
+                            yield ("thinking", val)
                 elif path:
                     continue  # other metadata (status, elapsed_secs, BATCH, etc.)
                 elif isinstance(val, str) and val:

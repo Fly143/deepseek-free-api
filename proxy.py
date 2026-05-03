@@ -149,12 +149,13 @@ hr{border:none;border-top:1px solid #334155;margin:24px 0}
 /* Usage table */
 .ut{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}
 .ut th,.ut td{padding:10px 12px;text-align:right;border-bottom:1px solid #334155}
-.ut th{color:#94a3b8;font-weight:500;font-size:11px;white-space:nowrap}
+.ut th{color:#94a3b8;font-weight:500;font-size:11px;white-space:nowrap;position:sticky;top:0;background:#0f172a;z-index:1}
 .ut td{font-variant-numeric:tabular-nums}
 .ut tr:last-child td{border-bottom:none}
 .ut .ml{text-align:left}
 .ut .tr{font-weight:600;border-top:2px solid #2563eb}
-.ut .tr td{padding-top:14px;color:#93c5fd}
+.ut .tr td{padding-top:14px;color:#93c5fd;background:#0f172a;position:sticky;bottom:0}
+.us{max-height:440px;overflow-y:auto}
 .ue{text-align:center;color:#64748b;padding:40px 20px}
 /* Period buttons */
 .pb{padding:8px 16px;border-radius:8px;border:1px solid #334155;background:transparent;color:#e2e8f0;font-size:13px;cursor:pointer}
@@ -304,9 +305,9 @@ const r=await fetch('/api/usage');const d=await r.json();
 const p=d[_up]||d.total||{};const m=p.models||{};const t=p.total||{};
 const e=Object.entries(m).sort((a,b)=>b[1].total_tokens-a[1].total_tokens);
 if(!e.length&&!t.requests){Q('usageContent').innerHTML='<div class=ue>📊 暂无用量数据</div>';return}
-let h='<table class=ut><thead><tr><th class=ml>模型</th><th>请求</th><th>输入</th><th>输出</th><th>总计</th></tr></thead><tbody>';
+let h='<div class=us><table class=ut><thead><tr><th class=ml>模型</th><th>请求</th><th>输入</th><th>输出</th><th>总计</th></tr></thead><tbody>';
 for(const[k,v]of e){h+=`<tr><td class=ml>${k}</td><td>${f(v.requests)}</td><td>${f(v.prompt_tokens)}</td><td>${f(v.completion_tokens)}</td><td>${f(v.total_tokens)}</td></tr>`}
-h+=`<tr class=tr><td class=ml>📋 合计</td><td>${f(t.requests)}</td><td>${f(t.prompt_tokens)}</td><td>${f(t.completion_tokens)}</td><td>${f(t.total_tokens)}</td></tr></tbody></table>`;
+h+=`<tr class=tr><td class=ml>📋 合计</td><td>${f(t.requests)}</td><td>${f(t.prompt_tokens)}</td><td>${f(t.completion_tokens)}</td><td>${f(t.total_tokens)}</td></tr></tbody></table></div>`;
 Q('usageContent').innerHTML=h
 }catch(e){Q('usageContent').innerHTML='<div class=ue>加载失败: '+e.message+'</div>'}
 }

@@ -133,13 +133,13 @@ info "工作目录: $WORK_DIR"
 # ── 5. 安装 Python 依赖 ──
 info "安装依赖..."
 if command -v pip3 &>/dev/null; then
-    pip3 install --quiet --break-system-packages fastapi uvicorn curl-cffi python-dotenv tiktoken 2>/dev/null || \
-    pip3 install --quiet fastapi uvicorn curl-cffi python-dotenv tiktoken 2>/dev/null || \
-    pip3 install fastapi uvicorn curl-cffi python-dotenv tiktoken
+    pip3 install -r requirements.txt --quiet --break-system-packages 2>/dev/null || \
+    pip3 install -r requirements.txt --quiet 2>/dev/null || \
+    pip3 install -r requirements.txt
 elif command -v pip &>/dev/null; then
-    pip install --quiet --break-system-packages fastapi uvicorn curl-cffi python-dotenv tiktoken 2>/dev/null || \
-    pip install --quiet fastapi uvicorn curl-cffi python-dotenv tiktoken 2>/dev/null || \
-    pip install fastapi uvicorn curl-cffi python-dotenv tiktoken
+    pip install -r requirements.txt --quiet --break-system-packages 2>/dev/null || \
+    pip install -r requirements.txt --quiet 2>/dev/null || \
+    pip install -r requirements.txt
 else
     error "未找到 pip，请先安装: python3 -m ensurepip"
 fi

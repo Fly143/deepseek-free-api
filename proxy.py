@@ -4,6 +4,7 @@ DeepSeek 网页 → API 代理（纯 HTTP 转发，无浏览器依赖）
 """
 import json, os, shlex, time, uuid, webbrowser, base64, re, secrets
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
@@ -19,6 +20,7 @@ def _count_tokens(text: str) -> int:
 # ── 用量统计 ───────────────────────────────────
 from usage_store import add_usage, get_usage, clear_usage
 from session_store import needs_renewal, on_new_session, add_tokens, get_usage_status
+from response_store import save_response_record, get_response_record, delete_response_record
 
 # ── 工具调用处理模块 ─────────────────────────────────
 from tool_call import (
@@ -51,6 +53,745 @@ def _vlog(msg: str):
             f.write(f"[{ts}] {msg}\n")
     print(f"[Vision] {msg}", flush=True)
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
+
+
+def _gen_response_id() -> str:
+    return f"resp_{uuid.uuid4().hex}"
+
+
+def _ensure_list(value: Any) -> list:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _safe_json_loads(text: Any, default: Any):
+    if not isinstance(text, str):
+        return default
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return default
+
+
+def _response_status_from_finish_reason(finish_reason: str) -> str:
+    if finish_reason in ("stop", "tool_calls"):
+        return "completed"
+    if finish_reason in ("length", "content_filter"):
+        return "incomplete"
+    return "completed"
+
+
+def _response_incomplete_details(finish_reason: str) -> dict | None:
+    if finish_reason in ("length", "content_filter"):
+        return {"reason": finish_reason}
+    return None
+
+
+def _response_terminal_event_type(status: str) -> str:
+    if status == "failed":
+        return "response.failed"
+    if status == "incomplete":
+        return "response.incomplete"
+    return "response.completed"
+
+
+def _build_response_usage(usage: dict | None) -> dict:
+    usage = usage or {}
+    input_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    output_tokens = int(usage.get("completion_tokens", 0) or 0)
+    total_tokens = int(usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    return {
+        "input_tokens": input_tokens,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": output_tokens,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": total_tokens,
+    }
+
+
+def _response_text_item(text: str, item_id: str | None = None) -> dict:
+    return {
+        "id": item_id or f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": text or "",
+            "annotations": [],
+        }],
+    }
+
+
+def _response_reasoning_item(summary_text: str, item_id: str | None = None) -> dict:
+    return {
+        "id": item_id or f"rs_{uuid.uuid4().hex[:24]}",
+        "type": "reasoning",
+        "summary": [{
+            "type": "summary_text",
+            "text": summary_text or "",
+        }],
+    }
+
+
+def _response_function_call_item(tool_call: dict, call_id: str | None = None) -> dict:
+    fn = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+    return {
+        "id": tool_call.get("id") or f"fc_{uuid.uuid4().hex[:24]}",
+        "type": "function_call",
+        "call_id": call_id or tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+        "name": fn.get("name", ""),
+        "arguments": fn.get("arguments", "{}"),
+        "status": "completed",
+    }
+
+
+def _extract_output_text(output: list[dict]) -> str:
+    texts: list[str] = []
+    for item in output or []:
+        if item.get("type") == "message":
+            for content in item.get("content", []) or []:
+                if content.get("type") == "output_text":
+                    texts.append(content.get("text", "") or "")
+    return "".join(texts)
+
+
+def _normalize_response_tool_output(output: Any) -> str:
+    if isinstance(output, str):
+        return output
+    if output is None:
+        return ""
+    return json.dumps(output, ensure_ascii=False)
+
+
+def _normalize_input_file_part(part: dict) -> dict:
+    if part.get("file_data") or part.get("data"):
+        return {
+            "type": "input_file",
+            "filename": part.get("filename") or "file.txt",
+            "file_data": part.get("file_data") or part.get("data") or "",
+        }
+
+    out = {"type": "input_file"}
+    if part.get("file_id"):
+        out["file_id"] = part.get("file_id")
+    if part.get("filename"):
+        out["filename"] = part.get("filename")
+    return out
+
+
+def _normalize_response_input_item(item: Any) -> dict | None:
+    if isinstance(item, str):
+        return {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": item}],
+        }
+    if not isinstance(item, dict):
+        return None
+
+    item_type = item.get("type")
+    role = item.get("role")
+
+    if item_type in ("input_text", "text"):
+        return {"type": "input_text", "text": item.get("text", "")}
+
+    if item_type == "function_call_output":
+        normalized = {
+            "type": "function_call_output",
+            "call_id": item.get("call_id") or item.get("id") or "",
+            "output": _normalize_response_tool_output(item.get("output")),
+        }
+        if item.get("id"):
+            normalized["id"] = item.get("id")
+        return normalized
+
+    if item_type == "function_call":
+        normalized = {
+            "type": "function_call",
+            "call_id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "name": item.get("name", ""),
+            "arguments": item.get("arguments", "{}") if isinstance(item.get("arguments", "{}"), str)
+            else json.dumps(item.get("arguments", {}), ensure_ascii=False),
+        }
+        if item.get("id"):
+            normalized["id"] = item.get("id")
+        if "parameters" in item:
+            normalized["parameters"] = item.get("parameters")
+        if "description" in item:
+            normalized["description"] = item.get("description")
+        return normalized
+
+    if item_type == "message" or role in ("system", "user", "assistant", "tool"):
+        normalized = {
+            "type": "message",
+            "role": role or item.get("role", "user"),
+        }
+        content = item.get("content", "")
+        normalized_parts = []
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype in ("input_text", "output_text", "text"):
+                    normalized_parts.append({"type": "input_text", "text": part.get("text", "")})
+                elif ptype == "input_image":
+                    image_url = part.get("image_url") or part.get("url") or ""
+                    item_part = {"type": "input_image"}
+                    if isinstance(image_url, dict):
+                        item_part["image_url"] = image_url.get("url", "")
+                        if image_url.get("detail"):
+                            item_part["detail"] = image_url.get("detail")
+                    elif image_url:
+                        item_part["image_url"] = image_url
+                    if part.get("file_id"):
+                        item_part["file_id"] = part.get("file_id")
+                    normalized_parts.append(item_part)
+                elif ptype == "input_file":
+                    normalized_parts.append(_normalize_input_file_part(part))
+                elif ptype == "function_call" and normalized["role"] == "assistant":
+                    normalized_parts.append({
+                        "type": "function_call",
+                        "call_id": part.get("call_id") or part.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                        "name": part.get("name", ""),
+                        "arguments": part.get("arguments", "{}") if isinstance(part.get("arguments", "{}"), str)
+                        else json.dumps(part.get("arguments", {}), ensure_ascii=False),
+                    })
+        elif isinstance(content, str):
+            normalized_parts.append({"type": "input_text", "text": content})
+        normalized["content"] = normalized_parts
+        return normalized
+
+    return item
+
+
+def _normalize_response_input_items(input_items: Any) -> list[dict]:
+    items = _ensure_list(input_items)
+    normalized: list[dict] = []
+    for item in items:
+        normalized_item = _normalize_response_input_item(item)
+        if normalized_item is not None:
+            normalized.append(normalized_item)
+    return normalized
+
+
+def _response_instructions_item(instructions: str) -> dict:
+    return {
+        "type": "message",
+        "role": "system",
+        "content": [{"type": "input_text", "text": instructions}],
+    }
+
+
+def _stored_input_items(body: dict) -> list[dict]:
+    items = _normalize_response_input_items(body.get("input"))
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        return [_response_instructions_item(instructions)] + items
+    return items
+
+
+def _response_object_payload(record: dict, *, status: str | None = None, usage: dict | None = None,
+                             completed_at: int | None | object = Ellipsis, output: list[dict] | None = None,
+                             error: dict | None | object = Ellipsis, incomplete_details: dict | None | object = Ellipsis,
+                             output_text: str | None = None) -> dict:
+    payload = dict(_public_response_record(record))
+    if status is not None:
+        payload["status"] = status
+    if usage is not None or "usage" in payload:
+        payload["usage"] = usage
+    if completed_at is not Ellipsis:
+        payload["completed_at"] = completed_at
+    if output is not None:
+        payload["output"] = output
+    if error is not Ellipsis:
+        payload["error"] = error
+    if incomplete_details is not Ellipsis:
+        payload["incomplete_details"] = incomplete_details
+    if output_text is not None:
+        payload["output_text"] = output_text
+    return payload
+
+
+def _response_failed_payload(response_id: str, created: int, model_name: str, body: dict,
+                             previous_response_id: str | None, error: dict, output_text: str = "") -> dict:
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": created,
+        "completed_at": None,
+        "status": "failed",
+        "error": error,
+        "incomplete_details": None,
+        "instructions": body.get("instructions"),
+        "max_output_tokens": body.get("max_output_tokens"),
+        "model": model_name,
+        "output": [],
+        "parallel_tool_calls": True,
+        "previous_response_id": previous_response_id,
+        "reasoning": {"effort": body.get("reasoning", {}).get("effort")} if isinstance(body.get("reasoning"), dict) else {},
+        "store": True if body.get("store", True) else False,
+        "temperature": body.get("temperature"),
+        "text": {"format": {"type": "text"}},
+        "tool_choice": body.get("tool_choice", "auto"),
+        "tools": body.get("tools", []),
+        "top_p": body.get("top_p"),
+        "truncation": body.get("truncation", "disabled"),
+        "usage": None,
+        "user": body.get("user"),
+        "metadata": body.get("metadata", {}),
+        "output_text": output_text,
+    }
+
+
+def _extract_response_messages_and_tools(input_items: Any) -> tuple[list[dict], list[dict] | None]:
+    items = _ensure_list(input_items)
+    messages: list[dict] = []
+    tools_from_input: list[dict] = []
+
+    for item in items:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        role = item.get("role")
+
+        if role in ("system", "user", "assistant", "tool"):
+            content = item.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                assistant_tool_calls = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type")
+                    if ptype in ("input_text", "output_text", "text"):
+                        parts.append({"type": "text", "text": part.get("text", "")})
+                    elif ptype == "input_image":
+                        image_url = part.get("image_url") or part.get("url") or ""
+                        if image_url:
+                            parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                    elif ptype == "input_file":
+                        file_obj = {
+                            "filename": part.get("filename") or "file.txt",
+                            "file_data": part.get("file_data") or part.get("data") or "",
+                        }
+                        parts.append({"type": "file", "file": file_obj})
+                    elif ptype == "function_call" and role == "assistant":
+                        assistant_tool_calls.append({
+                            "id": part.get("call_id") or part.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "type": "function",
+                            "function": {
+                                "name": part.get("name", ""),
+                                "arguments": part.get("arguments", "{}") if isinstance(part.get("arguments", "{}"), str)
+                                else json.dumps(part.get("arguments", {}), ensure_ascii=False),
+                            }
+                        })
+                msg = {"role": role, "content": parts if parts else ""}
+                if assistant_tool_calls:
+                    msg["tool_calls"] = assistant_tool_calls
+                    if not parts:
+                        msg["content"] = None
+                messages.append(msg)
+            else:
+                msg = {"role": role, "content": content}
+                if role == "assistant" and item_type == "function_call":
+                    msg["tool_calls"] = [{
+                        "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", "{}") if isinstance(item.get("arguments", "{}"), str)
+                            else json.dumps(item.get("arguments", {}), ensure_ascii=False),
+                        }
+                    }]
+                    if content in ("", None):
+                        msg["content"] = None
+                messages.append(msg)
+            continue
+
+        if item_type == "message":
+            content = item.get("content", [])
+            role = item.get("role", "user")
+            normalized_parts = []
+            assistant_tool_calls = []
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type")
+                    if ptype in ("input_text", "output_text", "text"):
+                        normalized_parts.append({"type": "text", "text": part.get("text", "")})
+                    elif ptype == "input_image":
+                        image_url = part.get("image_url") or part.get("url") or ""
+                        if image_url:
+                            normalized_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                    elif ptype == "input_file":
+                        normalized_parts.append({
+                            "type": "file",
+                            "file": {
+                                "filename": part.get("filename") or "file.txt",
+                                "file_data": part.get("file_data") or part.get("data") or "",
+                            }
+                        })
+                    elif ptype == "function_call" and role == "assistant":
+                        assistant_tool_calls.append({
+                            "id": part.get("call_id") or part.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "type": "function",
+                            "function": {
+                                "name": part.get("name", ""),
+                                "arguments": part.get("arguments", "{}") if isinstance(part.get("arguments", "{}"), str)
+                                else json.dumps(part.get("arguments", {}), ensure_ascii=False),
+                            }
+                        })
+            msg = {"role": role, "content": normalized_parts if normalized_parts else ""}
+            if assistant_tool_calls:
+                msg["tool_calls"] = assistant_tool_calls
+                if not normalized_parts:
+                    msg["content"] = None
+            messages.append(msg)
+            continue
+
+        if item_type == "function_call_output":
+            output = _normalize_response_tool_output(item.get("output"))
+            tool_message = {"role": "tool", "content": output}
+            if item.get("call_id"):
+                tool_message["tool_call_id"] = item.get("call_id")
+            messages.append(tool_message)
+            continue
+
+        if item_type == "function_call":
+            if item.get("name") and ("parameters" in item or "description" in item):
+                tools_from_input.append({
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "description": item.get("description", ""),
+                        "parameters": item.get("parameters", {"type": "object", "properties": {}}),
+                    }
+                })
+            else:
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", "{}") if isinstance(item.get("arguments", "{}"), str)
+                            else json.dumps(item.get("arguments", {}), ensure_ascii=False),
+                        }
+                    }]
+                })
+            continue
+
+        if item_type in ("input_text", "text"):
+            messages.append({"role": "user", "content": item.get("text", "")})
+
+    return messages, (tools_from_input or None)
+
+
+def _merge_previous_response_context(messages: list[dict], previous_response_id: str | None) -> list[dict]:
+    if not previous_response_id:
+        return messages
+    prev = get_response_record(previous_response_id)
+    if not prev:
+        raise HTTPException(404, detail={"error": {"message": f"response {previous_response_id} not found", "type": "invalid_request_error"}})
+
+    previous_messages = prev.get("_messages", [])
+    if not isinstance(previous_messages, list):
+        previous_messages = []
+    else:
+        previous_messages = list(previous_messages)
+    if messages and messages[0].get("role") == "system":
+        while previous_messages and isinstance(previous_messages[0], dict) and previous_messages[0].get("role") == "system":
+            previous_messages.pop(0)
+    return previous_messages + messages
+
+
+def _normalize_response_tools(body: dict, parsed_tools: list[dict] | None) -> list[dict] | None:
+    if parsed_tools:
+        return parsed_tools
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return None
+    out = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        ttype = tool.get("type")
+        if ttype == "function":
+            out.append(tool)
+        elif ttype == "web_search_preview":
+            continue
+    return out or None
+
+
+def _has_web_search_tool(body: dict) -> bool:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("type") == "web_search_preview":
+            return True
+    return False
+
+
+def _resolve_responses_model(body: dict) -> str:
+    model = body.get("model", "deepseek-default")
+    if not _has_web_search_tool(body) or "search" in model:
+        return model
+
+    candidates = []
+    if model.endswith("-reasoner"):
+        candidates.append(f"{model}-search")
+    candidates.append(f"{model}-search")
+    if model == "deepseek-default":
+        candidates.append("deepseek-search")
+    if model == "deepseek-reasoner":
+        candidates.append("deepseek-reasoner-search")
+
+    models = get_models()
+    for candidate in candidates:
+        if candidate in models:
+            return candidate
+    return model
+
+
+def _messages_from_responses_request(body: dict) -> tuple[list[dict], list[dict] | None]:
+    input_items = body.get("input", [])
+    if isinstance(input_items, str):
+        messages, tools = [{"role": "user", "content": input_items}], None
+    else:
+        messages, tools = _extract_response_messages_and_tools(input_items)
+
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        messages = [{"role": "system", "content": instructions}] + messages
+    return messages, tools
+
+
+def _build_responses_record(
+    response_id: str,
+    body: dict,
+    model: str,
+    created: int,
+    completed_at: int | None,
+    output: list[dict],
+    usage: dict,
+    messages: list[dict],
+    status: str = "completed",
+    incomplete_details: dict | None = None,
+) -> dict:
+    text = _extract_output_text(output)
+    record = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created,
+        "completed_at": completed_at,
+        "status": status,
+        "error": None,
+        "incomplete_details": incomplete_details,
+        "instructions": body.get("instructions"),
+        "max_output_tokens": body.get("max_output_tokens"),
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": True,
+        "previous_response_id": body.get("previous_response_id"),
+        "reasoning": {"effort": body.get("reasoning", {}).get("effort")} if isinstance(body.get("reasoning"), dict) else {},
+        "store": True if body.get("store", True) else False,
+        "temperature": body.get("temperature"),
+        "text": {"format": {"type": "text"}},
+        "tool_choice": body.get("tool_choice", "auto"),
+        "tools": body.get("tools", []),
+        "top_p": body.get("top_p"),
+        "truncation": body.get("truncation", "disabled"),
+        "usage": _build_response_usage(usage),
+        "user": body.get("user"),
+        "metadata": body.get("metadata", {}),
+        "output_text": text,
+        "_messages": messages,
+        "_input": _stored_input_items(body),
+    }
+    return record
+
+
+def _public_response_record(record: dict) -> dict:
+    return {k: v for k, v in record.items() if not k.startswith("_")}
+
+
+def _response_output_from_chat_message(msg: dict) -> list[dict]:
+    output: list[dict] = []
+    reasoning = msg.get("reasoning_content", "")
+    if reasoning:
+        output.append(_response_reasoning_item(reasoning))
+    content = msg.get("content", "")
+    if isinstance(content, str) and content:
+        output.append(_response_text_item(content))
+    tool_calls = msg.get("tool_calls") or []
+    for tc in tool_calls:
+        output.append(_response_function_call_item(tc))
+    if not output:
+        output.append(_response_text_item(""))
+    return output
+
+
+def _assistant_message_from_chat_message(msg: dict) -> dict:
+    assistant = {
+        "role": "assistant",
+        "content": msg.get("content"),
+    }
+    if msg.get("reasoning_content"):
+        assistant["reasoning_content"] = msg.get("reasoning_content")
+    if msg.get("tool_calls"):
+        assistant["tool_calls"] = msg.get("tool_calls")
+    return assistant
+
+
+def _chat_completion_to_response_record(body: dict, response_id: str, response_json: dict, messages: list[dict]) -> dict:
+    choice = (response_json.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) or {}
+    finish_reason = choice.get("finish_reason", "stop")
+    created = int(response_json.get("created", int(time.time())))
+    model = response_json.get("model") or body.get("model", "deepseek-default")
+    output = _response_output_from_chat_message(msg)
+    full_messages = messages + [_assistant_message_from_chat_message(msg)]
+    return _build_responses_record(
+        response_id=response_id,
+        body=body,
+        model=model,
+        created=created,
+        completed_at=created if _response_status_from_finish_reason(finish_reason) == "completed" else None,
+        output=output,
+        usage=response_json.get("usage") or {},
+        messages=full_messages,
+        status=_response_status_from_finish_reason(finish_reason),
+        incomplete_details=_response_incomplete_details(finish_reason),
+    )
+
+
+def _responses_error(message: str, code: int | None = None, err_type: str = "server_error") -> dict:
+    err = {"message": message, "type": err_type}
+    if code is not None:
+        err["code"] = code
+    return {"error": err}
+
+
+def _sse_json(obj: dict) -> str:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def _json_from_response(resp: JSONResponse) -> dict:
+    body = resp.body.decode("utf-8", errors="ignore") if isinstance(resp.body, (bytes, bytearray)) else str(resp.body)
+    return json.loads(body)
+
+
+async def _single_response_stream(record: dict):
+    yield _sse_json({
+        "type": "response.created",
+        "response": _response_object_payload(record, status="in_progress", completed_at=None, usage=None)
+    })
+    yield _sse_json({
+        "type": "response.in_progress",
+        "response": _response_object_payload(record, status="in_progress", completed_at=None, usage=None)
+    })
+    output = record.get("output", [])
+    for output_index, item in enumerate(output):
+        yield _sse_json({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": item,
+        })
+        if item.get("type") == "reasoning":
+            text = ""
+            summary = item.get("summary", [])
+            if summary and isinstance(summary, list):
+                text = summary[0].get("text", "") or ""
+            if text:
+                yield _sse_json({
+                    "type": "response.reasoning_text.delta",
+                    "item_id": item.get("id"),
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": text,
+                })
+                yield _sse_json({
+                    "type": "response.reasoning_text.done",
+                    "item_id": item.get("id"),
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": text,
+                })
+        elif item.get("type") == "message":
+            for content_index, content in enumerate(item.get("content", []) or []):
+                yield _sse_json({
+                    "type": "response.content_part.added",
+                    "item_id": item.get("id"),
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "part": content,
+                })
+                if content.get("type") == "output_text":
+                    text = content.get("text", "") or ""
+                    if text:
+                        yield _sse_json({
+                            "type": "response.output_text.delta",
+                            "item_id": item.get("id"),
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "delta": text,
+                        })
+                        yield _sse_json({
+                            "type": "response.output_text.done",
+                            "item_id": item.get("id"),
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "text": text,
+                        })
+                yield _sse_json({
+                    "type": "response.content_part.done",
+                    "item_id": item.get("id"),
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "part": content,
+                })
+        elif item.get("type") == "function_call":
+            yield _sse_json({
+                "type": "response.function_call_arguments.delta",
+                "item_id": item.get("id"),
+                "output_index": output_index,
+                "delta": item.get("arguments", "{}"),
+            })
+            yield _sse_json({
+                "type": "response.function_call_arguments.done",
+                "item_id": item.get("id"),
+                "output_index": output_index,
+                "arguments": item.get("arguments", "{}"),
+            })
+        yield _sse_json({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        })
+    yield _sse_json({
+        "type": _response_terminal_event_type(record.get("status", "completed")),
+        "response": _public_response_record(record),
+    })
+
+
+class _SyntheticRequest:
+    def __init__(self, source_request: Request, body: dict):
+        self._body = body
+        self.headers = source_request.headers
+
+    async def json(self):
+        return self._body
 
 # ── cURL 解析 ──────────────────────────────────────────
 def parse_curl(curl: str) -> dict:
@@ -1264,6 +2005,376 @@ async def chat(request: Request):
         add_usage(model, prompt_tokens, 0)
         add_tokens("default", cfg.get("session_id", ""), prompt_tokens)
     return result
+
+
+@app.post("/v1/responses")
+async def responses(request: Request):
+    if not CONFIG_FILE.exists():
+        raise HTTPException(503, detail="请先访问 http://localhost:{}/admin 登录账号".format(PROXY_PORT))
+
+    body = await request.json()
+    model = _resolve_responses_model(body)
+    stream = body.get("stream", False)
+    previous_response_id = body.get("previous_response_id")
+
+    messages, parsed_tools = _messages_from_responses_request(body)
+    messages = _merge_previous_response_context(messages, previous_response_id)
+    tools = _normalize_response_tools(body, parsed_tools)
+
+    chat_body = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    }
+    if tools:
+        chat_body["tools"] = tools
+    if "tool_choice" in body:
+        chat_body["tool_choice"] = body.get("tool_choice")
+
+    response_id = _gen_response_id()
+
+    if not stream:
+        chat_result = await chat(_SyntheticRequest(request, chat_body))
+        if isinstance(chat_result, JSONResponse):
+            response_json = _json_from_response(chat_result)
+            record = _chat_completion_to_response_record(body, response_id, response_json, messages)
+            if record.get("store", True):
+                save_response_record(record)
+            return JSONResponse(_public_response_record(record))
+        raise HTTPException(502, detail={"error": {"message": "unexpected non-JSON response", "type": "server_error"}})
+
+    chat_stream = await chat(_SyntheticRequest(request, chat_body))
+    if not isinstance(chat_stream, StreamingResponse):
+        if isinstance(chat_stream, JSONResponse):
+            response_json = _json_from_response(chat_stream)
+            record = _chat_completion_to_response_record(body, response_id, response_json, messages)
+            if record.get("store", True):
+                save_response_record(record)
+            return StreamingResponse(_single_response_stream(record), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        raise HTTPException(502, detail={"error": {"message": "unexpected non-stream response", "type": "server_error"}})
+
+    async def _responses_stream():
+        created = int(time.time())
+        model_name = model
+        reasoning_parts: list[str] = []
+        text_parts: list[str] = []
+        tool_calls: dict[int, dict] = {}
+        reasoning_item_id = "rs_0"
+        message_item_id = "msg_0"
+        output_indices: dict[str, int] = {}
+        output_started: set[str] = set()
+        content_started = False
+
+        def _start_output_item(item: dict) -> tuple[int, dict | None]:
+            item_id = item.get("id") or f"out_{len(output_indices)}"
+            if item_id not in output_indices:
+                output_indices[item_id] = len(output_indices)
+            output_index = output_indices[item_id]
+            if item_id not in output_started:
+                output_started.add(item_id)
+                return_event = {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": item,
+                }
+                return output_index, return_event
+            return output_index, None
+
+        def _ensure_reasoning_started() -> list[dict]:
+            if not reasoning_parts:
+                return []
+            item = _response_reasoning_item("".join(reasoning_parts), reasoning_item_id)
+            output_index, event = _start_output_item(item)
+            events = []
+            if event:
+                events.append(event)
+            return events
+
+        def _ensure_message_started() -> list[dict]:
+            nonlocal content_started
+            if not text_parts and not content_started:
+                return []
+            item = _response_text_item("".join(text_parts), message_item_id)
+            output_index, event = _start_output_item(item)
+            events = []
+            if event:
+                events.append(event)
+            if not content_started:
+                content_started = True
+                events.append({
+                    "type": "response.content_part.added",
+                    "item_id": message_item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": item["content"][0],
+                })
+            return events
+
+        created_record = _build_responses_record(
+            response_id=response_id,
+            body=body,
+            model=model_name,
+            created=created,
+            completed_at=None,
+            output=[],
+            usage={},
+            messages=messages,
+            status="in_progress",
+            incomplete_details=None,
+        )
+
+        yield _sse_json({
+            "type": "response.created",
+            "response": _response_object_payload(created_record, status="in_progress", completed_at=None, usage=None)
+        })
+        yield _sse_json({
+            "type": "response.in_progress",
+            "response": _response_object_payload(created_record, status="in_progress", completed_at=None, usage=None)
+        })
+
+        try:
+            async for chunk in chat_stream.body_iterator:
+                s = chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else str(chunk)
+                if not s.startswith("data: "):
+                    continue
+                raw = s[6:].strip()
+                if raw == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+                if "error" in obj:
+                    err = obj.get("error", {})
+                    yield _sse_json({
+                        "type": "response.failed",
+                        "response": _response_failed_payload(
+                            response_id, created, model_name, body, previous_response_id, err, "".join(text_parts)
+                        ),
+                    })
+                    return
+
+                model_name = obj.get("model", model_name)
+                delta = (obj.get("choices") or [{}])[0].get("delta", {}) or {}
+                finish_reason = (obj.get("choices") or [{}])[0].get("finish_reason")
+
+                reasoning_delta = delta.get("reasoning_content")
+                if isinstance(reasoning_delta, str) and reasoning_delta:
+                    reasoning_parts.append(reasoning_delta)
+                    for event in _ensure_reasoning_started():
+                        yield _sse_json(event)
+                    yield _sse_json({
+                        "type": "response.reasoning_text.delta",
+                        "item_id": reasoning_item_id,
+                        "output_index": output_indices.get(reasoning_item_id, 0),
+                        "content_index": 0,
+                        "delta": reasoning_delta,
+                    })
+
+                content_delta = delta.get("content")
+                if isinstance(content_delta, str) and content_delta:
+                    text_parts.append(content_delta)
+                    for event in _ensure_message_started():
+                        yield _sse_json(event)
+                    yield _sse_json({
+                        "type": "response.output_text.delta",
+                        "item_id": message_item_id,
+                        "output_index": output_indices.get(message_item_id, 0),
+                        "content_index": 0,
+                        "delta": content_delta,
+                    })
+
+                tc_list = delta.get("tool_calls") or []
+                if isinstance(tc_list, list):
+                    for tc in tc_list:
+                        if not isinstance(tc, dict):
+                            continue
+                        idx = int(tc.get("index", 0) or 0)
+                        slot = tool_calls.setdefault(idx, {
+                            "id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "name": "",
+                            "arguments": "",
+                        })
+                        fn = tc.get("function", {}) or {}
+                        if fn.get("name"):
+                            slot["name"] = fn.get("name")
+                        if fn.get("arguments"):
+                            slot["arguments"] += fn.get("arguments")
+                            function_item = {
+                                "id": slot["id"],
+                                "type": "function_call",
+                                "call_id": slot["id"],
+                                "name": slot["name"],
+                                "arguments": slot["arguments"] or "{}",
+                                "status": "in_progress",
+                            }
+                            output_index, event = _start_output_item(function_item)
+                            if event:
+                                yield _sse_json(event)
+                            yield _sse_json({
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": slot["id"],
+                                "output_index": output_index,
+                                "delta": fn.get("arguments"),
+                            })
+
+                if finish_reason:
+                    output_by_id: dict[str, dict] = {}
+                    if reasoning_parts:
+                        output_by_id[reasoning_item_id] = _response_reasoning_item("".join(reasoning_parts), reasoning_item_id)
+                    if text_parts:
+                        output_by_id[message_item_id] = _response_text_item("".join(text_parts), message_item_id)
+                    for idx in sorted(tool_calls.keys()):
+                        tc = tool_calls[idx]
+                        output_by_id[tc["id"]] = {
+                            "id": tc["id"],
+                            "type": "function_call",
+                            "call_id": tc["id"],
+                            "name": tc["name"],
+                            "arguments": tc["arguments"] or "{}",
+                            "status": "completed",
+                        }
+                    if not output_by_id:
+                        output_by_id[message_item_id] = _response_text_item("", message_item_id)
+                        for event in _ensure_message_started():
+                            yield _sse_json(event)
+                    output = [
+                        item for _, item in sorted(
+                            output_by_id.items(),
+                            key=lambda pair: output_indices.get(pair[0], len(output_indices))
+                        )
+                    ]
+
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": "".join(text_parts) if text_parts else None,
+                    }
+                    if reasoning_parts:
+                        assistant_msg["reasoning_content"] = "".join(reasoning_parts)
+                    if tool_calls:
+                        assistant_msg["tool_calls"] = [{
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": tc["arguments"] or "{}",
+                            }
+                        } for _, tc in sorted(tool_calls.items())]
+
+                    approx_completion_tokens = _count_tokens("".join(reasoning_parts) + "".join(text_parts))
+                    approx_prompt_tokens = _count_tokens(convert_messages_for_deepseek(messages, tools))
+                    status = _response_status_from_finish_reason(finish_reason)
+                    incomplete_details = _response_incomplete_details(finish_reason)
+                    completed_at = int(time.time()) if status == "completed" else None
+
+                    record = _build_responses_record(
+                        response_id=response_id,
+                        body=body,
+                        model=model_name,
+                        created=created,
+                        completed_at=completed_at,
+                        output=output,
+                        usage={
+                            "prompt_tokens": approx_prompt_tokens,
+                            "completion_tokens": approx_completion_tokens,
+                            "total_tokens": approx_prompt_tokens + approx_completion_tokens,
+                        },
+                        messages=messages + [assistant_msg],
+                        status=status,
+                        incomplete_details=incomplete_details,
+                    )
+                    if record.get("store", True):
+                        save_response_record(record)
+
+                    if reasoning_parts:
+                        yield _sse_json({
+                            "type": "response.reasoning_text.done",
+                            "item_id": reasoning_item_id,
+                            "output_index": output_indices.get(reasoning_item_id, 0),
+                            "content_index": 0,
+                            "text": "".join(reasoning_parts),
+                        })
+                    if text_parts:
+                        yield _sse_json({
+                            "type": "response.output_text.done",
+                            "item_id": message_item_id,
+                            "output_index": output_indices.get(message_item_id, 0),
+                            "content_index": 0,
+                            "text": "".join(text_parts),
+                        })
+                        yield _sse_json({
+                            "type": "response.content_part.done",
+                            "item_id": message_item_id,
+                            "output_index": output_indices.get(message_item_id, 0),
+                            "content_index": 0,
+                            "part": _response_text_item("".join(text_parts), message_item_id)["content"][0],
+                        })
+                    for idx in sorted(tool_calls.keys()):
+                        tc = tool_calls[idx]
+                        yield _sse_json({
+                            "type": "response.function_call_arguments.done",
+                            "item_id": tc["id"],
+                            "output_index": output_indices.get(tc["id"], 0),
+                            "arguments": tc["arguments"] or "{}",
+                        })
+                    for idx, item in enumerate(output):
+                        yield _sse_json({
+                            "type": "response.output_item.done",
+                            "output_index": idx,
+                            "item": item,
+                        })
+                    yield _sse_json({
+                        "type": _response_terminal_event_type(status),
+                        "response": _public_response_record(record),
+                    })
+                    return
+        except Exception as e:
+            yield _sse_json({
+                "type": "response.failed",
+                "response": _response_failed_payload(
+                    response_id,
+                    created,
+                    model_name,
+                    body,
+                    previous_response_id,
+                    {"message": str(e), "type": "server_error"},
+                    "".join(text_parts),
+                ),
+            })
+
+    return StreamingResponse(_responses_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+
+
+@app.get("/v1/responses/{response_id}")
+async def get_response(response_id: str):
+    record = get_response_record(response_id)
+    if not record:
+        raise HTTPException(404, detail={"error": {"message": f"response {response_id} not found", "type": "invalid_request_error"}})
+    return JSONResponse(_public_response_record(record))
+
+
+@app.get("/v1/responses/{response_id}/input_items")
+async def get_response_input_items(response_id: str):
+    record = get_response_record(response_id)
+    if not record:
+        raise HTTPException(404, detail={"error": {"message": f"response {response_id} not found", "type": "invalid_request_error"}})
+    return {
+        "object": "list",
+        "data": _ensure_list(record.get("_input")),
+        "first_id": None,
+        "last_id": None,
+        "has_more": False,
+    }
+
+
+@app.delete("/v1/responses/{response_id}")
+async def delete_response(response_id: str):
+    if not delete_response_record(response_id):
+        raise HTTPException(404, detail={"error": {"message": f"response {response_id} not found", "type": "invalid_request_error"}})
+    return {"id": response_id, "object": "response", "deleted": True}
 
 
 def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None, ref_file_ids=None):

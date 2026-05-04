@@ -1,5 +1,7 @@
 import json
 import shutil
+import asyncio
+import time
 from pathlib import Path
 
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -33,6 +35,8 @@ def main() -> None:
 
         async def fake_chat(req):
             body = req._body
+            if "cancel me" in json.dumps(body.get("messages", []), ensure_ascii=False):
+                await asyncio.sleep(0.2)
             if body.get("stream"):
                 async def gen():
                     yield _sse_line({
@@ -106,6 +110,14 @@ def main() -> None:
         assert data["tools"][0]["type"] == "function"
 
         response_id = data["id"]
+
+        token_count = client.post("/v1/responses/input_tokens", json={
+            "input": non_stream_body["input"],
+            "tools": non_stream_body["tools"],
+        })
+        assert token_count.status_code == 200, token_count.text
+        assert token_count.json()["input_tokens"] > 0
+
         page1 = client.get(f"/v1/responses/{response_id}/input_items", params={"limit": 1})
         assert page1.status_code == 200, page1.text
         page1_data = page1.json()
@@ -122,6 +134,75 @@ def main() -> None:
         page2_data = page2.json()
         assert page2_data["data"]
         assert page2_data["data"][0]["id"].endswith("_in_0")
+
+        background = client.post("/v1/responses", json={
+            "model": "deepseek-default",
+            "background": True,
+            "input": "background",
+        })
+        assert background.status_code == 200, background.text
+        background_data = background.json()
+        assert background_data["status"] in ("queued", "in_progress")
+        background_id = background_data["id"]
+
+        polled = None
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            poll = client.get(f"/v1/responses/{background_id}")
+            assert poll.status_code == 200, poll.text
+            polled = poll.json()
+            if polled["status"] in ("completed", "failed", "incomplete", "cancelled"):
+                break
+            time.sleep(0.05)
+        assert polled and polled["status"] == "completed"
+
+        with client.stream("GET", f"/v1/responses/{background_id}", params={"stream": "true"}) as replayed:
+            assert replayed.status_code == 200
+            replay_events = []
+            for line in replayed.iter_lines():
+                if not line or not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                replay_events.append(json.loads(line[6:]))
+        assert replay_events[0]["type"] == "response.created"
+        assert replay_events[-1]["type"] == "response.completed"
+        replay_cursor = replay_events[1]["sequence_number"]
+        with client.stream(
+            "GET",
+            f"/v1/responses/{background_id}",
+            params={"stream": "true", "starting_after": replay_cursor},
+        ) as replayed_after:
+            after_events = []
+            for line in replayed_after.iter_lines():
+                if not line or not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                after_events.append(json.loads(line[6:]))
+        assert after_events
+        assert all(event["sequence_number"] > replay_cursor for event in after_events)
+
+        cancellable = client.post("/v1/responses", json={
+            "model": "deepseek-default",
+            "background": True,
+            "input": "cancel me",
+        })
+        assert cancellable.status_code == 200, cancellable.text
+        cancel_id = cancellable.json()["id"]
+        cancelled = client.post(f"/v1/responses/{cancel_id}/cancel")
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["status"] == "cancelled"
+        cancelled_again = client.post(f"/v1/responses/{cancel_id}/cancel")
+        assert cancelled_again.status_code == 200, cancelled_again.text
+        assert cancelled_again.json()["status"] == "cancelled"
+
+        compacted = client.post("/v1/responses/compact", json={"response_id": response_id})
+        assert compacted.status_code == 200, compacted.text
+        compacted_data = compacted.json()
+        assert compacted_data["previous_response_id"] == response_id
+        continued = client.post("/v1/responses", json={
+            "model": "deepseek-default",
+            "previous_response_id": compacted_data["id"],
+            "input": "next",
+        })
+        assert continued.status_code == 200, continued.text
 
         stream_body = {
             "model": "deepseek-default",

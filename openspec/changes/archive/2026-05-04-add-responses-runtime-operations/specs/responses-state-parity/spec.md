@@ -1,8 +1,5 @@
-# responses-state-parity Specification
+## MODIFIED Requirements
 
-## Purpose
-Define retrieval behavior for stored Responses input items and their pagination contract.
-## Requirements
 ### Requirement: Ordered Responses input retrieval
 The proxy SHALL return stored Responses input items in stable submission order while honoring the Responses list ordering contract.
 
@@ -26,6 +23,8 @@ The proxy SHALL support paginated retrieval of stored Responses input items.
 - **WHEN** a stored response has been deleted or is otherwise missing
 - **THEN** the service returns an OpenAI-style invalid-request error payload for input-item retrieval
 
+## ADDED Requirements
+
 ### Requirement: Local response runtime state persistence
 The proxy SHALL persist enough private state to represent local background and compaction lifecycles beyond the public response payload.
 
@@ -36,4 +35,3 @@ The proxy SHALL persist enough private state to represent local background and c
 #### Scenario: Persist compaction lineage metadata
 - **WHEN** a response is locally compacted
 - **THEN** the stored compacted record preserves lineage back to the source response record
-

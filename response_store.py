@@ -38,6 +38,22 @@ def save_response_record(record: dict) -> None:
         _save(data)
 
 
+def update_response_record(response_id: str, updater) -> dict | None:
+    if not response_id:
+        return None
+    with _LOCK:
+        data = _load()
+        record = data.get(response_id)
+        if not isinstance(record, dict):
+            return None
+        updated = updater(dict(record))
+        if not isinstance(updated, dict):
+            return record
+        data[response_id] = updated
+        _save(data)
+        return updated
+
+
 def get_response_record(response_id: str) -> dict | None:
     if not response_id:
         return None

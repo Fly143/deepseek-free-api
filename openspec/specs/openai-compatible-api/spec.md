@@ -45,12 +45,13 @@ The proxy SHALL expose `POST /v1/chat/completions` as the primary OpenAI-compati
 - **AND** the client receives a single JSON `chat.completion` response
 
 ### Requirement: Responses compatibility layer
-The proxy SHALL expose `POST /v1/responses` as an OpenAI-compatible Responses subset backed by the same DeepSeek chat execution path.
+The proxy SHALL expose `POST /v1/responses` as an OpenAI-compatible Responses subset backed by the same DeepSeek chat execution path, and SHALL keep public response objects consistently shaped across creation, retrieval, background completion, replay, and streamed terminal events.
 
 #### Scenario: Support non-stream Responses objects
 - **WHEN** a client sends `POST /v1/responses` without streaming
 - **THEN** the service returns a JSON object with `object: "response"`
 - **AND** the object includes `output` items and `output_text` derived from the DeepSeek-backed completion
+- **AND** the object includes stable public lifecycle, model, metadata, usage, error, and incomplete-detail fields
 
 #### Scenario: Support streamed Responses events
 - **WHEN** a client sends `POST /v1/responses` with streaming enabled
@@ -70,6 +71,11 @@ The proxy SHALL expose `POST /v1/responses` as an OpenAI-compatible Responses su
 - **WHEN** the proxy returns a Responses object
 - **THEN** it persists enough local state to support `GET /v1/responses/{response_id}` and `GET /v1/responses/{response_id}/input_items`
 
+#### Scenario: Retrieve public response shape consistently
+- **WHEN** a client retrieves a stored response using `GET /v1/responses/{response_id}`
+- **THEN** the returned object uses the same public response field contract as the creation response
+- **AND** it does not expose internal metadata keys
+
 #### Scenario: Continue a stored response conversation
 - **WHEN** a client sends `POST /v1/responses` with a known `previous_response_id`
 - **THEN** the proxy prepends the stored conversation context from that prior response before forwarding the next turn upstream
@@ -87,6 +93,7 @@ The proxy SHALL expose `POST /v1/responses` as an OpenAI-compatible Responses su
 - **WHEN** a client sends `POST /v1/responses` with `background: true`
 - **THEN** the service returns an immediately persisted response object
 - **AND** the object has a non-terminal background lifecycle status rather than waiting for the final completion
+- **AND** later polling returns the same public response field contract with updated lifecycle state
 
 #### Scenario: Cancel a background response
 - **WHEN** a client sends `POST /v1/responses/{response_id}/cancel`

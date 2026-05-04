@@ -1,8 +1,5 @@
-# responses-structured-outputs Specification
+## MODIFIED Requirements
 
-## Purpose
-Define the supported Responses structured-output contract for `text.format` and stored response metadata.
-## Requirements
 ### Requirement: Responses structured output formatting
 The proxy SHALL accept supported `text.format` structured-output requests on `POST /v1/responses`, preserve the requested format on stored response objects, and validate generated output before returning a successful Responses object.
 
@@ -27,4 +24,3 @@ The proxy SHALL accept supported `text.format` structured-output requests on `PO
 - **THEN** the service returns a Responses failure or incomplete response with an OpenAI-style error payload
 - **AND** the stored response object records the failure state
 - **AND** replaying or retrieving the stored response preserves that failure state
-

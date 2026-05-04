@@ -177,16 +177,9 @@ def _response_text_config(body: dict) -> dict:
     return {"format": {"type": "text"}}
 
 
-def _normalize_structured_output_text(output_text: str, text_config: dict | None) -> str:
-    if not output_text or not isinstance(text_config, dict):
-        return output_text
-    fmt = text_config.get("format")
-    if not isinstance(fmt, dict):
-        return output_text
-    fmt_type = fmt.get("type")
-    if fmt_type not in ("json_object", "json_schema"):
-        return output_text
-
+def _extract_structured_json_text(output_text: str) -> tuple[str, Any] | tuple[None, None]:
+    if not output_text:
+        return None, None
     candidate = output_text.strip()
     if candidate.startswith("```"):
         candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
@@ -200,9 +193,119 @@ def _normalize_structured_output_text(output_text: str, text_config: dict | None
             candidate = candidate[start:end + 1]
     try:
         parsed = json.loads(candidate)
-        return json.dumps(parsed, ensure_ascii=False)
+        return json.dumps(parsed, ensure_ascii=False), parsed
     except (json.JSONDecodeError, ValueError, TypeError):
+        return None, None
+
+
+def _normalize_structured_output_text(output_text: str, text_config: dict | None) -> str:
+    if not output_text or not isinstance(text_config, dict):
         return output_text
+    fmt = text_config.get("format")
+    if not isinstance(fmt, dict):
+        return output_text
+    fmt_type = fmt.get("type")
+    if fmt_type not in ("json_object", "json_schema"):
+        return output_text
+
+    normalized, _ = _extract_structured_json_text(output_text)
+    return normalized if normalized is not None else output_text
+
+
+def _json_schema_from_text_config(text_config: dict | None) -> dict | None:
+    fmt = text_config.get("format") if isinstance(text_config, dict) else None
+    if not isinstance(fmt, dict) or fmt.get("type") != "json_schema":
+        return None
+    schema = fmt.get("schema")
+    if isinstance(schema, dict):
+        return schema
+    json_schema = fmt.get("json_schema")
+    if isinstance(json_schema, dict):
+        nested = json_schema.get("schema")
+        return nested if isinstance(nested, dict) else json_schema
+    return None
+
+
+def _schema_type_matches(value: Any, expected: str) -> bool:
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return (isinstance(value, int) or isinstance(value, float)) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def _validate_json_schema_subset(value: Any, schema: dict | None, path: str = "$") -> str | None:
+    if not isinstance(schema, dict):
+        return None
+    expected_type = schema.get("type")
+    if isinstance(expected_type, list):
+        if not any(_schema_type_matches(value, t) for t in expected_type if isinstance(t, str)):
+            return f"{path} does not match any allowed type"
+    elif isinstance(expected_type, str) and not _schema_type_matches(value, expected_type):
+        return f"{path} must be {expected_type}"
+
+    if isinstance(value, dict):
+        required = schema.get("required")
+        if isinstance(required, list):
+            for key in required:
+                if isinstance(key, str) and key not in value:
+                    return f"{path}.{key} is required"
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for key, prop_schema in properties.items():
+                if key in value and isinstance(prop_schema, dict):
+                    error = _validate_json_schema_subset(value[key], prop_schema, f"{path}.{key}")
+                    if error:
+                        return error
+        additional = schema.get("additionalProperties")
+        if additional is False and isinstance(properties, dict):
+            extra = [key for key in value.keys() if key not in properties]
+            if extra:
+                return f"{path}.{extra[0]} is not allowed"
+        elif isinstance(additional, dict):
+            properties = properties if isinstance(properties, dict) else {}
+            for key, item in value.items():
+                if key not in properties:
+                    error = _validate_json_schema_subset(item, additional, f"{path}.{key}")
+                    if error:
+                        return error
+
+    if isinstance(value, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for idx, item in enumerate(value):
+                error = _validate_json_schema_subset(item, item_schema, f"{path}[{idx}]")
+                if error:
+                    return error
+
+    return None
+
+
+def _structured_output_error(output_text: str, text_config: dict | None) -> dict | None:
+    fmt = text_config.get("format") if isinstance(text_config, dict) else None
+    if not isinstance(fmt, dict):
+        return None
+    fmt_type = fmt.get("type")
+    if fmt_type not in ("json_object", "json_schema"):
+        return None
+    normalized, parsed = _extract_structured_json_text(output_text)
+    if normalized is None:
+        return {"message": "response output_text is not valid JSON", "type": "invalid_response_format", "code": "invalid_json"}
+    if fmt_type == "json_schema":
+        schema_error = _validate_json_schema_subset(parsed, _json_schema_from_text_config(text_config))
+        if schema_error:
+            return {"message": f"response output_text does not match json_schema: {schema_error}", "type": "invalid_response_format", "code": "schema_validation_failed"}
+    return None
 
 
 def _extract_output_text(output: list[dict]) -> str:
@@ -732,8 +835,122 @@ def _build_responses_record(
     return record
 
 
+_RESPONSE_PUBLIC_DEFAULTS = {
+    "object": "response",
+    "completed_at": None,
+    "error": None,
+    "incomplete_details": None,
+    "instructions": None,
+    "max_output_tokens": None,
+    "parallel_tool_calls": True,
+    "previous_response_id": None,
+    "reasoning": {},
+    "store": True,
+    "temperature": None,
+    "text": {"format": {"type": "text"}},
+    "tool_choice": "auto",
+    "tools": [],
+    "top_p": None,
+    "truncation": "disabled",
+    "usage": None,
+    "user": None,
+    "metadata": {},
+    "output": [],
+    "output_text": "",
+}
+
+
+def _normalized_response_output_item(item: Any) -> dict:
+    if not isinstance(item, dict):
+        return _response_text_item("")
+    item_type = item.get("type")
+    if item_type == "message":
+        normalized = dict(item)
+        normalized.setdefault("id", f"msg_{uuid.uuid4().hex[:24]}")
+        normalized.setdefault("status", "completed")
+        normalized.setdefault("role", "assistant")
+        content = []
+        for part in normalized.get("content", []) or []:
+            if not isinstance(part, dict):
+                continue
+            p = dict(part)
+            p.setdefault("type", "output_text")
+            if p.get("type") == "output_text":
+                p.setdefault("text", "")
+                p.setdefault("annotations", [])
+            content.append(p)
+        normalized["content"] = content
+        return normalized
+    if item_type == "reasoning":
+        normalized = dict(item)
+        normalized.setdefault("id", f"rs_{uuid.uuid4().hex[:24]}")
+        normalized.setdefault("summary", [])
+        return normalized
+    if item_type == "refusal":
+        normalized = dict(item)
+        normalized.setdefault("id", f"rf_{uuid.uuid4().hex[:24]}")
+        normalized.setdefault("status", "completed")
+        normalized.setdefault("content", [])
+        return normalized
+    if item_type == "function_call":
+        normalized = dict(item)
+        normalized.setdefault("id", normalized.get("call_id") or f"fc_{uuid.uuid4().hex[:24]}")
+        normalized.setdefault("call_id", normalized.get("id"))
+        normalized.setdefault("name", "")
+        normalized.setdefault("arguments", "{}")
+        normalized.setdefault("status", "completed")
+        return normalized
+    return dict(item)
+
+
+def _sync_output_text_to_message_items(output: list[dict], output_text: str) -> list[dict]:
+    synced: list[dict] = []
+    replaced = False
+    for item in output or []:
+        normalized = _normalized_response_output_item(item)
+        if normalized.get("type") == "message" and not replaced:
+            for part in normalized.get("content", []) or []:
+                if part.get("type") == "output_text":
+                    part["text"] = output_text or ""
+                    replaced = True
+                    break
+        synced.append(normalized)
+    return synced
+
+
 def _public_response_record(record: dict) -> dict:
-    return {k: v for k, v in record.items() if not k.startswith("_")}
+    payload = {k: v for k, v in record.items() if not k.startswith("_")}
+    for key, value in _RESPONSE_PUBLIC_DEFAULTS.items():
+        if key not in payload:
+            payload[key] = dict(value) if isinstance(value, dict) else list(value) if isinstance(value, list) else value
+    payload["object"] = "response"
+    payload["output"] = [_normalized_response_output_item(item) for item in _ensure_list(payload.get("output"))]
+    if not isinstance(payload.get("metadata"), dict):
+        payload["metadata"] = {}
+    if not isinstance(payload.get("reasoning"), dict):
+        payload["reasoning"] = {}
+    if not isinstance(payload.get("text"), dict):
+        payload["text"] = {"format": {"type": "text"}}
+    if payload.get("usage") is not None and not isinstance(payload.get("usage"), dict):
+        payload["usage"] = None
+    payload["output_text"] = payload.get("output_text") or _extract_output_text(payload["output"])
+    return payload
+
+
+def _apply_structured_output_contract(record: dict) -> dict:
+    text_config = record.get("text") if isinstance(record.get("text"), dict) else {"format": {"type": "text"}}
+    output_text = _extract_output_text(record.get("output", []))
+    normalized_text = _normalize_structured_output_text(output_text, text_config)
+    record = dict(record)
+    record["output_text"] = normalized_text
+    record["output"] = _sync_output_text_to_message_items(record.get("output", []), normalized_text)
+    error = _structured_output_error(normalized_text, text_config)
+    if error and record.get("status") == "completed":
+        record["status"] = "failed"
+        record["completed_at"] = None
+        record["error"] = error
+        record["incomplete_details"] = None
+    return record
 
 
 def _response_output_from_chat_message(msg: dict) -> list[dict]:
@@ -777,7 +994,7 @@ def _chat_completion_to_response_record(body: dict, response_id: str, response_j
     model = response_json.get("model") or body.get("model", "deepseek-default")
     output = _response_output_from_chat_message(msg)
     full_messages = messages + [_assistant_message_from_chat_message(msg)]
-    return _build_responses_record(
+    record = _build_responses_record(
         response_id=response_id,
         body=body,
         model=model,
@@ -789,6 +1006,7 @@ def _chat_completion_to_response_record(body: dict, response_id: str, response_j
         status=_response_status_from_finish_reason(finish_reason),
         incomplete_details=_response_incomplete_details(finish_reason),
     )
+    return _apply_structured_output_contract(record)
 
 
 _RESPONSE_TERMINAL_STATUSES = {"completed", "failed", "incomplete", "cancelled"}
@@ -2589,17 +2807,18 @@ async def responses(request: Request):
 
                 if "error" in obj:
                     err = obj.get("error", {})
+                    failed_payload = _response_failed_payload(
+                        response_id,
+                        created,
+                        model_name,
+                        body,
+                        previous_response_id,
+                        err,
+                        _normalize_structured_output_text("".join(text_parts), _response_text_config(body)),
+                    )
                     yield _sse_json(_event_payload({
                         "type": "response.failed",
-                        "response": _response_failed_payload(
-                            response_id,
-                            created,
-                            model_name,
-                            body,
-                            previous_response_id,
-                            err,
-                            _normalize_structured_output_text("".join(text_parts), _response_text_config(body)),
-                        ),
+                        "response": _public_response_record(failed_payload),
                     }))
                     return
 
@@ -2752,6 +2971,8 @@ async def responses(request: Request):
                         status=status,
                         incomplete_details=incomplete_details,
                     )
+                    record = _apply_structured_output_contract(record)
+                    status = record.get("status", status)
                     if record.get("store", True):
                         save_response_record(record)
 
@@ -2807,17 +3028,18 @@ async def responses(request: Request):
                     }))
                     return
         except Exception as e:
+            failed_payload = _response_failed_payload(
+                response_id,
+                created,
+                model_name,
+                body,
+                previous_response_id,
+                {"message": str(e), "type": "server_error"},
+                _normalize_structured_output_text("".join(text_parts), _response_text_config(body)),
+            )
             yield _sse_json(_event_payload({
                 "type": "response.failed",
-                "response": _response_failed_payload(
-                    response_id,
-                    created,
-                    model_name,
-                    body,
-                    previous_response_id,
-                    {"message": str(e), "type": "server_error"},
-                    _normalize_structured_output_text("".join(text_parts), _response_text_config(body)),
-                ),
+                "response": _public_response_record(failed_payload),
             }))
 
     return StreamingResponse(_responses_stream(), media_type="text/event-stream",

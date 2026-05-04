@@ -77,6 +77,9 @@ def main() -> None:
                 }],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
             }
+            if "invalid json" in json.dumps(body.get("messages", []), ensure_ascii=False):
+                response_json["choices"][0]["message"]["content"] = "not json"
+                response_json["choices"][0]["message"].pop("tool_calls", None)
             return JSONResponse(response_json)
 
         proxy.chat = fake_chat
@@ -108,8 +111,47 @@ def main() -> None:
         assert data["text"]["format"]["type"] == "json_object"
         assert data["output_text"] == "{\"ok\": true}" or data["output_text"] == "{\"ok\":true}"
         assert data["tools"][0]["type"] == "function"
+        for field in ("id", "object", "created_at", "completed_at", "status", "model", "output", "output_text", "usage", "error", "incomplete_details", "metadata"):
+            assert field in data
+        assert not any(key.startswith("_") for key in data)
+        message_items = [item for item in data["output"] if item["type"] == "message"]
+        assert message_items
+        assert message_items[0]["status"] == "completed"
+        assert message_items[0]["role"] == "assistant"
+        assert message_items[0]["content"][0]["text"] == data["output_text"]
 
         response_id = data["id"]
+
+        schema_resp = client.post("/v1/responses", json={
+            "model": "deepseek-default",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "ok_schema",
+                    "schema": {
+                        "type": "object",
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}},
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "input": "schema success",
+        })
+        assert schema_resp.status_code == 200, schema_resp.text
+        schema_data = schema_resp.json()
+        assert schema_data["status"] == "completed"
+        assert json.loads(schema_data["output_text"]) == {"ok": True}
+
+        invalid_resp = client.post("/v1/responses", json={
+            "model": "deepseek-default",
+            "text": {"format": {"type": "json_object"}},
+            "input": "invalid json",
+        })
+        assert invalid_resp.status_code == 200, invalid_resp.text
+        invalid_data = invalid_resp.json()
+        assert invalid_data["status"] == "failed"
+        assert invalid_data["error"]["code"] == "invalid_json"
 
         token_count = client.post("/v1/responses/input_tokens", json={
             "input": non_stream_body["input"],
@@ -165,6 +207,7 @@ def main() -> None:
                 replay_events.append(json.loads(line[6:]))
         assert replay_events[0]["type"] == "response.created"
         assert replay_events[-1]["type"] == "response.completed"
+        assert replay_events[-1]["response"] == client.get(f"/v1/responses/{background_id}").json()
         replay_cursor = replay_events[1]["sequence_number"]
         with client.stream(
             "GET",
@@ -235,6 +278,8 @@ def main() -> None:
         assert any(event["type"] == "response.function_call_arguments.done" for event in events)
         assert any(event["type"] == "response.refusal.done" for event in events)
         assert events[-1]["type"] == "response.completed"
+        assert "metadata" in events[-1]["response"]
+        assert not any(key.startswith("_") for key in events[-1]["response"])
 
         missing = client.get("/v1/responses/not_found/input_items")
         assert missing.status_code == 404

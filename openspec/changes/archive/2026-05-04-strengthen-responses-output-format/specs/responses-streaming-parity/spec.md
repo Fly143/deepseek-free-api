@@ -1,20 +1,4 @@
-# responses-streaming-parity Specification
-
-## Purpose
-Define the streamed Responses lifecycle and event sequencing contract.
-## Requirements
-### Requirement: Deterministic Responses stream sequencing
-The proxy SHALL emit monotonically increasing `sequence_number` values for streamed `POST /v1/responses` events and persisted replay streams.
-
-#### Scenario: Assign ordered sequence numbers
-- **WHEN** the service emits streamed Responses SSE events
-- **THEN** each event includes a `sequence_number`
-- **AND** each later event has a greater sequence number than the prior event
-
-#### Scenario: Resume from a stored event cursor
-- **WHEN** a client requests replay of a stored Responses stream after a previously seen event cursor
-- **THEN** the service emits only events after that cursor
-- **AND** the replay preserves the original event ordering
+## MODIFIED Requirements
 
 ### Requirement: Full Responses lifecycle events
 The proxy SHALL emit the core Responses stream lifecycle events for streamed requests and SHALL embed normalized public response objects in terminal lifecycle events.
@@ -48,4 +32,3 @@ The proxy SHALL emit the core Responses stream lifecycle events for streamed req
 - **THEN** the service replays the persisted lifecycle event sequence
 - **AND** it ends with the stored terminal event for that response
 - **AND** the terminal event embeds the same public response object returned by retrieval
-

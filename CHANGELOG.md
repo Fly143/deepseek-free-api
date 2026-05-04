@@ -8,12 +8,12 @@
 
 ### Added
 - **工具调用（main 分支）** — DSML 格式 XML 工具提取 + 流式筛分（参考 ds2api 架构重构）
-- **流式筛分** — 实时分离响应中的正文与工具调用内容
+- **Expert 模型路由** — 通过 SSE ready 事件的 `model_type` 字段判断；路由失效时自动降级到 default，并提供诊断方案
+- **流式筛分（main 分支）** — 实时分离响应中的正文与工具调用内容
 - **会话管理** — Token 阈值（90 万字符）自动检测并续接会话，超限自动新建
 - **按模型上下文大小** — 从 DeepSeek API 的 `input_character_limit` 字段动态推算（大部分模型映射为 1M）
 - **文本文件上传** — 使用 `ref_file_ids` 方式，与网页端行为一致（上传 → `wait_for_file_parsing` → 引用原始 file_id）
 - **TikToken 用量统计** — Token 计数 + Web 面板可视化，固定表头/合计行的 440px 滚动表格
-- **Expert 模型路由** — 通过 SSE ready 事件的 `model_type` 字段判断；路由失效时自动降级到 default，并提供诊断方案
 - **Web 管理面板** — 用量统计 Tab，支持今日/本周/全部时间筛选和清空
 
 ### Changed
@@ -53,7 +53,7 @@
 
 | 分支 | 功能 |
 |------|------|
-| `main` | DSML 工具调用、流式筛分、会话管理、文件上传、用量统计 |
-| `no-tools` | 纯对话代理 — 无 prompt 注入，输出更干净 |
+| `main` | DSML 工具调用、流式筛分、会话管理、文件上传、用量统计、Expert 路由 |
+| `no-tools` | 纯对话代理 — 无 prompt 注入，输出更干净、会话管理、Expert 路由 |
 
 纯对话、写作、翻译、代码生成等场景推荐使用 no-tools 分支。

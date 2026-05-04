@@ -38,6 +38,13 @@ def main() -> None:
             if "cancel me" in json.dumps(body.get("messages", []), ensure_ascii=False):
                 await asyncio.sleep(0.2)
             if body.get("stream"):
+                if "no finish" in json.dumps(body.get("messages", []), ensure_ascii=False):
+                    async def gen_no_finish():
+                        yield _sse_line({"choices": [{"delta": {"content": "done without finish"}}]})
+                        yield b"data: [DONE]\n\n"
+
+                    return StreamingResponse(gen_no_finish(), media_type="text/event-stream")
+
                 async def gen():
                     yield _sse_line({
                         "choices": [{"delta": {"content": "```json\n{\"value\":1}", "reasoning_content": "think ", "tool_calls": [{
@@ -280,6 +287,21 @@ def main() -> None:
         assert events[-1]["type"] == "response.completed"
         assert "metadata" in events[-1]["response"]
         assert not any(key.startswith("_") for key in events[-1]["response"])
+
+        no_finish_body = {
+            "model": "deepseek-default",
+            "stream": True,
+            "input": "no finish",
+        }
+        with client.stream("POST", "/v1/responses", json=no_finish_body) as streamed_no_finish:
+            assert streamed_no_finish.status_code == 200
+            no_finish_events = []
+            for line in streamed_no_finish.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                no_finish_events.append(json.loads(line[6:]))
+        assert no_finish_events[-1]["type"] == "response.completed"
+        assert no_finish_events[-1]["response"]["output_text"] == "done without finish"
 
         missing = client.get("/v1/responses/not_found/input_items")
         assert missing.status_code == 404

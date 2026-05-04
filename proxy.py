@@ -3027,6 +3027,121 @@ async def responses(request: Request):
                         "response": _public_response_record(record),
                     }))
                     return
+
+            output_by_id: dict[str, dict] = {}
+            if reasoning_parts:
+                output_by_id[reasoning_item_id] = _response_reasoning_item("".join(reasoning_parts), reasoning_item_id)
+            if refusal_parts:
+                output_by_id[refusal_item_id] = _response_refusal_item("".join(refusal_parts), refusal_item_id)
+            normalized_text = _normalize_structured_output_text("".join(text_parts), _response_text_config(body)) if text_parts else ""
+            output_by_id[message_item_id] = _response_text_item(normalized_text, message_item_id)
+            for idx in sorted(tool_calls.keys()):
+                tc = tool_calls[idx]
+                output_by_id[tc["id"]] = {
+                    "id": tc["id"],
+                    "type": "function_call",
+                    "call_id": tc["id"],
+                    "name": tc["name"],
+                    "arguments": tc["arguments"] or "{}",
+                    "status": "completed",
+                }
+            output = [
+                item for _, item in sorted(
+                    output_by_id.items(),
+                    key=lambda pair: output_indices.get(pair[0], len(output_indices))
+                )
+            ]
+            if message_item_id not in output_indices:
+                for event in _ensure_message_started():
+                    yield _sse_json(_event_payload(event))
+
+            assistant_msg = {"role": "assistant", "content": normalized_text if text_parts else None}
+            if reasoning_parts:
+                assistant_msg["reasoning_content"] = "".join(reasoning_parts)
+            if refusal_parts:
+                assistant_msg["refusal"] = "".join(refusal_parts)
+            if tool_calls:
+                assistant_msg["tool_calls"] = [{
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["arguments"] or "{}",
+                    }
+                } for _, tc in sorted(tool_calls.items())]
+
+            approx_completion_tokens = _count_tokens("".join(reasoning_parts) + "".join(text_parts))
+            approx_prompt_tokens = _count_tokens(convert_messages_for_deepseek(messages, tools))
+            record = _build_responses_record(
+                response_id=response_id,
+                body=body,
+                model=model_name,
+                created=created,
+                completed_at=int(time.time()),
+                output=output,
+                usage={
+                    "prompt_tokens": approx_prompt_tokens,
+                    "completion_tokens": approx_completion_tokens,
+                    "total_tokens": approx_prompt_tokens + approx_completion_tokens,
+                },
+                messages=messages + [assistant_msg],
+                status="completed",
+                incomplete_details=None,
+            )
+            record = _apply_structured_output_contract(record)
+            status = record.get("status", "completed")
+            if record.get("store", True):
+                save_response_record(record)
+
+            if reasoning_parts:
+                yield _sse_json(_event_payload({
+                    "type": "response.reasoning_text.done",
+                    "item_id": reasoning_item_id,
+                    "output_index": output_indices.get(reasoning_item_id, 0),
+                    "content_index": 0,
+                    "text": "".join(reasoning_parts),
+                }))
+            if refusal_parts:
+                yield _sse_json(_event_payload({
+                    "type": "response.refusal.done",
+                    "item_id": refusal_item_id,
+                    "output_index": output_indices.get(refusal_item_id, 0),
+                    "content_index": 0,
+                    "text": "".join(refusal_parts),
+                }))
+            if text_parts:
+                yield _sse_json(_event_payload({
+                    "type": "response.output_text.done",
+                    "item_id": message_item_id,
+                    "output_index": output_indices.get(message_item_id, 0),
+                    "content_index": 0,
+                    "text": normalized_text,
+                }))
+                yield _sse_json(_event_payload({
+                    "type": "response.content_part.done",
+                    "item_id": message_item_id,
+                    "output_index": output_indices.get(message_item_id, 0),
+                    "content_index": 0,
+                    "part": _response_text_item(normalized_text, message_item_id)["content"][0],
+                }))
+            for idx in sorted(tool_calls.keys()):
+                tc = tool_calls[idx]
+                yield _sse_json(_event_payload({
+                    "type": "response.function_call_arguments.done",
+                    "item_id": tc["id"],
+                    "output_index": output_indices.get(tc["id"], 0),
+                    "arguments": tc["arguments"] or "{}",
+                }))
+            for idx, item in enumerate(output):
+                yield _sse_json(_event_payload({
+                    "type": "response.output_item.done",
+                    "output_index": idx,
+                    "item": item,
+                }))
+            yield _sse_json(_event_payload({
+                "type": _response_terminal_event_type(status),
+                "response": _public_response_record(record),
+            }))
         except Exception as e:
             failed_payload = _response_failed_payload(
                 response_id,

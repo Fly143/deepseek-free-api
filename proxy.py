@@ -124,6 +124,19 @@ def _response_text_item(text: str, item_id: str | None = None) -> dict:
     }
 
 
+def _response_refusal_item(refusal_text: str, item_id: str | None = None) -> dict:
+    return {
+        "id": item_id or f"rf_{uuid.uuid4().hex[:24]}",
+        "type": "refusal",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": refusal_text or "",
+            "annotations": [],
+        }],
+    }
+
+
 def _response_reasoning_item(summary_text: str, item_id: str | None = None) -> dict:
     return {
         "id": item_id or f"rs_{uuid.uuid4().hex[:24]}",
@@ -147,6 +160,49 @@ def _response_function_call_item(tool_call: dict, call_id: str | None = None) ->
     }
 
 
+def _response_text_config(body: dict) -> dict:
+    text = body.get("text")
+    if isinstance(text, dict):
+        cfg = dict(text)
+        fmt = cfg.get("format")
+        if isinstance(fmt, dict):
+            cfg["format"] = dict(fmt)
+        elif isinstance(fmt, str):
+            cfg["format"] = {"type": fmt}
+        else:
+            cfg["format"] = {"type": "text"}
+        return cfg
+    return {"format": {"type": "text"}}
+
+
+def _normalize_structured_output_text(output_text: str, text_config: dict | None) -> str:
+    if not output_text or not isinstance(text_config, dict):
+        return output_text
+    fmt = text_config.get("format")
+    if not isinstance(fmt, dict):
+        return output_text
+    fmt_type = fmt.get("type")
+    if fmt_type not in ("json_object", "json_schema"):
+        return output_text
+
+    candidate = output_text.strip()
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s*```$", "", candidate)
+    start_candidates = [i for i in (candidate.find("{"), candidate.find("[")) if i != -1]
+    if start_candidates:
+        start = min(start_candidates)
+        end_candidates = [candidate.rfind("}"), candidate.rfind("]")]
+        end = max(end_candidates)
+        if end > start:
+            candidate = candidate[start:end + 1]
+    try:
+        parsed = json.loads(candidate)
+        return json.dumps(parsed, ensure_ascii=False)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return output_text
+
+
 def _extract_output_text(output: list[dict]) -> str:
     texts: list[str] = []
     for item in output or []:
@@ -163,6 +219,29 @@ def _normalize_response_tool_output(output: Any) -> str:
     if output is None:
         return ""
     return json.dumps(output, ensure_ascii=False)
+
+
+def _normalize_response_tool(tool: Any) -> dict | None:
+    if not isinstance(tool, dict):
+        return None
+    ttype = tool.get("type")
+    if ttype == "web_search_preview":
+        return None
+
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    name = tool.get("name") or fn.get("name")
+    if ttype == "function" or name:
+        normalized_fn = {
+            "name": name or "",
+            "description": tool.get("description") or fn.get("description", ""),
+            "parameters": tool.get("parameters") or fn.get("parameters") or {"type": "object", "properties": {}},
+        }
+        if "strict" in tool:
+            normalized_fn["strict"] = tool.get("strict")
+        elif "strict" in fn:
+            normalized_fn["strict"] = fn.get("strict")
+        return {"type": "function", "function": normalized_fn}
+    return None
 
 
 def _normalize_input_file_part(part: dict) -> dict:
@@ -277,6 +356,18 @@ def _normalize_response_input_items(input_items: Any) -> list[dict]:
     return normalized
 
 
+def _assign_response_input_item_ids(items: list[dict], response_id: str) -> list[dict]:
+    assigned: list[dict] = []
+    for idx, item in enumerate(items or []):
+        if not isinstance(item, dict):
+            continue
+        copy = dict(item)
+        if not copy.get("id"):
+            copy["id"] = f"{response_id}_in_{idx}"
+        assigned.append(copy)
+    return assigned
+
+
 def _response_instructions_item(instructions: str) -> dict:
     return {
         "type": "message",
@@ -289,14 +380,30 @@ def _stored_input_items(body: dict) -> list[dict]:
     items = _normalize_response_input_items(body.get("input"))
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
-        return [_response_instructions_item(instructions)] + items
-    return items
+        items = [_response_instructions_item(instructions)] + items
+    return _assign_response_input_item_ids(items, body.get("_response_id", f"resp_{uuid.uuid4().hex}"))
+
+
+def _paginate_response_input_items(items: list[dict], *, limit: int, after: str | None, before: str | None, order: str) -> tuple[list[dict], bool]:
+    ordered = list(items or [])
+    if order == "desc":
+        ordered = list(reversed(ordered))
+
+    if after:
+        idx = next((i for i, item in enumerate(ordered) if item.get("id") == after), -1)
+        ordered = ordered[idx + 1:] if idx != -1 else []
+    if before:
+        idx = next((i for i, item in enumerate(ordered) if item.get("id") == before), -1)
+        ordered = ordered[:idx] if idx != -1 else []
+
+    has_more = len(ordered) > limit
+    return ordered[:limit], has_more
 
 
 def _response_object_payload(record: dict, *, status: str | None = None, usage: dict | None = None,
-                             completed_at: int | None | object = Ellipsis, output: list[dict] | None = None,
-                             error: dict | None | object = Ellipsis, incomplete_details: dict | None | object = Ellipsis,
-                             output_text: str | None = None) -> dict:
+                              completed_at: int | None | object = Ellipsis, output: list[dict] | None = None,
+                              error: dict | None | object = Ellipsis, incomplete_details: dict | None | object = Ellipsis,
+                              output_text: str | None = None) -> dict:
     payload = dict(_public_response_record(record))
     if status is not None:
         payload["status"] = status
@@ -317,6 +424,7 @@ def _response_object_payload(record: dict, *, status: str | None = None, usage: 
 
 def _response_failed_payload(response_id: str, created: int, model_name: str, body: dict,
                              previous_response_id: str | None, error: dict, output_text: str = "") -> dict:
+    text_cfg = _response_text_config(body)
     return {
         "id": response_id,
         "object": "response",
@@ -334,7 +442,7 @@ def _response_failed_payload(response_id: str, created: int, model_name: str, bo
         "reasoning": {"effort": body.get("reasoning", {}).get("effort")} if isinstance(body.get("reasoning"), dict) else {},
         "store": True if body.get("store", True) else False,
         "temperature": body.get("temperature"),
-        "text": {"format": {"type": "text"}},
+        "text": text_cfg,
         "tool_choice": body.get("tool_choice", "auto"),
         "tools": body.get("tools", []),
         "top_p": body.get("top_p"),
@@ -342,7 +450,7 @@ def _response_failed_payload(response_id: str, created: int, model_name: str, bo
         "usage": None,
         "user": body.get("user"),
         "metadata": body.get("metadata", {}),
-        "output_text": output_text,
+        "output_text": _normalize_structured_output_text(output_text, text_cfg),
     }
 
 
@@ -516,21 +624,20 @@ def _merge_previous_response_context(messages: list[dict], previous_response_id:
 
 
 def _normalize_response_tools(body: dict, parsed_tools: list[dict] | None) -> list[dict] | None:
-    if parsed_tools:
-        return parsed_tools
     tools = body.get("tools")
-    if not isinstance(tools, list):
-        return None
-    out = []
-    for tool in tools:
-        if not isinstance(tool, dict):
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for source in (parsed_tools or []) + (tools if isinstance(tools, list) else []):
+        normalized = _normalize_response_tool(source)
+        if not normalized:
             continue
-        ttype = tool.get("type")
-        if ttype == "function":
-            out.append(tool)
-        elif ttype == "web_search_preview":
+        name = normalized.get("function", {}).get("name", "")
+        if name and name in seen:
             continue
-    return out or None
+        if name:
+            seen.add(name)
+        merged.append(normalized)
+    return merged or None
 
 
 def _has_web_search_tool(body: dict) -> bool:
@@ -589,7 +696,8 @@ def _build_responses_record(
     status: str = "completed",
     incomplete_details: dict | None = None,
 ) -> dict:
-    text = _extract_output_text(output)
+    text_config = _response_text_config(body)
+    text = _normalize_structured_output_text(_extract_output_text(output), text_config)
     record = {
         "id": response_id,
         "object": "response",
@@ -607,7 +715,7 @@ def _build_responses_record(
         "reasoning": {"effort": body.get("reasoning", {}).get("effort")} if isinstance(body.get("reasoning"), dict) else {},
         "store": True if body.get("store", True) else False,
         "temperature": body.get("temperature"),
-        "text": {"format": {"type": "text"}},
+        "text": text_config,
         "tool_choice": body.get("tool_choice", "auto"),
         "tools": body.get("tools", []),
         "top_p": body.get("top_p"),
@@ -631,6 +739,9 @@ def _response_output_from_chat_message(msg: dict) -> list[dict]:
     reasoning = msg.get("reasoning_content", "")
     if reasoning:
         output.append(_response_reasoning_item(reasoning))
+    refusal = msg.get("refusal", "")
+    if isinstance(refusal, str) and refusal:
+        output.append(_response_refusal_item(refusal))
     content = msg.get("content", "")
     if isinstance(content, str) and content:
         output.append(_response_text_item(content))
@@ -649,6 +760,8 @@ def _assistant_message_from_chat_message(msg: dict) -> dict:
     }
     if msg.get("reasoning_content"):
         assistant["reasoning_content"] = msg.get("reasoning_content")
+    if msg.get("refusal"):
+        assistant["refusal"] = msg.get("refusal")
     if msg.get("tool_calls"):
         assistant["tool_calls"] = msg.get("tool_calls")
     return assistant
@@ -693,96 +806,122 @@ def _json_from_response(resp: JSONResponse) -> dict:
 
 
 async def _single_response_stream(record: dict):
-    yield _sse_json({
+    sequence_number = 0
+
+    def _event_payload(payload: dict) -> dict:
+        nonlocal sequence_number
+        sequence_number += 1
+        payload["sequence_number"] = sequence_number
+        return payload
+
+    yield _sse_json(_event_payload({
         "type": "response.created",
         "response": _response_object_payload(record, status="in_progress", completed_at=None, usage=None)
-    })
-    yield _sse_json({
+    }))
+    yield _sse_json(_event_payload({
         "type": "response.in_progress",
         "response": _response_object_payload(record, status="in_progress", completed_at=None, usage=None)
-    })
+    }))
     output = record.get("output", [])
     for output_index, item in enumerate(output):
-        yield _sse_json({
+        yield _sse_json(_event_payload({
             "type": "response.output_item.added",
             "output_index": output_index,
             "item": item,
-        })
+        }))
         if item.get("type") == "reasoning":
             text = ""
             summary = item.get("summary", [])
             if summary and isinstance(summary, list):
                 text = summary[0].get("text", "") or ""
             if text:
-                yield _sse_json({
+                yield _sse_json(_event_payload({
                     "type": "response.reasoning_text.delta",
                     "item_id": item.get("id"),
                     "output_index": output_index,
                     "content_index": 0,
                     "delta": text,
-                })
-                yield _sse_json({
+                }))
+                yield _sse_json(_event_payload({
                     "type": "response.reasoning_text.done",
                     "item_id": item.get("id"),
                     "output_index": output_index,
                     "content_index": 0,
                     "text": text,
-                })
+                }))
         elif item.get("type") == "message":
             for content_index, content in enumerate(item.get("content", []) or []):
-                yield _sse_json({
+                yield _sse_json(_event_payload({
                     "type": "response.content_part.added",
                     "item_id": item.get("id"),
                     "output_index": output_index,
                     "content_index": content_index,
                     "part": content,
-                })
+                }))
                 if content.get("type") == "output_text":
                     text = content.get("text", "") or ""
                     if text:
-                        yield _sse_json({
+                        yield _sse_json(_event_payload({
                             "type": "response.output_text.delta",
                             "item_id": item.get("id"),
                             "output_index": output_index,
                             "content_index": content_index,
                             "delta": text,
-                        })
-                        yield _sse_json({
+                        }))
+                        yield _sse_json(_event_payload({
                             "type": "response.output_text.done",
                             "item_id": item.get("id"),
                             "output_index": output_index,
                             "content_index": content_index,
                             "text": text,
-                        })
-                yield _sse_json({
+                        }))
+                yield _sse_json(_event_payload({
                     "type": "response.content_part.done",
                     "item_id": item.get("id"),
                     "output_index": output_index,
                     "content_index": content_index,
                     "part": content,
-                })
+                }))
+        elif item.get("type") == "refusal":
+            for content_index, content in enumerate(item.get("content", []) or []):
+                text = content.get("text", "") or ""
+                if text:
+                    yield _sse_json(_event_payload({
+                        "type": "response.refusal.delta",
+                        "item_id": item.get("id"),
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "delta": text,
+                    }))
+                    yield _sse_json(_event_payload({
+                        "type": "response.refusal.done",
+                        "item_id": item.get("id"),
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "text": text,
+                    }))
         elif item.get("type") == "function_call":
-            yield _sse_json({
+            yield _sse_json(_event_payload({
                 "type": "response.function_call_arguments.delta",
                 "item_id": item.get("id"),
                 "output_index": output_index,
                 "delta": item.get("arguments", "{}"),
-            })
-            yield _sse_json({
+            }))
+            yield _sse_json(_event_payload({
                 "type": "response.function_call_arguments.done",
                 "item_id": item.get("id"),
                 "output_index": output_index,
                 "arguments": item.get("arguments", "{}"),
-            })
-        yield _sse_json({
+            }))
+        yield _sse_json(_event_payload({
             "type": "response.output_item.done",
             "output_index": output_index,
             "item": item,
-        })
-    yield _sse_json({
+        }))
+    yield _sse_json(_event_payload({
         "type": _response_terminal_event_type(record.get("status", "completed")),
         "response": _public_response_record(record),
-    })
+    }))
 
 
 class _SyntheticRequest:
@@ -2016,6 +2155,7 @@ async def responses(request: Request):
     model = _resolve_responses_model(body)
     stream = body.get("stream", False)
     previous_response_id = body.get("previous_response_id")
+    body["_response_id"] = _gen_response_id()
 
     messages, parsed_tools = _messages_from_responses_request(body)
     messages = _merge_previous_response_context(messages, previous_response_id)
@@ -2031,7 +2171,7 @@ async def responses(request: Request):
     if "tool_choice" in body:
         chat_body["tool_choice"] = body.get("tool_choice")
 
-    response_id = _gen_response_id()
+    response_id = body["_response_id"]
 
     if not stream:
         chat_result = await chat(_SyntheticRequest(request, chat_body))
@@ -2059,12 +2199,21 @@ async def responses(request: Request):
         model_name = model
         reasoning_parts: list[str] = []
         text_parts: list[str] = []
+        refusal_parts: list[str] = []
         tool_calls: dict[int, dict] = {}
         reasoning_item_id = "rs_0"
         message_item_id = "msg_0"
+        refusal_item_id = "rf_0"
         output_indices: dict[str, int] = {}
         output_started: set[str] = set()
         content_started = False
+        sequence_number = 0
+
+        def _event_payload(payload: dict) -> dict:
+            nonlocal sequence_number
+            sequence_number += 1
+            payload["sequence_number"] = sequence_number
+            return payload
 
         def _start_output_item(item: dict) -> tuple[int, dict | None]:
             item_id = item.get("id") or f"out_{len(output_indices)}"
@@ -2085,6 +2234,16 @@ async def responses(request: Request):
             if not reasoning_parts:
                 return []
             item = _response_reasoning_item("".join(reasoning_parts), reasoning_item_id)
+            output_index, event = _start_output_item(item)
+            events = []
+            if event:
+                events.append(event)
+            return events
+
+        def _ensure_refusal_started() -> list[dict]:
+            if not refusal_parts:
+                return []
+            item = _response_refusal_item("".join(refusal_parts), refusal_item_id)
             output_index, event = _start_output_item(item)
             events = []
             if event:
@@ -2124,14 +2283,14 @@ async def responses(request: Request):
             incomplete_details=None,
         )
 
-        yield _sse_json({
+        yield _sse_json(_event_payload({
             "type": "response.created",
             "response": _response_object_payload(created_record, status="in_progress", completed_at=None, usage=None)
-        })
-        yield _sse_json({
+        }))
+        yield _sse_json(_event_payload({
             "type": "response.in_progress",
             "response": _response_object_payload(created_record, status="in_progress", completed_at=None, usage=None)
-        })
+        }))
 
         try:
             async for chunk in chat_stream.body_iterator:
@@ -2148,12 +2307,18 @@ async def responses(request: Request):
 
                 if "error" in obj:
                     err = obj.get("error", {})
-                    yield _sse_json({
+                    yield _sse_json(_event_payload({
                         "type": "response.failed",
                         "response": _response_failed_payload(
-                            response_id, created, model_name, body, previous_response_id, err, "".join(text_parts)
+                            response_id,
+                            created,
+                            model_name,
+                            body,
+                            previous_response_id,
+                            err,
+                            _normalize_structured_output_text("".join(text_parts), _response_text_config(body)),
                         ),
-                    })
+                    }))
                     return
 
                 model_name = obj.get("model", model_name)
@@ -2164,27 +2329,40 @@ async def responses(request: Request):
                 if isinstance(reasoning_delta, str) and reasoning_delta:
                     reasoning_parts.append(reasoning_delta)
                     for event in _ensure_reasoning_started():
-                        yield _sse_json(event)
-                    yield _sse_json({
+                        yield _sse_json(_event_payload(event))
+                    yield _sse_json(_event_payload({
                         "type": "response.reasoning_text.delta",
                         "item_id": reasoning_item_id,
                         "output_index": output_indices.get(reasoning_item_id, 0),
                         "content_index": 0,
                         "delta": reasoning_delta,
-                    })
+                    }))
 
                 content_delta = delta.get("content")
                 if isinstance(content_delta, str) and content_delta:
                     text_parts.append(content_delta)
                     for event in _ensure_message_started():
-                        yield _sse_json(event)
-                    yield _sse_json({
+                        yield _sse_json(_event_payload(event))
+                    yield _sse_json(_event_payload({
                         "type": "response.output_text.delta",
                         "item_id": message_item_id,
                         "output_index": output_indices.get(message_item_id, 0),
                         "content_index": 0,
                         "delta": content_delta,
-                    })
+                    }))
+
+                refusal_delta = delta.get("refusal")
+                if isinstance(refusal_delta, str) and refusal_delta:
+                    refusal_parts.append(refusal_delta)
+                    for event in _ensure_refusal_started():
+                        yield _sse_json(_event_payload(event))
+                    yield _sse_json(_event_payload({
+                        "type": "response.refusal.delta",
+                        "item_id": refusal_item_id,
+                        "output_index": output_indices.get(refusal_item_id, 0),
+                        "content_index": 0,
+                        "delta": refusal_delta,
+                    }))
 
                 tc_list = delta.get("tool_calls") or []
                 if isinstance(tc_list, list):
@@ -2212,20 +2390,25 @@ async def responses(request: Request):
                             }
                             output_index, event = _start_output_item(function_item)
                             if event:
-                                yield _sse_json(event)
-                            yield _sse_json({
+                                yield _sse_json(_event_payload(event))
+                            yield _sse_json(_event_payload({
                                 "type": "response.function_call_arguments.delta",
                                 "item_id": slot["id"],
                                 "output_index": output_index,
                                 "delta": fn.get("arguments"),
-                            })
+                            }))
 
                 if finish_reason:
                     output_by_id: dict[str, dict] = {}
                     if reasoning_parts:
                         output_by_id[reasoning_item_id] = _response_reasoning_item("".join(reasoning_parts), reasoning_item_id)
+                    if refusal_parts:
+                        output_by_id[refusal_item_id] = _response_refusal_item("".join(refusal_parts), refusal_item_id)
                     if text_parts:
-                        output_by_id[message_item_id] = _response_text_item("".join(text_parts), message_item_id)
+                        output_by_id[message_item_id] = _response_text_item(
+                            _normalize_structured_output_text("".join(text_parts), _response_text_config(body)),
+                            message_item_id,
+                        )
                     for idx in sorted(tool_calls.keys()):
                         tc = tool_calls[idx]
                         output_by_id[tc["id"]] = {
@@ -2239,7 +2422,7 @@ async def responses(request: Request):
                     if not output_by_id:
                         output_by_id[message_item_id] = _response_text_item("", message_item_id)
                         for event in _ensure_message_started():
-                            yield _sse_json(event)
+                            yield _sse_json(_event_payload(event))
                     output = [
                         item for _, item in sorted(
                             output_by_id.items(),
@@ -2249,10 +2432,12 @@ async def responses(request: Request):
 
                     assistant_msg = {
                         "role": "assistant",
-                        "content": "".join(text_parts) if text_parts else None,
+                        "content": _normalize_structured_output_text("".join(text_parts), _response_text_config(body)) if text_parts else None,
                     }
                     if reasoning_parts:
                         assistant_msg["reasoning_content"] = "".join(reasoning_parts)
+                    if refusal_parts:
+                        assistant_msg["refusal"] = "".join(refusal_parts)
                     if tool_calls:
                         assistant_msg["tool_calls"] = [{
                             "id": tc["id"],
@@ -2289,49 +2474,58 @@ async def responses(request: Request):
                         save_response_record(record)
 
                     if reasoning_parts:
-                        yield _sse_json({
+                        yield _sse_json(_event_payload({
                             "type": "response.reasoning_text.done",
                             "item_id": reasoning_item_id,
                             "output_index": output_indices.get(reasoning_item_id, 0),
                             "content_index": 0,
                             "text": "".join(reasoning_parts),
-                        })
+                        }))
+                    if refusal_parts:
+                        yield _sse_json(_event_payload({
+                            "type": "response.refusal.done",
+                            "item_id": refusal_item_id,
+                            "output_index": output_indices.get(refusal_item_id, 0),
+                            "content_index": 0,
+                            "text": "".join(refusal_parts),
+                        }))
                     if text_parts:
-                        yield _sse_json({
+                        normalized_text = _normalize_structured_output_text("".join(text_parts), _response_text_config(body))
+                        yield _sse_json(_event_payload({
                             "type": "response.output_text.done",
                             "item_id": message_item_id,
                             "output_index": output_indices.get(message_item_id, 0),
                             "content_index": 0,
-                            "text": "".join(text_parts),
-                        })
-                        yield _sse_json({
+                            "text": normalized_text,
+                        }))
+                        yield _sse_json(_event_payload({
                             "type": "response.content_part.done",
                             "item_id": message_item_id,
                             "output_index": output_indices.get(message_item_id, 0),
                             "content_index": 0,
-                            "part": _response_text_item("".join(text_parts), message_item_id)["content"][0],
-                        })
+                            "part": _response_text_item(normalized_text, message_item_id)["content"][0],
+                        }))
                     for idx in sorted(tool_calls.keys()):
                         tc = tool_calls[idx]
-                        yield _sse_json({
+                        yield _sse_json(_event_payload({
                             "type": "response.function_call_arguments.done",
                             "item_id": tc["id"],
                             "output_index": output_indices.get(tc["id"], 0),
                             "arguments": tc["arguments"] or "{}",
-                        })
+                        }))
                     for idx, item in enumerate(output):
-                        yield _sse_json({
+                        yield _sse_json(_event_payload({
                             "type": "response.output_item.done",
                             "output_index": idx,
                             "item": item,
-                        })
-                    yield _sse_json({
+                        }))
+                    yield _sse_json(_event_payload({
                         "type": _response_terminal_event_type(status),
                         "response": _public_response_record(record),
-                    })
+                    }))
                     return
         except Exception as e:
-            yield _sse_json({
+            yield _sse_json(_event_payload({
                 "type": "response.failed",
                 "response": _response_failed_payload(
                     response_id,
@@ -2340,9 +2534,9 @@ async def responses(request: Request):
                     body,
                     previous_response_id,
                     {"message": str(e), "type": "server_error"},
-                    "".join(text_parts),
+                    _normalize_structured_output_text("".join(text_parts), _response_text_config(body)),
                 ),
-            })
+            }))
 
     return StreamingResponse(_responses_stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
@@ -2357,16 +2551,34 @@ async def get_response(response_id: str):
 
 
 @app.get("/v1/responses/{response_id}/input_items")
-async def get_response_input_items(response_id: str):
+async def get_response_input_items(response_id: str, request: Request):
     record = get_response_record(response_id)
     if not record:
         raise HTTPException(404, detail={"error": {"message": f"response {response_id} not found", "type": "invalid_request_error"}})
+    stored_items = _ensure_list(record.get("_input"))
+    limit_raw = request.query_params.get("limit")
+    try:
+        limit = max(1, min(int(limit_raw), 100)) if limit_raw is not None else 20
+    except ValueError:
+        raise HTTPException(400, detail={"error": {"message": "invalid limit", "type": "invalid_request_error"}})
+    after = request.query_params.get("after")
+    before = request.query_params.get("before")
+    order = (request.query_params.get("order") or "desc").lower()
+    if order not in ("asc", "desc"):
+        raise HTTPException(400, detail={"error": {"message": "invalid order", "type": "invalid_request_error"}})
+    page_items, has_more = _paginate_response_input_items(
+        stored_items,
+        limit=limit,
+        after=after,
+        before=before,
+        order=order,
+    )
     return {
         "object": "list",
-        "data": _ensure_list(record.get("_input")),
-        "first_id": None,
-        "last_id": None,
-        "has_more": False,
+        "data": page_items,
+        "first_id": page_items[0].get("id") if page_items else None,
+        "last_id": page_items[-1].get("id") if page_items else None,
+        "has_more": has_more,
     }
 
 

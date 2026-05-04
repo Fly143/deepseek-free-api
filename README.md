@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![FastAPI](https://img.shields.io/badge/FastAPI-teal)](https://fastapi.tiangolo.com/)
 
-将 **DeepSeek 网页端免费对话**（chat.deepseek.com）反代为 **OpenAI 兼容 API**，支持工具调用（Function Calling）、动态模型发现、PoW 自动求解、Token 自动刷新。
+将 **DeepSeek 网页端免费对话**（chat.deepseek.com）反代为 **OpenAI 兼容 API**，支持动态模型发现、PoW 自动求解、Token 自动刷新，并提供纯聊天版（no-tools 分支，无工具调用 prompt 注入）。
 
 本项目所修改代码均为ai完成，不含任何一句人工代码，望周知！
 
@@ -49,13 +49,14 @@
 
 ## 特性
 
-- **OpenAI 完全兼容** — 标准 `/v1/chat/completions`（流式/非流式）、`/v1/models`、`/v1/models/{id}`、`/v1/models/refresh` 端点
-- **工具调用（Function Calling）** — DSML XML + CDATA 格式（参照 ds2api），流式筛分实时分离正文/工具调用 + fallback 全量解析，DeepSeek V3/R1 原生对话标记
+- **OpenAI 完全兼容** — `/v1/chat/completions`（流式/非流式）、`/v1/models`、`/v1/models/refresh`、**`/v1/responses`** 端点
+- **OpenAI Responses API** — 新增 `/v1/responses` create/retrieve/delete/input_items/cancel/compact，完整 SSE 生命周期事件，Structured Output 支持
+- **纯聊天代理** — 无工具调用 prompt 注入，输出更干净，模型注意力集中在用户问题上
 - **动态模型发现** — 启动时从 DeepSeek 官方 API 实时探测模型列表，每小时自动刷新（含上下文大小等完整信息）
 - **PoW 自动求解** — Node.js WASM 主求解器 + Python 纯算法回退，请求前自动获取 challenge 并求解
 - **Token 自动刷新** — 检测到 401 时自动用保存的密码重新登录，无需人工干预
 - **深度思考** — 支持 DeepSeek 的 `<thought>` 标签，流式输出时分离为 `reasoning_content`
-- **Vision 图像理解** — 支持图片上传、解析、对话，Vision 模型同时支持工具调用
+- **Vision 图像理解** — 支持图片上传、解析、对话
 - **文本文件上传** — 支持 .txt/.md/.py 等文本文件直接上传对话，走 ref_file_ids（和网页端一致）
 - **联网搜索** — 支持 search 模型变体的 `search_enabled` 参数
 - **管理面板** — 内嵌单文件 Web UI，支持手机号/邮箱登录、cURL 导入
@@ -263,59 +264,83 @@ curl http://localhost:8000/v1/chat/completions \
 
 > **注意：** 文本文件不 fork，直接等 DeepSeek 解析完成后引用原始 `file_id`；图片需要 fork 到 `"vision"` 才能被 Vision 模型读取。
 
-### 5. 工具调用（Function Calling）
+### 5. Responses API（OpenAI 兼容）
+
+支持 OpenAI 最新的 `/v1/responses` 端点。非流式：
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "deepseek-default",
-    "messages": [
-      {"role": "user", "content": "北京今天天气怎么样？"}
-    ],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "查询指定城市的天气",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "city": {"type": "string", "description": "城市名称"}
-          },
-          "required": ["city"]
-        }
-      }
-    }],
-    "tool_choice": "auto"
+    "model": "deepseek",
+    "input": "用Python写一个快速排序",
+    "stream": false
   }'
 ```
 
-成功时返回 `finish_reason: "tool_calls"`：
+流式（带完整 SSE 生命周期事件）：
 
-```json
-{
-  "choices": [{
-    "finish_reason": "tool_calls",
-    "message": {
-      "role": "assistant",
-      "content": null,
-      "tool_calls": [{
-        "id": "call_abc123...",
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "arguments": "{\"city\": \"北京\"}"
-        }
-      }]
-    }
-  }]
-}
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek",
+    "input": "解释量子纠缠",
+    "stream": true
+  }'
 ```
 
-**多轮工具调用**：代理会自动转换 assistant 的 `tool_calls` 和 tool 角色的返回结果为 `[ASST]` / `[TOOL_RESULT]` 格式文本，DeepSeek 可以理解。
+Events: `response.created` → `response.in_progress` → `response.output_item.added` → `response.content_part.added` → `response.output_text.delta`(逐块) → `response.output_text.done` → `response.content_part.done` → `response.output_item.done` → `response.completed`
 
-### 6. 模型刷新
+其他端点（支持流式 replay）：
+
+```bash
+# 查询
+curl http://localhost:8000/v1/responses/{response_id}
+
+# 输入项
+curl http://localhost:8000/v1/responses/{response_id}/input_items
+
+# 取消
+curl -X POST http://localhost:8000/v1/responses/{response_id}/cancel
+
+# 删除
+curl -X DELETE http://localhost:8000/v1/responses/{response_id}
+
+# 压缩多轮对话
+curl -X POST http://localhost:8000/v1/responses/{response_id}/compact \
+  -H "Content-Type: application/json" \
+  -d '{"instructions": "请用中文回答接下来的所有问题"}'
+```
+
+Structured Output（json_schema）：
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek",
+    "input": "北京今天天气25°C，请返回结构化数据",
+    "text": {
+      "format": {
+        "type": "json_schema",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"},
+            "temperature": {"type": "integer"},
+            "unit": {"type": "string"}
+          },
+          "required": ["city", "temperature", "unit"]
+        }
+      }
+    }
+  }'
+```
+
+> Responses API 是对现有 `/v1/chat/completions` 的补充，两者可同时使用。
+
+### 7. 模型刷新
 
 ```bash
 # 强制刷新模型列表（无需等待1小时缓存过期）
@@ -372,92 +397,19 @@ def _discover_models():
 > - 所有模型均显式指定 `model_type`（`default` / `expert` / `vision`），确保 DeepSeek 正确路由
 > - 模型名称为纯英文 ID，中文对照见上表
 
-## 工具调用详解
+## 分支说明
 
-DeepSeek 网页端**不支持**原生 function calling。本代理通过 **DSML XML + CDATA 提示词注入** + **流式筛分** + **DSML 解析**实现，参照 [ds2api](https://github.com/CJackHwang/ds2api)。
+本仓库提供两个分支：
 
-### 提示词注入
+| 分支 | 特点 |
+|------|------|
+| `no-tools`（当前分支） | 纯对话代理 — 无工具调用 prompt 注入，输出更干净。适合写作、翻译、代码生成等场景 |
+| `main` | 完整功能版 — 支持 DSML 工具调用、流式筛分、会话管理等。需要工具调用时使用 |
 
-注入 DSML 格式的工具调用指令（`build_dsml_tool_prompt`）：
-
-```xml
-<|DSML|tool_calls>
-  <|DSML|invoke name="get_weather">
-    <|DSML|parameter name="city"><![CDATA[北京]]></|DSML|parameter>
-  </|DSML|invoke>
-</|DSML|tool_calls>
-```
-
-包含完整的格式规则、错误示例和正确示例。
-
-### 流式筛分（`tool_sieve.py`）
-
-有工具调用且 `stream: true` 时，`StreamSieve` 引擎逐字扫描 DeepSeek 响应流，实时分离正文和 DSML 工具调用：
-- **正文** → 即时转为 `delta.content` 逐块输出
-- **DSML 块** → 缓冲至闭合后解析为 `tool_calls`
-
-筛分未命中时自动 fallback 到全量缓冲解析，确保可靠性。
-
-### DSML 解析（`tool_dsml.py`）
-
-参照 ds2api 的字符级扫描引擎：
-- **前缀剥离** — 逐字符消费 `|`、空格、`dsml` 标记，保留标准 XML
-- **CDATA 处理** — `SanitizeLooseCDATA` 修复未闭合 CDATA
-- **XML 解析** — 递归解析 `<invoke>` → `<parameter>` 标签
-- **camelCase 适配** — 自动将模型输出的 camelCase 工具名转换为 snake_case
-
-### DeepSeek 原生对话标记
-
-`convert_messages_for_deepseek` 使用 DeepSeek V3/R1 原生标记（参照 ds2api 的 `MessagesPrepare`）：
-
-```
-<｜begin▁of▁sentence｜><｜System｜>系统消息<｜end▁of▁instructions｜><｜User｜>用户消息<｜Assistant｜>
-```
-
-相比旧版 `[SYS]`/`[USER]` ASCII 标签，原生标记使模型更稳定地输出 DSML 格式。
-
-## 无工具分支 (no-tools)
-
-### 为什么注入太多 Prompt 会让模型变笨
-
-工具调用（Function Calling）的实现方式是**将工具定义以文本形式注入到 user 消息中**。这带来不可忽视的副作用：
-
-**每注入一个工具定义，就消耗一部分模型的"注意力预算"。**
-
-具体影响：
-
-- **注意力稀释** — 大量工具描述占据上下文，模型分配到用户实际问题的注意力比例下降，回答质量明显变差
-- **格式过拟合** — 模型过度关注 `TOOL_CALL` 输出格式，在不需要调用工具的纯对话中也可能产生格式残留或奇怪的输出
-- **混淆增加** — 工具名称、参数描述与正常对话内容混在一起，增加了模型混淆的概率，尤其是参数较多的工具
-- **Token 浪费** — 工具 prompt 每次请求都占用 token，既浪费上下文窗口又增加上游处理时间，而大部分对话根本不需要工具
-- **幻觉风险** — 过多的格式指令可能让模型"学会"无中生有地输出 TOOL_CALL，即使当前问题根本不需要调用工具
-
-**简单说：prompt 越多，模型越容易"分心"，回答质量越差。**
-
-### 无工具分支
-
-如果你的使用场景**不需要**工具调用（纯对话、写作、翻译、代码生成、问答等），强烈建议使用 `no-tools` 分支：
-
-```bash
-# 克隆无工具版本
-git clone -b no-tools https://github.com/Fly143/deepseek-free-api.git
-```
-
-`no-tools` 分支与 `main` 分支的区别：
-
-| | main | no-tools |
-|---|---|---|
-| 工具 prompt 注入 | ✅ 每次请求注入工具描述 | ❌ 不注入任何 prompt |
-| tool_call.py | ✅ ~1000 行工具调用逻辑 | ❌ 完全移除 |
-| 响应清理 | ✅ 清理 TOOL_CALL 残留 | ❌ 不需要 |
-| 深度思考 | ✅ | ✅ |
-| PoW 求解 | ✅ | ✅ |
-| Token 自动刷新 | ✅ | ✅ |
-| Vision 图像理解 | ✅ | ✅ |
-| 联网搜索 | ✅ | ✅ |
-| 动态模型发现 | ✅ | ✅ |
-
-**效果：** 上下文更干净，模型注意力完全集中在用户问题上，回答更专注、质量更高，代码体积减小 ~1000 行。对于大多数日常使用场景，无工具分支是更好的选择。
+> 当前你正在使用 `no-tools` 分支。如需工具调用功能，请切换到 `main` 分支：
+> ```bash
+> git checkout main
+> ```
 
 ## PoW 求解机制
 
@@ -534,9 +486,7 @@ curl http://localhost:8000/health
 ```
 ds-free-api/
 ├── proxy.py              # 主程序：FastAPI 应用、SSE 解析、OpenAI 端点、管理面板
-├── tool_call.py          # 工具调用模块：DSML 提示词构建、DSML 解析入口、多轮对话转换
-├── tool_dsml.py          # DSML 解析器：字符级前缀剥离、CDATA 处理、XML 参数解析
-├── tool_sieve.py         # 流式筛分引擎：实时分离正文/DSML 工具调用
+├── response_store.py     # Responses API 本地持久化（JSON 文件）
 ├── pow_native.py         # PoW 求解器：Node.js WASM 主求解 + Python 回退
 ├── pow_solver.js         # Node.js PoW 求解脚本（调用 WASM）
 ├── sha3_wasm_bg.wasm     # SHA3 WASM 二进制
@@ -550,10 +500,8 @@ ds-free-api/
 
 | 文件 | 职责 | 行数 |
 |------|------|------|
-| `proxy.py` | 应用入口、路由、SSE 解析、DeepSeek API 交互、Token 刷新、管理面板 UI | ~1524 |
-| `tool_call.py` | DSML 提示词构建、DSML 解析入口、camelCase 匹配、多轮对话转换 | ~247 |
-| `tool_dsml.py` | 字符级 DSML 前缀剥离、CDATA 修复、XML 解析、工具历史格式化 | ~350 |
-| `tool_sieve.py` | 流式筛分：实时分离正文/DSML 块，fallback 全量解析 | ~180 |
+| `proxy.py` | 应用入口、路由、SSE 解析、DeepSeek API 交互、Token 刷新、管理面板 UI | ~3770 |
+| `response_store.py` | Responses API 本地持久化（线程安全 JSON 文件读写） | ~73 |
 | `pow_native.py` | PoW 求解器（Node.js 子进程 + Python 纯算法回退） | ~124 |
 | `deploy.sh` | 一键部署（环境检查、依赖安装、启动/停止/状态） | ~198 |
 
@@ -625,7 +573,7 @@ pip install fastapi uvicorn curl-cffi python-dotenv
 |------|------|
 | Token 有效期 | 约 24 小时过期，需要密码登录来自动刷新 |
 | 并发限制 | DeepSeek 免费版每账号限制约 2 并发请求 |
-| 仅 Chat Completions | 不支持 Embeddings、Fine-tuning 等端点 |
+| 仅 Chat Completions + Responses | 不支持 Embeddings、Fine-tuning 等端点 |
 | PoW 耗时 | 每次请求需要先获取并求解 PoW challenge（Node.js 约 1-3 秒） |
 | 非流式走 SSE | DeepSeek 只提供 SSE 流，非流式请求会缓冲全部 SSE 后合并返回 |
 | Vision 非流式 | Vision 模型在流式模式下无 content 输出，内部用非流式获取后包装为 SSE |
@@ -661,4 +609,5 @@ MIT License
 - [NIyueeE/ds-free-api](https://github.com/NIyueeE/ds-free-api) — Rust 原版，提供了 DeepSeek API 逆向思路和 PoW 算法参考
 - [CJackHwang/ds2api](https://github.com/CJackHwang/ds2api) — DSML 工具调用格式、流式筛分架构、DeepSeek 原生对话标记 均参考此项目
 - [GoblinHonest/mimo2api_mimoapi](https://github.com/GoblinHonest/mimo2api_mimoapi) — 会话管理（消息指纹续接、token 超限自动清屏）设计参考
+- [Acidmoon](https://github.com/Acidmoon) — 提交 PR #2，实现 OpenAI Responses API 兼容层
 - [xstjmark21-cmyk](https://github.com/xstjmark21-cmyk) — 为 Vision 功能修改测试提供模型Token算力

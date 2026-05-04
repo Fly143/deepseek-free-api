@@ -1,0 +1,8 @@
+token.json
+usage.json
+sessions.json
+responses.json
+vision.log
+.codex/
+__pycache__/
+*.pyc

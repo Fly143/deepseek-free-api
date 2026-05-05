@@ -963,7 +963,10 @@ def _response_output_from_chat_message(msg: dict) -> list[dict]:
         output.append(_response_refusal_item(refusal))
     content = msg.get("content", "")
     if isinstance(content, str) and content:
-        output.append(_response_text_item(content))
+        # 安全防护：剥除 content 中残留的 <think> 标签（SSE 解析可能遗漏）
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        if content:
+            output.append(_response_text_item(content))
     tool_calls = msg.get("tool_calls") or []
     for tc in tool_calls:
         output.append(_response_function_call_item(tc))

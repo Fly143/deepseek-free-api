@@ -2900,6 +2900,7 @@ async def responses(request: Request):
                         idx = int(tc.get("index", 0) or 0)
                         slot = tool_calls.setdefault(idx, {
                             "id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "fc_id": f"fc_{uuid.uuid4().hex[:24]}",
                             "name": "",
                             "arguments": "",
                         })
@@ -2909,7 +2910,7 @@ async def responses(request: Request):
                         if fn.get("arguments"):
                             slot["arguments"] += fn.get("arguments")
                             function_item = {
-                                "id": slot["id"],
+                                "id": slot["fc_id"],
                                 "type": "function_call",
                                 "call_id": slot["id"],
                                 "name": slot["name"],
@@ -2921,7 +2922,7 @@ async def responses(request: Request):
                                 yield _sse_json(_event_payload(event))
                             yield _sse_json(_event_payload({
                                 "type": "response.function_call_arguments.delta",
-                                "item_id": slot["id"],
+                                "item_id": slot["fc_id"],
                                 "output_index": output_index,
                                 "delta": fn.get("arguments"),
                             }))
@@ -2939,9 +2940,8 @@ async def responses(request: Request):
                         )
                     for idx in sorted(tool_calls.keys()):
                         tc = tool_calls[idx]
-                        fc_id = f"fc_{uuid.uuid4().hex[:24]}"
-                        output_by_id[fc_id] = {
-                            "id": fc_id,
+                        output_by_id[tc["fc_id"]] = {
+                            "id": tc["fc_id"],
                             "type": "function_call",
                             "call_id": tc["id"],
                             "name": tc["name"],
@@ -3040,8 +3040,8 @@ async def responses(request: Request):
                         tc = tool_calls[idx]
                         yield _sse_json(_event_payload({
                             "type": "response.function_call_arguments.done",
-                            "item_id": tc["id"],
-                            "output_index": output_indices.get(tc["id"], 0),
+                            "item_id": tc["fc_id"],
+                            "output_index": output_indices.get(tc["fc_id"], 0),
                             "arguments": tc["arguments"] or "{}",
                         }))
                     for idx, item in enumerate(output):
@@ -3156,8 +3156,8 @@ async def responses(request: Request):
                 tc = tool_calls[idx]
                 yield _sse_json(_event_payload({
                     "type": "response.function_call_arguments.done",
-                    "item_id": tc["id"],
-                    "output_index": output_indices.get(tc["id"], 0),
+                    "item_id": tc["fc_id"],
+                    "output_index": output_indices.get(tc["fc_id"], 0),
                     "arguments": tc["arguments"] or "{}",
                 }))
             for idx, item in enumerate(output):

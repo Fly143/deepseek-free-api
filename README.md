@@ -31,7 +31,9 @@
   - [非流式对话](#2-非流式对话)
   - [流式对话](#3-流式对话)
   - [工具调用（Function Calling）](#4-工具调用function-calling)
-  - [模型刷新](#5-模型刷新)
+  - [Responses API](#5-responses-apiopenai-兼容)
+  - [Anthropic Messages API](#6-anthropic-messages-api)
+  - [模型刷新](#7-模型刷新)
 - [模型系统](#模型系统)
   - [动态模型发现](#动态模型发现)
   - [当前可用模型](#当前可用模型)
@@ -339,6 +341,58 @@ curl http://localhost:8000/v1/responses \
 ```
 
 > Responses API 是对现有 `/v1/chat/completions` 的补充，两者可同时使用。
+
+### 6. Anthropic Messages API
+
+本代理完全兼容 **Anthropic Messages API** 格式，支持 RikkaHub 等客户端无缝接入。
+
+**认证方式**：使用 `x-api-key` 头或 `Authorization: Bearer` 均可：
+
+```bash
+# x-api-key 方式（推荐）
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: sk-dsapi" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-default",
+    "max_tokens": 1024,
+    "messages": [
+      {"role": "user", "content": "用Python写一个快速排序"}
+    ]
+  }'
+```
+
+**流式（思考链 + 文本）：**
+
+```bash
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: sk-dsapi" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-reasoner",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "解释量子纠缠"}
+    ]
+  }'
+```
+
+思考内容以 `thinking` block 形式实时流出，文本以 `text` block 流出。
+
+**可用端点：**
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| POST | `/v1/messages` | 发送消息（文本/思考链） |
+| POST | `/v1/messages/count_tokens` | 计算 token 数 |
+| GET | `/v1/messages/{id}` | 查询已发送的消息 |
+| POST | `/v1/messages/batches` | 创建批量请求 |
+| GET | `/v1/messages/batches` | 列出批量请求 |
+| GET | `/v1/messages/batches/{id}` | 查询批量详情 |
+| POST | `.../cancel` | 取消批量 |
+| GET | `.../results` | 下载批量结果 |
+| DELETE | `/v1/messages/batches/{id}` | 删除批量 |
 
 ### 7. 模型刷新
 

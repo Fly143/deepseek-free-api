@@ -3809,7 +3809,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             msg["reasoning_content"] = full_thinking
         if tc_result:
             msg["tool_calls"] = tc_result
-            if final_content is None:
+            if not final_content:
                 msg["content"] = None
 
         # Build and validate response — pre-serialize to catch any issues early

@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 import tiktoken
 from curl_cffi import requests as cffi_requests
+from anthropic_adapter import convert_request as anthropic_convert_request, convert_response as anthropic_convert_response, stream_response as anthropic_stream_response, nonstream_to_sse as anthropic_nonstream_to_sse, error_response as anthropic_error_response
 
 # ── Tokenizer ───────────────────────────────────
 _enc = tiktoken.get_encoding("cl100k_base")
@@ -2651,6 +2652,91 @@ async def chat(request: Request):
         add_usage(model, prompt_tokens, 0)
         add_tokens("default", cfg.get("session_id", ""), prompt_tokens)
     return result
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """Anthropic Messages API 兼容端点（no-tools）"""
+    body = await request.json()
+    model = body.get("model", "deepseek-default")
+
+    # 转换请求
+    openai_body = anthropic_convert_request(body)
+    messages = openai_body.get("messages", [])
+    stream = openai_body.get("stream", False)
+
+    cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+    model_info = get_models().get(model, get_models().get("deepseek-default"))
+    if not model_info:
+        raise HTTPException(status_code=400, detail=anthropic_error_response(f"Unknown model: {model}"))
+    thinking_enabled, search_enabled, _, _ = model_info
+
+    prompt = _convert_messages_for_deepseek(messages)
+    prompt_tokens = _count_tokens(prompt)
+
+    # 会话管理
+    if needs_renewal():
+        try:
+            token = cfg.get("token", "")
+            if token:
+                auth_h = {**cfg.get("headers", {}), "authorization": f"Bearer {token}"}
+                sess_resp = cffi_requests.post(
+                    "https://chat.deepseek.com/api/v0/chat_session/create",
+                    json={}, headers=auth_h, impersonate="chrome120", timeout=15)
+                if sess_resp.status_code == 200:
+                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
+                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                    if new_sid:
+                        cfg = dict(cfg)
+                        cfg["session_id"] = new_sid
+                        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+                        on_new_session("default", new_sid, model)
+        except Exception as e:
+            _vlog(f"Session renewal failed: {e}")
+
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    if stream:
+        result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled,
+                         stream=True, is_retry=False, ref_file_ids=[])
+
+        async def _anthropic_stream_wrapper():
+            orig_iter = result.body_iterator
+
+            async def _openai_gen():
+                async for chunk in orig_iter:
+                    yield chunk
+
+            async for event in anthropic_stream_response(_openai_gen(), model, msg_id):
+                yield event
+
+            add_usage(model, prompt_tokens, 0)
+            add_tokens("default", cfg.get("session_id", ""), prompt_tokens)
+
+        return StreamingResponse(
+            _anthropic_stream_wrapper(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            }
+        )
+    else:
+        result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled,
+                         stream=False, is_retry=False, ref_file_ids=[])
+
+        add_usage(model, prompt_tokens, 0)
+        add_tokens("default", cfg.get("session_id", ""), prompt_tokens)
+
+        if isinstance(result, JSONResponse):
+            openai_body_resp = json.loads(result.body)
+        elif isinstance(result, dict):
+            openai_body_resp = result
+        else:
+            raise HTTPException(status_code=500, detail=anthropic_error_response("Internal error"))
+
+        anthropic_resp = anthropic_convert_response(openai_body_resp, model, msg_id)
+        return anthropic_resp
 
 
 @app.post("/v1/responses")

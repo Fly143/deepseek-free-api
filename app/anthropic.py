@@ -126,27 +126,6 @@ def convert_messages(
             else:
                 result.append({"role": "user", "content": combined_text})
 
-        elif role == "tool" and isinstance(content, list):
-            # tool_result 消息 → tool role
-            tool_content = ""
-            tool_call_id = ""
-            for block in content:
-                if block.get("type") == "tool_result":
-                    tool_call_id = block.get("tool_use_id", "")
-                    tc = block.get("content", "")
-                    if isinstance(tc, list):
-                        tool_content = "\n".join(
-                            c.get("text", "") for c in tc if isinstance(c, dict) and c.get("type") == "text"
-                        )
-                    else:
-                        tool_content = str(tc)
-            if tool_content:
-                result.append({
-                    "role": "tool",
-                    "content": tool_content,
-                    "tool_call_id": tool_call_id,
-                })
-
         elif isinstance(content, str):
             # 纯字符串（兼容）
             result.append({"role": role, "content": content})

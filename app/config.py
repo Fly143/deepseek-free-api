@@ -15,7 +15,7 @@ LEGACY_FILE = BASE_DIR / "token.json"
 @dataclass
 class DsAccount:
     """DeepSeek 账号配置"""
-    account_label: str       # "+86 18905836835" 或 "user@example.com"
+    account_label: str       # 手机号 或 "user@example.com"
     login_type: str          # "phone" 或 "email"
     _password: str = ""
     # 手机登录

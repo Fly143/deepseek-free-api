@@ -33,30 +33,68 @@ router = APIRouter()
 
 @router.post("/v1/messages")
 async def anthropic_messages(request: Request):
-    """Anthropic Messages API 兼容端点（no-tools 分支，无工具调用）"""
+    """Anthropic Messages API 兼容端点（no-tools 分支，无工具调用，支持多账号+多模态）"""
     from proxy import (
         CONFIG_FILE, _count_tokens, _convert_messages_for_deepseek,
         get_models, needs_renewal, on_new_session, _vlog,
         add_usage, add_tokens, _do_chat, cffi_requests,
+        config_manager, extract_text_files_from_messages, extract_images_from_messages,
+        upload_file_to_deepseek, fork_file_to_vision, wait_for_file_parsing,
+        get_usage_status,
     )
     body = await request.json()
     model = body.get("model", "deepseek-default")
+
+    # 多账号轮询
+    account = config_manager.get_next_account()
+    if not account:
+        raise HTTPException(status_code=503, detail=_anthropic_error_response("No available account, please visit /admin to add and login"))
 
     openai_body = _anthropic_convert_request(body)
     messages = openai_body.get("messages", [])
     stream = openai_body.get("stream", False)
 
-    cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
     model_info = get_models().get(model, get_models().get("deepseek-default"))
     if not model_info:
         raise HTTPException(status_code=400, detail=_anthropic_error_response(f"Unknown model: {model}"))
     thinking_enabled, search_enabled, _, _ = model_info
 
-    prompt = _convert_messages_for_deepseek(messages)
-    prompt_tokens = _count_tokens(prompt)
+    cfg = {
+        "token": account.token,
+        "session_id": account.session_id,
+        "headers": dict(account.headers),
+        "cookie": account.cookie,
+        "account_label": account.account_label,
+    }
+    account_label = account.account_label
+    ref_file_ids = []
+    import time as _vtime
 
-    # 会话管理
-    if needs_renewal():
+    # 文本文件上传
+    text_files = extract_text_files_from_messages(messages)
+    if text_files:
+        raw_ids = []
+        for tf in text_files:
+            orig_fid = upload_file_to_deepseek(tf["data"], tf["filename"], tf["content_type"], cfg=cfg)
+            if orig_fid:
+                raw_ids.append(orig_fid)
+        if raw_ids:
+            text_ids = wait_for_file_parsing(cfg, raw_ids, timeout=30)
+            ref_file_ids.extend(text_ids)
+
+    # 多模态：提取、上传、fork 图片
+    is_vision = "vision" in model
+    if is_vision:
+        images = extract_images_from_messages(messages)
+        for img in images:
+            orig_fid = upload_file_to_deepseek(img["data"], img["filename"], img["content_type"], cfg=cfg)
+            if orig_fid:
+                forked_fid = fork_file_to_vision(cfg, orig_fid)
+                if forked_fid:
+                    ref_file_ids.append(forked_fid)
+        if ref_file_ids:
+            ref_file_ids = wait_for_file_parsing(cfg, ref_file_ids, timeout=10)
+        # Vision 专用 fresh session，避免 parallel_chat_limit_by_queue
         try:
             token = cfg.get("token", "")
             if token:
@@ -70,8 +108,29 @@ async def anthropic_messages(request: Request):
                     if new_sid:
                         cfg = dict(cfg)
                         cfg["session_id"] = new_sid
-                        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-                        on_new_session("default", new_sid, model)
+        except Exception as e:
+            _vlog(f"vision fresh session failed: {e}")
+
+    prompt = _convert_messages_for_deepseek(messages)
+    prompt_tokens = _count_tokens(prompt)
+
+    # 会话管理：token 超限自动续期
+    if needs_renewal(account_label):
+        try:
+            token = cfg.get("token", "")
+            if token:
+                auth_h = {**cfg.get("headers", {}), "authorization": f"Bearer {token}"}
+                sess_resp = cffi_requests.post(
+                    "https://chat.deepseek.com/api/v0/chat_session/create",
+                    json={}, headers=auth_h, impersonate="chrome120", timeout=15)
+                if sess_resp.status_code == 200:
+                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
+                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                    if new_sid:
+                        cfg = dict(cfg)
+                        cfg["session_id"] = new_sid
+                        config_manager.update_account(account_label, session_id=new_sid)
+                        on_new_session(account_label, new_sid, model)
         except Exception as e:
             _vlog(f"Session renewal failed: {e}")
 
@@ -79,7 +138,7 @@ async def anthropic_messages(request: Request):
 
     if stream:
         result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled,
-                         stream=True, is_retry=False, ref_file_ids=[])
+                         stream=True, is_retry=False, ref_file_ids=ref_file_ids)
 
         async def _wrap():
             orig_iter = result.body_iterator
@@ -92,7 +151,7 @@ async def anthropic_messages(request: Request):
                 yield event
 
             add_usage(model, prompt_tokens, 0)
-            add_tokens("default", cfg.get("session_id", ""), prompt_tokens)
+            add_tokens(account_label, cfg.get("session_id", ""), prompt_tokens)
 
         return StreamingResponse(
             _wrap(),
@@ -104,10 +163,10 @@ async def anthropic_messages(request: Request):
         )
     else:
         result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled,
-                         stream=False, is_retry=False, ref_file_ids=[])
+                         stream=False, is_retry=False, ref_file_ids=ref_file_ids)
 
         add_usage(model, prompt_tokens, 0)
-        add_tokens("default", cfg.get("session_id", ""), prompt_tokens)
+        add_tokens(account_label, cfg.get("session_id", ""), prompt_tokens)
 
         if isinstance(result, JSONResponse):
             openai_body_resp = json.loads(result.body)

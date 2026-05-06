@@ -1580,6 +1580,8 @@ a{color:#7dd3fc}
 .acct-tbl th,.acct-tbl td{padding:8px 10px;text-align:left;border-bottom:1px solid #334155}
 .acct-tbl th{color:#94a3b8;font-weight:500;font-size:11px;white-space:nowrap}
 .acct-tbl td{font-variant-numeric:tabular-nums}
+.acct-tbl td:nth-child(3){max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acct-tbl td:last-child{white-space:nowrap}
 .acct-st{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle}
 .acct-st.ok{background:#22c55e}.acct-st.no{background:#64748b}.acct-st.er{background:#ef4444}
 .acct-btn{padding:4px 10px;border-radius:4px;border:none;cursor:pointer;font-size:12px;font-weight:500}
@@ -1660,12 +1662,7 @@ a{color:#7dd3fc}
 
 <div id="accountsPanel" class="panel">
 <div class="acct-stat" id="acctStat">加载中...</div>
-<div class="acct-add">
-<input type="tel" id="acctPhone" placeholder="手机号" style="flex:2;min-width:120px">
-<input type="text" id="acctCode" value="+86" placeholder="+86" style="width:70px;flex:0">
-<input type="password" id="acctPw" placeholder="密码" style="flex:1">
-<button onclick="addAccount()">添加</button>
-</div>
+
 <div id="acctList"><div class="acct-empty">暂无账号，请先添加</div></div>
 <button class="acct-btn batch" onclick="reloginAll()">全部重新登录</button>
 </div>
@@ -1680,7 +1677,7 @@ Q('phonePanel').className='panel'+(type==='phone'?' active':'');
 Q('emailPanel').className='panel'+(type==='email'?' active':'');
 if(Q('usagePanel'))Q('usagePanel').className='panel'+(type==='usage'?' active':'');
 if(Q('accountsPanel'))Q('accountsPanel').className='panel'+(type==='accounts'?' active':'');
-var as=Q('apiSection');if(as)as.style.display=type==='usage'?'none':'';
+var as=Q('apiSection');if(as)as.style.display=(type==='usage'||type==='accounts')?'none':'';
 if(type==='usage')loadUsage();
 if(type==='accounts')loadAccounts();
 }
@@ -1752,7 +1749,7 @@ var st=a.is_valid?'ok':'no';
 var stT=a.is_valid?'有效':'未登录';
 var l=encodeURIComponent(a.account_label);
 h+='<tr><td>'+a.account_label+'</td><td><span class="acct-st '+st+'"></span>'+stT+'</td><td>'+(a.token_masked||'***')+'</td><td>'+(a.login_time||'-')+'</td>';
-h+=`<td><button class="acct-btn rm" onclick="removeAccount('${l}')">删除</button></td>`;
+h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">重登</button> <button class="acct-btn rm" onclick="removeAccount('${l}')">删除</button></td>`;
 }
 h+='</table>';
 }else{h='<div class="acct-empty">暂无账号，请在上方添加</div>'}

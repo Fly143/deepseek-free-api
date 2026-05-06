@@ -1544,7 +1544,7 @@ input:focus{outline:none;border-color:#3b82f6}
 .pw-row{margin-bottom:14px}
 .pw-row input{width:100%}
 .tab-bar{display:flex;gap:0;margin-bottom:16px;border-radius:8px;overflow:hidden;border:1px solid #334155}
-.tab{flex:1;padding:10px;text-align:center;font-size:13px;cursor:pointer;background:#0f172a;color:#94a3b8;transition:all .2s}
+.tab{flex:1;padding:10px;text-align:center;font-size:13px;cursor:pointer;background:#0f172a;color:#94a3b8;transition:all .2s;white-space:nowrap}
 .tab.active{background:#2563eb;color:#fff}
 .tab:hover:not(.active){background:#1e293b}
 .panel{display:none}.panel.active{display:block}
@@ -1581,6 +1581,7 @@ a{color:#7dd3fc}
 .acct-tbl th{color:#94a3b8;font-weight:500;font-size:11px;white-space:nowrap}
 .acct-tbl td{font-variant-numeric:tabular-nums}
 .acct-tbl td:nth-child(3){max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:640px){.acct-tbl td:nth-child(3){max-width:80px}.acct-tbl td:first-child{white-space:nowrap;max-width:100px;overflow:hidden;text-overflow:ellipsis}.acct-tbl td:nth-child(2){white-space:nowrap}.acct-tbl td{padding:10px 6px}.acct-btn{margin:3px 0}}
 .acct-tbl td:last-child{white-space:nowrap}
 .acct-st{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle}
 .acct-st.ok{background:#22c55e}.acct-st.no{background:#64748b}.acct-st.er{background:#ef4444}
@@ -1742,14 +1743,14 @@ try{
 const r=await fetch('/api/accounts');const d=await r.json();
 var h='';
 if(d.accounts&&d.accounts.length>0){
-h+='<div class="acct-stat">共 '+d.total+' 个账号，'+d.valid+' 个有效</div>';
+Q('acctStat').innerHTML='共 '+d.total+' 个账号，'+d.valid+' 个有效';
 h+='<table class="acct-tbl"><tr><th>账号</th><th>状态</th><th>Token</th><th>登录时间</th><th>操作</th></tr>';
 for(var a of d.accounts){
 var st=a.is_valid?'ok':'no';
 var stT=a.is_valid?'有效':'未登录';
 var l=encodeURIComponent(a.account_label);
 h+='<tr><td>'+a.account_label+'</td><td><span class="acct-st '+st+'"></span>'+stT+'</td><td>'+(a.token_masked||'***')+'</td><td>'+(a.login_time||'-')+'</td>';
-h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">重登</button> <button class="acct-btn rm" onclick="removeAccount('${l}')">删除</button></td>`;
+h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">重登</button><br><button class="acct-btn rm" onclick="removeAccount('${l}')">删除</button></td>`;
 }
 h+='</table>';
 }else{h='<div class="acct-empty">暂无账号，请在上方添加</div>'}

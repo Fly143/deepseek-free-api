@@ -1752,8 +1752,7 @@ var st=a.is_valid?'ok':'no';
 var stT=a.is_valid?'有效':'未登录';
 var l=encodeURIComponent(a.account_label);
 h+='<tr><td>'+a.account_label+'</td><td><span class="acct-st '+st+'"></span>'+stT+'</td><td>'+(a.token_masked||'***')+'</td><td>'+(a.login_time||'-')+'</td>';
-h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">重登</td>`;
-h+=`<td><button class="acct-btn rm" onclick="removeAccount('${l}')">删除</td>`;
+h+=`<td><button class="acct-btn rm" onclick="removeAccount('${l}')">删除</button></td>`;
 }
 h+='</table>';
 }else{h='<div class="acct-empty">暂无账号，请在上方添加</div>'}

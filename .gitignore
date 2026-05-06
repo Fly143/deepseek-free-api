@@ -7,3 +7,5 @@ vision.log
 __pycache__/
 *.pyc
 config.json
+*.bak
+*.bak

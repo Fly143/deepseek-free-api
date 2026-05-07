@@ -398,17 +398,19 @@ curl http://localhost:8000/v1/messages \
 
 Claude Code CLI 等工具期望 Anthropic 风格的模型名（如 `claude-sonnet-4-6`），无法直接使用 `deepseek-*` 原生名。本代理在 Anthropic 端点内部自动映射：
 
-| Claude 模型名 | → DeepSeek 内部模型 |
-|---|---|
-| `claude-opus-4-6` | `deepseek-expert-reasoner` |
-| `claude-sonnet-4-6` | `deepseek-reasoner` |
-| `claude-haiku-4-5` | `deepseek-default` |
-| `claude-sonnet-4-5` | `deepseek-reasoner` |
-| `claude-3-7-sonnet` | `deepseek-reasoner` |
-| `claude-3-5-sonnet` | `deepseek-default` |
-| `claude-3-opus` | `deepseek-expert-reasoner` |
+| Claude 模型名 | → DeepSeek 内部 | 思考 | 联网 |
+|---|---|---|---|
+| `claude-opus-4-6` | `deepseek-expert-reasoner` | ✓ | ✗ |
+| `claude-opus-4-6-search` | `deepseek-expert-reasoner-search` | ✓ | ✓ |
+| `claude-sonnet-4-6` | `deepseek-reasoner` | ✓ | ✗ |
+| `claude-sonnet-4-6-search` | `deepseek-reasoner-search` | ✓ | ✓ |
+| `claude-haiku-4-5` | `deepseek-default` | ✗ | ✗ |
+| `claude-sonnet-4-6-nothinking` | `deepseek-default` | ✗ | ✗ |
+| `claude-3-7-sonnet` | `deepseek-reasoner` | ✓ | ✗ |
+| `claude-3-5-sonnet` | `deepseek-default` | ✗ | ✗ |
+| `claude-3-opus` | `deepseek-expert-reasoner` | ✓ | ✗ |
 
-也支持 Search 变体（`claude-sonnet-4-6-search` → `deepseek-reasoner-search`）和 `-nothinking` 变体。DeepSeek 原生名（`deepseek-*`）继续直接使用，`/v1/models` 返回的仍是原生名，不影响其他软件。
+也支持 Claude 4.x 历史名（`claude-sonnet-4-5`、`claude-opus-4-1` 等）和 `-nothinking` 变体。DeepSeek 原生名（`deepseek-*`）继续直接使用，`/v1/models` 返回的仍是原生名，不影响其他软件。
 
 ```bash
 # 用 Claude 模型名同样可用

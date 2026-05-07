@@ -205,6 +205,14 @@ class ConfigManager:
         with self.lock:
             return [acc.to_dict() for acc in self.accounts]
 
+    def get_token(self, label: str) -> str:
+        """获取指定账号的 token。"""
+        with self.lock:
+            for acc in self.accounts:
+                if acc.account_label == label:
+                    return acc.token
+            return ""
+
     def count(self) -> int:
         with self.lock:
             return len(self.accounts)

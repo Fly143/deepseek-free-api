@@ -72,7 +72,7 @@ def _convert_messages_for_deepseek(messages):
 
 # ── 用量统计 ───────────────────────────────────
 from usage_store import add_usage, get_usage, clear_usage
-from session_store import needs_renewal, on_new_session, add_tokens, get_usage_status
+from session_store import needs_renewal, on_new_session, add_tokens, get_usage_status, get_expired_sessions, remove_old_session
 from response_store import save_response_record, get_response_record, delete_response_record, update_response_record
 
 # ── PoW (Proof of Work) Solver — 纯 Python 实现（无 WASM 依赖）────────
@@ -88,6 +88,16 @@ CONFIG_FILE = BASE_DIR / "config.json"
 from app.config import config_manager, DsAccount
 VISION_LOG = BASE_DIR / "vision.log"
 _DEBUG = os.getenv("DS_DEBUG", "").lower() in ("1", "true", "yes")
+
+# ── DeepSeek API 通用 Headers ─────────────────────
+DS_HEADERS = {
+    "content-type": "application/json",
+    "origin": "https://chat.deepseek.com",
+    "referer": "https://chat.deepseek.com/",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
+    "x-client-version": "2.0.2",
+    "x-client-platform": "web",
+}
 
 def _vlog(msg: str):
     """Log vision-related messages. File logging only when DS_DEBUG=1."""
@@ -1516,9 +1526,14 @@ app.include_router(anthropic_routes.router)
 
 @app.on_event("startup")
 async def startup_discover():
-    """启动时自动刷新模型列表。"""
+    """启动时自动刷新模型列表，清理过期会话。"""
     print("[启动] 探测模型列表...")
     _discover_models()
+    print("[启动] 检查过期会话...")
+    try:
+        cleanup_old_sessions()
+    except Exception as e:
+        print(f"[启动] 会话清理失败: {e}")
 
 # ── 管理页面 ─────────────────────────────────────────────
 ADMIN = """<!DOCTYPE html>
@@ -1669,6 +1684,7 @@ a{color:#7dd3fc}
 
 <div id="acctList"><div class="acct-empty">暂无账号，请先添加</div></div>
 <button class="acct-btn batch" onclick="reloginAll()">全部重新登录</button>
+<button class="acct-btn batch" onclick="cleanupSessions()" style="background:#7c3aed;color:#fff">清理过期会话</button>
 </div>
 </div>
 <div id="toast" class="toast"></div>
@@ -1803,6 +1819,15 @@ loadAccounts();
 }else{t('失败: '+(d.error||'未知'),1)}
 }catch(e){t('重登失败: '+e.message,1)}
 if(btn){btn.disabled=false;btn.textContent='全部重新登录'}
+}
+async function cleanupSessions(){
+var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='清理中...'}
+try{
+var r=await fetch('/api/cleanup',{method:'POST'});
+var d=await r.json();
+t(d.ok?d.msg:'清理失败: '+(d.msg||'未知'),d.ok?0:1)
+}catch(e){t('清理失败: '+e.message,1)}
+if(btn){btn.disabled=false;btn.textContent='清理过期会话'}
 }
 // === 用量统计 ===
 var _up='total';
@@ -2169,6 +2194,16 @@ async def usage_stats():
 async def clear_usage_stats():
     clear_usage()
     return {"ok": True}
+
+
+@app.post("/api/cleanup")
+async def manual_cleanup():
+    """手动触发会话清理。"""
+    try:
+        cleanup_old_sessions()
+        return {"ok": True, "msg": "清理完成"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
 
 
 # ─── 模型列表（免鉴权，供管理页面使用） ───────────────────────
@@ -2572,6 +2607,48 @@ def upload_file_to_deepseek(file_data: bytes, filename: str, content_type: str =
     return None
 
 
+# ── 会话清理 ──────────────────────────────────────────
+
+def _delete_deepseek_session(token: str, session_id: str) -> bool:
+    """调用 DeepSeek API 删除指定会话。"""
+    try:
+        headers = {**DS_HEADERS, "authorization": f"Bearer {token}"}
+        resp = cffi_requests.post(
+            "https://chat.deepseek.com/api/v0/chat_session/delete",
+            json={"chat_session_id": session_id},
+            headers=headers,
+            impersonate="chrome120",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("data", {}).get("biz_code") == 0
+        return False
+    except Exception as e:
+        print(f"[Cleanup] Delete session {session_id} failed: {e}")
+        return False
+
+
+def cleanup_old_sessions():
+    """清理所有账号中过期的旧会话。"""
+    expired = get_expired_sessions()
+    if not expired:
+        return
+
+    print(f"[Cleanup] Found {len(expired)} expired sessions, deleting...")
+    deleted = 0
+    for account_label, session_id, model, days_ago in expired:
+        token = config_manager.get_token(account_label)
+        if not token:
+            continue
+        if _delete_deepseek_session(token, session_id):
+            remove_old_session(account_label, session_id)
+            deleted += 1
+            print(f"[Cleanup] Deleted: {session_id[:12]}... ({days_ago}d old)")
+    if deleted:
+        print(f"[Cleanup] Done: {deleted}/{len(expired)} deleted")
+
+
 def fork_file_to_vision(cfg: dict, file_id: str) -> str | None:
     """Fork an uploaded file to the vision model type.
 
@@ -2881,8 +2958,11 @@ async def chat(request: Request):
                     biz = sess_resp.json().get("data", {}).get("biz_data", {})
                     new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
                     if new_sid:
+                        old_sid = cfg.get("session_id", "")
                         cfg = dict(cfg)
                         cfg["session_id"] = new_sid
+                        if old_sid and old_sid != new_sid:
+                            on_new_session(account_label, new_sid, model)
                         _vlog(f"vision fresh session: {new_sid}")
         except Exception as e:
             _vlog(f"fresh session failed: {e}")

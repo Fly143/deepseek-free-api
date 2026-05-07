@@ -95,7 +95,7 @@ DS_HEADERS = {
     "origin": "https://chat.deepseek.com",
     "referer": "https://chat.deepseek.com/",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
-    "x-client-version": "2.0.2",
+    "x-client-version": "2.3.0",
     "x-client-platform": "web",
 }
 
@@ -1969,7 +1969,7 @@ async def deepseek_login(data: dict):
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
-        "x-client-version": "2.0.2",
+        "x-client-version": "2.3.0",
         "x-client-platform": "web",
     }
 
@@ -2355,7 +2355,7 @@ def relogin(cfg: dict) -> dict | None:
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
-        "x-client-version": "2.0.2",
+        "x-client-version": "2.3.0",
         "x-client-platform": "web",
     }
 

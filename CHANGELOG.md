@@ -4,6 +4,35 @@
 
 ---
 
+## [v2.1.0] — 2026-05-07
+
+### Added
+- **Anthropic 模型名映射** — Claude Code CLI 等工具可使用 Anthropic 风格模型名（如 `claude-sonnet-4-6`），内部自动映射为对应 DeepSeek 模型
+  - `claude-opus-4-6` → `deepseek-expert-reasoner`（最强）
+  - `claude-sonnet-4-6` → `deepseek-reasoner`（均衡）
+  - `claude-haiku-4-5` → `deepseek-default`（快速）
+  - 支持 search / nothinking 变体及 Claude 3.x 历史模型名
+- DeepSeek 原生名（`deepseek-*`）继续直接可用，`/v1/models` 返回不变，不影响其他 OpenAI 兼容客户端
+
+## [v2.0.0] — 2026-05-06
+
+### Added
+- **Anthropic Messages API 全兼容** — 新增 9 个 Anthropic 端点：`/v1/messages`（流式/非流式）、count_tokens、message CRUD、batch 全流程
+- **多账号管理** — Web 面板增删账号、轮询负载均衡、401 自动重登
+- **用量统计** — tiktoken 精确计数 + Web UI（表格/时间筛选）
+- **会话管理** — 900K token 阈值自动续期，多账号独立追踪
+
+### Changed
+- 路由从 `proxy.py` 拆分为 `app/anthropic_routes.py`（APIRouter 模式）
+- `app/anthropic.py` + `app/batch.py` 模块化，两分支共用 batch、分支差异在 anthropic.py
+
+### Fixed
+- 401 重登失败后账号未标记无效（死循环 bug）
+- `relogin()` key 名不一致导致 token 写不回账号池
+- Anthropic 路由：多账号未接入、ref_file_ids 硬编码为空
+- Anthropic 路由：`tool_result` block 遗漏 + 工具定义未注入 prompt
+- 路由顺序：`{message_id}` 在 batch 路由后，避免参数化匹配冲突
+
 ## [v1.1.0] — 2026-05-04
 
 ### Added
@@ -30,10 +59,13 @@
 ## [v1.0.0] — 2026-05-04
 
 ### Added
+- **工具调用（main 分支）** — DSML 格式 XML 工具提取 + 流式筛分（参考 ds2api 架构重构）
+- **流式筛分** — 实时分离响应中的正文与工具调用内容
 - **会话管理** — Token 阈值（90 万字符）自动检测并续接会话，超限自动新建
 - **按模型上下文大小** — 从 DeepSeek API 的 `input_character_limit` 字段动态推算（大部分模型映射为 1M）
 - **文本文件上传** — 使用 `ref_file_ids` 方式，与网页端行为一致（上传 → `wait_for_file_parsing` → 引用原始 file_id）
 - **TikToken 用量统计** — Token 计数 + Web 面板可视化，固定表头/合计行的 440px 滚动表格
+- **Expert 模型路由** — 通过 SSE ready 事件的 `model_type` 字段判断；路由失效时自动降级到 default，并提供诊断方案
 - **Web 管理面板** — 用量统计 Tab，支持今日/本周/全部时间筛选和清空
 
 ### Changed
@@ -54,6 +86,7 @@
 - Token 过期后静默降级（不返回错误，expert→default 退化）
 - SSE ready 事件 `model_type` 字段不可靠，不能作为路由验证依据
 - 不支持 Embeddings 端点
+- 非原生 function calling（通过文本提示模拟）
 
 ---
 
@@ -72,7 +105,7 @@
 
 | 分支 | 功能 |
 |------|------|
-| `main` | DSML 工具调用、流式筛分、会话管理、文件上传、用量统计、Expert 路由 |
-| `no-tools` | 纯对话代理 — 无 prompt 注入，输出更干净、会话管理、Expert 路由 |
+| `main` | DSML 工具调用、流式筛分、会话管理、文件上传、用量统计 |
+| `no-tools` | 纯对话代理 — 无 prompt 注入，输出更干净 |
 
 纯对话、写作、翻译、代码生成等场景推荐使用 no-tools 分支。

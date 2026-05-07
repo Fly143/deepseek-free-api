@@ -1494,7 +1494,7 @@ async def startup_discover():
 
 # ── 管理页面 ─────────────────────────────────────────────
 ADMIN = """<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>DeepSeek Proxy</title>
@@ -1577,50 +1577,50 @@ a{color:#7dd3fc}
 <body>
 <div class="c">
 <h1>DeepSeek Proxy</h1>
-<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st">等待配置</span></div>
+<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st">Not configured</span></div>
 
 <div class="tab-bar">
-<div class="tab active" onclick="switchTab('phone')">手机号登录</div>
-<div class="tab" onclick="switchTab('email')">邮箱登录</div>
-<div class="tab" onclick="switchTab('usage')">用量统计</div>
-<div class="tab" onclick="switchTab('accounts')">账号管理</div>
+<div class="tab active" onclick="switchTab('phone')">Phone Login</div>
+<div class="tab" onclick="switchTab('email')">Email Login</div>
+<div class="tab" onclick="switchTab('usage')">Usage</div>
+<div class="tab" onclick="switchTab('accounts')">Accounts</div>
 </div>
 
 <div id="phonePanel" class="panel active">
 <div class="row">
 <input class="ac" type="tel" id="area_code" value="+86" placeholder="+86">
-<input class="ph" type="tel" id="mobile" placeholder="手机号" autocomplete="tel">
+<input class="ph" type="tel" id="mobile" placeholder="Phone number" autocomplete="tel">
 </div>
-<div class="pw-row"><input type="password" id="pw1" placeholder="密码" autocomplete="current-password"></div>
-<button class="btn bp" id="btn1" onclick="doLogin('phone')">登录</button>
+<div class="pw-row"><input type="password" id="pw1" placeholder="Password" autocomplete="current-password"></div>
+<button class="btn bp" id="btn1" onclick="doLogin('phone')">Login</button>
 </div>
 
 <div id="emailPanel" class="panel">
-<div class="pw-row"><input type="email" id="email" placeholder="邮箱地址" autocomplete="email"></div>
-<div class="pw-row"><input type="password" id="pw2" placeholder="密码" autocomplete="current-password"></div>
-<button class="btn bp" id="btn2" onclick="doLogin('email')">登录</button>
+<div class="pw-row"><input type="email" id="email" placeholder="Email address" autocomplete="email"></div>
+<div class="pw-row"><input type="password" id="pw2" placeholder="Password" autocomplete="current-password"></div>
+<button class="btn bp" id="btn2" onclick="doLogin('email')">Login</button>
 </div>
 
 <div class="info" id="info"></div>
 
 <div id="apiSection">
-<div class="collapse" onclick="toggleCurl()">高级: 手动粘贴 cURL ▾</div>
+<div class="collapse" onclick="toggleCurl()">Advanced: Paste cURL ▾</div>
 <div class="curl-box" id="curlBox">
-<textarea id="curl" placeholder="粘贴 cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px"></textarea>
-<button class="btn bp" id="btn3" onclick="saveCurl()" style="margin-top:8px">保存 cURL</button>
+<textarea id="curl" placeholder="Paste cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px"></textarea>
+<button class="btn bp" id="btn3" onclick="saveCurl()" style="margin-top:8px">Save cURL</button>
 </div>
 
 <hr>
 <div class="step">
-<div class="sl" style="font-weight:600;color:#e2e8f0;">API 配置</div>
+<div class="sl" style="font-weight:600;color:#e2e8f0;">API Configuration</div>
 <div class="cfg">
-<div class="cr"><span>API 地址</span><code onclick="cp(this)">http://localhost:""" + str(PROXY_PORT) + """/v1</code></div>
-<div class="cr"><span>API Key</span><code onclick="cp(this)">任意填写</code></div>
+<div class="cr"><span>API URL</span><code onclick="cp(this)">http://localhost:""" + str(PROXY_PORT) + """/v1</code></div>
+<div class="cr"><span>API Key</span><code onclick="cp(this)">Any value</code></div>
 
 </div>
 </div>
 <div class="step" style="margin-top:16px">
-<button class="btn" style="background:#334155;color:#e2e8f0;width:100%;font-size:13px" onclick="refreshModels()" id="refreshBtn">🔄 刷新模型列表</button>
+<button class="btn" style="background:#334155;color:#e2e8f0;width:100%;font-size:13px" onclick="refreshModels()" id="refreshBtn">🔄 Refresh Models</button>
 <div id="modelsInfo" style="margin-top:8px;font-size:12px;color:#64748b;display:none"></div>
 </div>
 </div>
@@ -1628,20 +1628,20 @@ a{color:#7dd3fc}
 <div id="usagePanel" class="panel">
 <div id="usageContent"></div>
 <div style="margin-top:14px">
-<button class="pb ac" onclick="switchPeriod('total')" id="pbTotal">全部</button>
-<button class="pb" onclick="switchPeriod('week')" id="pbWeek">本周</button>
-<button class="pb" onclick="switchPeriod('today')" id="pbToday">今日</button>
-<button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:6px 12px;margin-left:8px" onclick="loadUsage()">刷新</button>
-<button class="btn" style="background:#7f1d1d;color:#fca5a5;font-size:12px;padding:6px 12px;margin-left:4px" onclick="clearUsage()">清空</button>
+<button class="pb ac" onclick="switchPeriod('total')" id="pbTotal">All</button>
+<button class="pb" onclick="switchPeriod('week')" id="pbWeek">This Week</button>
+<button class="pb" onclick="switchPeriod('today')" id="pbToday">Today</button>
+<button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:6px 12px;margin-left:8px" onclick="loadUsage()">Refresh</button>
+<button class="btn" style="background:#7f1d1d;color:#fca5a5;font-size:12px;padding:6px 12px;margin-left:4px" onclick="clearUsage()">Clear</button>
 </div>
 </div>
 
 <div id="accountsPanel" class="panel">
-<div class="acct-stat" id="acctStat">加载中...</div>
+<div class="acct-stat" id="acctStat">Loading...</div>
 
-<div id="acctList"><div class="acct-empty">暂无账号，请先添加</div></div>
-<button class="acct-btn batch" onclick="reloginAll()">全部重新登录</button>
-<button class="acct-btn batch" onclick="cleanupSessions()" style="background:#7c3aed;color:#fff">清理过期会话</button>
+<div id="acctList"><div class="acct-empty">No accounts yet. Add one above.</div></div>
+<button class="acct-btn batch" onclick="reloginAll()">Re-login All</button>
+<button class="acct-btn batch" onclick="cleanupSessions()" style="background:#7c3aed;color:#fff">Clean Expired Sessions</button>
 </div>
 </div>
 <div id="toast" class="toast"></div>
@@ -1660,58 +1660,58 @@ if(type==='accounts')loadAccounts();
 }
 async function cs(){
 try{const r=await fetch('/api/config');const d=await r.json()
-if(d.configured){Q('s').className='s ok';Q('sd').className='d dg';Q('st').textContent='已配置 | '+d.masked}
-else{Q('s').className='s no';Q('sd').className='d dy';Q('st').textContent=d.error||'等待配置'}
-}catch(e){Q('s').className='s err';Q('st').textContent='连接失败'}
+if(d.configured){Q('s').className='s ok';Q('sd').className='d dg';Q('st').textContent='Configured | '+d.masked}
+else{Q('s').className='s no';Q('sd').className='d dy';Q('st').textContent=d.error||'Waiting for config'}
+}catch(e){Q('s').className='s err';Q('st').textContent='Connection failed'}
 }
 async function doLogin(type){
 let body={}
 if(type==='phone'){
 const m=Q('mobile').value.trim();const p=Q('pw1').value;const a=Q('area_code').value.trim()
-if(!m||!p){t('请输入手机号和密码',1);return}
+if(!m||!p){t('Please enter phone number and password',1);return}
 body={mobile:m,password:p,area_code:a,login_type:'phone'}
 var btn=Q('btn1')
 }else{
 const e=Q('email').value.trim();const p=Q('pw2').value
-if(!e||!p){t('请输入邮箱和密码',1);return}
+if(!e||!p){t('Please enter email and password',1);return}
 body={email:e,password:p,login_type:'email'}
 var btn=Q('btn2')
 }
-btn.disabled=true;btn.textContent='登录中...'
-Q('info').style.display='block';Q('info').innerHTML='正在登录 DeepSeek...'
+btn.disabled=true;btn.textContent='Logging in...'
+Q('info').style.display='block';Q('info').innerHTML='Logging into DeepSeek...'
 try{
 const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
 const d=await r.json()
-if(d.ok){Q('info').innerHTML='登录成功 | Token: '+d.masked+' | Session: '+d.session_id;t('登录成功');cs()}
-else{Q('info').innerHTML='失败: '+d.error;t(d.error,1)}
-}catch(e){Q('info').innerHTML='错误: '+e.message;t(e.message,1)}
-btn.disabled=false;btn.textContent='登录'
+if(d.ok){Q('info').innerHTML='Login successful | Token: '+d.masked+' | Session: '+d.session_id;t('Login successful');cs()}
+else{Q('info').innerHTML='Failed: '+d.error;t(d.error,1)}
+}catch(e){Q('info').innerHTML='Error: '+e.message;t(e.message,1)}
+btn.disabled=false;btn.textContent='Login'
 }
 function toggleCurl(){const b=Q('curlBox');b.style.display=b.style.display==='block'?'none':'block'}
 async function saveCurl(){
-const c=Q('curl').value.trim();if(!c){t('请先粘贴 cURL',1);return}
-const b=Q('btn3');b.disabled=true;b.textContent='保存中...'
-Q('info').style.display='block';Q('info').innerHTML='解析中...'
+const c=Q('curl').value.trim();if(!c){t('Please paste cURL first',1);return}
+const b=Q('btn3');b.disabled=true;b.textContent='Saving...'
+Q('info').style.display='block';Q('info').innerHTML='Parsing...'
 try{
 const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({curl:c})})
 const d=await r.json()
-if(d.ok){Q('info').innerHTML='OK | '+d.masked+' | Session '+d.session_id;t('已保存');cs()}
-else{Q('info').innerHTML='失败: '+d.error;t(d.error,1)}
-}catch(e){Q('info').innerHTML='错误: '+e.message;t(e.message,1)}
-b.disabled=false;b.textContent='保存 cURL'
+if(d.ok){Q('info').innerHTML='OK | '+d.masked+' | Session '+d.session_id;t('Saved');cs()}
+else{Q('info').innerHTML='Failed: '+d.error;t(d.error,1)}
+}catch(e){Q('info').innerHTML='Error: '+e.message;t(e.message,1)}
+b.disabled=false;b.textContent='Save cURL'
 }
-function cp(el){navigator.clipboard.writeText(el.textContent);t('已复制')}
+function cp(el){navigator.clipboard.writeText(el.textContent);t('Copied!')}
 function t(m,e){const x=Q('toast');x.textContent=m;x.className='toast t'+(e?'e':'s');setTimeout(()=>x.className='toast',2500)}
 async function refreshModels(){
 const btn=Q('refreshBtn');const info=Q('modelsInfo')
-btn.disabled=true;btn.textContent='刷新中...';info.style.display='none'
+btn.disabled=true;btn.textContent='Refreshing...';info.style.display='none'
 try{
 const r=await fetch('/v1/models/refresh',{method:'POST'})
 const d=await r.json()
 const names=d.data.map(m=>m.id).join(', ')
-info.style.display='block';info.innerHTML='✅ 发现 '+d.data.length+' 个模型: '+names;t('刷新成功')
-}catch(e){info.style.display='block';info.innerHTML='❌ 失败: '+e.message;t('刷新失败',1)}
-btn.disabled=false;btn.textContent='🔄 刷新模型列表'
+info.style.display='block';info.innerHTML='✅ Found '+d.data.length+' models: '+names;t('Refresh successful')
+}catch(e){info.style.display='block';info.innerHTML='❌ Failed: '+e.message;t('Refresh failed',1)}
+btn.disabled=false;btn.textContent='🔄 Refresh Models'
 }
 // === 账号管理 ===
 async function loadAccounts(){
@@ -1719,72 +1719,72 @@ try{
 const r=await fetch('/api/accounts');const d=await r.json();
 var h='';
 if(d.accounts&&d.accounts.length>0){
-Q('acctStat').innerHTML='共 '+d.total+' 个账号，'+d.valid+' 个有效';
-h+='<table class="acct-tbl"><tr><th>账号</th><th>状态</th><th>Token</th><th>登录时间</th><th>操作</th></tr>';
+Q('acctStat').innerHTML='Total: '+d.total+' accounts, '+d.valid+' valid';
+h+='<table class="acct-tbl"><tr><th>Account</th><th>Status</th><th>Token</th><th>Login Time</th><th>Action</th></tr>';
 for(var a of d.accounts){
 var st=a.is_valid?'ok':'no';
-var stT=a.is_valid?'有效':'未登录';
+var stT=a.is_valid?'Valid':'Inactive';
 var l=encodeURIComponent(a.account_label);
 h+='<tr><td>'+a.account_label+'</td><td><span class="acct-st '+st+'"></span>'+stT+'</td><td>'+(a.token_masked||'***')+'</td><td>'+(a.login_time||'-')+'</td>';
-h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">重登</button><br><button class="acct-btn rm" onclick="removeAccount('${l}')">删除</button></td>`;
+h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">Re-login</button><br><button class="acct-btn rm" onclick="removeAccount('${l}')">Remove</button></td>`;
 }
 h+='</table>';
-}else{h='<div class="acct-empty">暂无账号，请在上方添加</div>'}
+}else{h='<div class="acct-empty">No accounts yet. Add one above.</div>'}
 Q('acctList').innerHTML=h;
-}catch(e){Q('acctList').innerHTML='<div class="acct-empty">加载失败: '+e.message+'</div>'}
+}catch(e){Q('acctList').innerHTML='<div class="acct-empty">Failed to load: '+e.message+'</div>'}
 }
 async function addAccount(){
 var phone=Q('acctPhone').value.trim();
 var code=Q('acctCode').value.trim()||'+86';
 var pw=Q('acctPw').value;
-if(!phone||!pw){t('请输入手机号和密码',1);return}
+if(!phone||!pw){t('Please enter phone number and password',1);return}
 try{
 var r=await fetch('/api/accounts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mobile:phone,area_code:code,password:pw,login_type:'phone'})});
 var d=await r.json();
-if(d.ok){t('已添加，需登录获取token');Q('acctPhone').value='';Q('acctPw').value='';loadAccounts()}
-else{t('失败: '+(d.error||'未知错误'),1)}
-}catch(e){t('添加失败: '+e.message,1)}
+if(d.ok){t('Added. Login required to get token.');Q('acctPhone').value='';Q('acctPw').value='';loadAccounts()}
+else{t('Failed: '+(d.error||'Unknown error'),1)}
+}catch(e){t('Add failed: '+e.message,1)}
 }
 async function removeAccount(label){
-if(!confirm('确定删除账号 '+decodeURIComponent(label)+'？'))return;
+if(!confirm('Delete account '+decodeURIComponent(label)+'?'))return;
 try{
 var r=await fetch('/api/accounts/'+label,{method:'DELETE'});
 var d=await r.json();
-if(d.ok){t('已删除');loadAccounts()}
-else{t('删除失败: '+(d.error||'未知错误'),1)}
-}catch(e){t('删除失败: '+e.message,1)}
+if(d.ok){t('Deleted');loadAccounts()}
+else{t('Remove failed: '+(d.error||'Unknown error'),1)}
+}catch(e){t('Remove failed: '+e.message,1)}
 }
 async function reloginAccount(label){
 var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='...'}
 try{
 var r=await fetch('/api/accounts/'+label+'/relogin',{method:'POST'});
 var d=await r.json();
-if(d.ok){t('重新登录成功');loadAccounts()}
-else{t('重登失败: '+(d.error||'未知错误'),1)}
-}catch(e){t('重登失败: '+e.message,1)}
-if(btn){btn.disabled=false;btn.textContent='重登'}
+if(d.ok){t('Re-login successful');loadAccounts()}
+else{t('Re-login failed: '+(d.error||'Unknown error'),1)}
+}catch(e){t('Re-login failed: '+e.message,1)}
+if(btn){btn.disabled=false;btn.textContent='Re-login'}
 }
 async function reloginAll(){
-var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='登录中...'}
+var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='Logging in...'}
 try{
 var r=await fetch('/api/accounts/relogin-all',{method:'POST'});
 var d=await r.json();
 if(d.results){
 var ok=d.results.filter(x=>x.ok).length;
-t('重登完成: '+ok+'/'+d.total+' 成功');
+t('Re-login: '+ok+'/'+d.total+' successful');
 loadAccounts();
-}else{t('失败: '+(d.error||'未知'),1)}
-}catch(e){t('重登失败: '+e.message,1)}
-if(btn){btn.disabled=false;btn.textContent='全部重新登录'}
+}else{t('Failed: '+(d.error||'Unknown'),1)}
+}catch(e){t('Re-login failed: '+e.message,1)}
+if(btn){btn.disabled=false;btn.textContent='Re-login All'}
 }
 async function cleanupSessions(){
-var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='清理中...'}
+var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='Cleaning...'}
 try{
 var r=await fetch('/api/cleanup',{method:'POST'});
 var d=await r.json();
-t(d.ok?d.msg:'清理失败: '+(d.msg||'未知'),d.ok?0:1)
-}catch(e){t('清理失败: '+e.message,1)}
-if(btn){btn.disabled=false;btn.textContent='清理过期会话'}
+t(d.ok?d.msg:'Cleanup failed: '+(d.msg||'Unknown'),d.ok?0:1)
+}catch(e){t('Cleanup failed: '+e.message,1)}
+if(btn){btn.disabled=false;btn.textContent='Clean Expired Sessions'}
 }
 // === 用量统计 ===
 var _up='total';
@@ -1794,12 +1794,12 @@ try{
 const r=await fetch('/api/usage');const d=await r.json();
 const p=d[_up]||d.total||{};const m=p.models||{};const t=p.total||{};
 const e=Object.entries(m).sort((a,b)=>b[1].total_tokens-a[1].total_tokens);
-if(!e.length&&!t.requests){Q('usageContent').innerHTML='<div class=ue>📊 暂无用量数据</div>';return}
-let h='<div class=us><table class=ut><thead><tr><th class=ml>模型</th><th>请求</th><th>输入</th><th>输出</th><th>总计</th></tr></thead><tbody>';
+if(!e.length&&!t.requests){Q('usageContent').innerHTML='<div class=ue>📊 No usage data yet</div>';return}
+let h='<div class=us><table class=ut><thead><tr><th class=ml>Model</th><th>Requests</th><th>Input</th><th>Output</th><th>Total</th></tr></thead><tbody>';
 for(const[k,v]of e){h+=`<tr><td class=ml>${k}</td><td>${f(v.requests)}</td><td>${f(v.prompt_tokens)}</td><td>${f(v.completion_tokens)}</td><td>${f(v.total_tokens)}</td></tr>`}
-h+=`<tr class=tr><td class=ml>📋 合计</td><td>${f(t.requests)}</td><td>${f(t.prompt_tokens)}</td><td>${f(t.completion_tokens)}</td><td>${f(t.total_tokens)}</td></tr></tbody></table></div>`;
+h+=`<tr class=tr><td class=ml>📋 Total</td><td>${f(t.requests)}</td><td>${f(t.prompt_tokens)}</td><td>${f(t.completion_tokens)}</td><td>${f(t.total_tokens)}</td></tr></tbody></table></div>`;
 Q('usageContent').innerHTML=h
-}catch(e){Q('usageContent').innerHTML='<div class=ue>加载失败: '+e.message+'</div>'}
+}catch(e){Q('usageContent').innerHTML='<div class=ue>Failed to load: '+e.message+'</div>'}
 }
 function switchPeriod(p){
 _up=p;
@@ -1807,8 +1807,8 @@ _up=p;
 loadUsage()
 }
 async function clearUsage(){
-if(!confirm('确定清空全部用量数据？'))return;
-try{await fetch('/api/usage',{method:'DELETE'});t('已清空');loadUsage()}catch(e){t('清空失败',1)}
+if(!confirm('Clear all usage data?'))return;
+try{await fetch('/api/usage',{method:'DELETE'});t('Cleared');loadUsage()}catch(e){t('Clear failed',1)}
 }
 cs()
 </script>

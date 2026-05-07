@@ -15,6 +15,9 @@ from app.batch import init_batch_storage as anthropic_init_batch_storage
 # ── Tokenizer ───────────────────────────────────
 _enc = tiktoken.get_encoding("cl100k_base")
 
+# ── 联网搜索引用标记 ───────────────────────────
+_CITATION_RE = re.compile(r"\[citation:\d+\]")
+
 def _count_tokens(text: str) -> int:
     return len(_enc.encode(text or ""))
 
@@ -3950,7 +3953,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 if etype == "content":
                     _stream_content_count += 1
                     r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                         "choices": [{"index": 0, "delta": {"content": val}, "finish_reason": None}]}
+                         "choices": [{"index": 0, "delta": {"content": _CITATION_RE.sub("", val)}, "finish_reason": None}]}
                     yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                 elif etype == "thinking":
                     _stream_think_count += 1
@@ -4042,6 +4045,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             _vlog(f"NONSTREAM_RESULT: thinking={len(full_thinking)} chars, content={len(full_content)} chars")
             _vlog(f"NONSTREAM_THINKING[:500]: {full_thinking[:500]}")
             _vlog(f"NONSTREAM_CONTENT[:500]: {full_content[:500]}")
+
+        # 清理引用标记
+        full_content = _CITATION_RE.sub("", full_content)
 
         msg = {"role": "assistant", "content": full_content}
         finish_reason = "stop"

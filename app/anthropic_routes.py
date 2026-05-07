@@ -30,6 +30,45 @@ from .batch import (
 
 router = APIRouter()
 
+# ── Anthropic 模型名 → DeepSeek 内部模型名映射 ──
+# Claude Code CLI 等工具期望 Anthropic 风格的模型名（如 claude-sonnet-4-6），
+# 无法直接使用 deepseek-* 原生名。此映射表在请求时自动转换。
+ANTHROPIC_MODEL_ALIASES = {
+    # Claude 4.x 当前
+    "claude-opus-4-6": "deepseek-expert-reasoner",
+    "claude-sonnet-4-6": "deepseek-reasoner",
+    "claude-haiku-4-5": "deepseek-default",
+    # Claude 4.x 历史
+    "claude-sonnet-4-5": "deepseek-reasoner",
+    "claude-opus-4-1": "deepseek-expert-reasoner",
+    "claude-opus-4-0": "deepseek-expert-reasoner",
+    "claude-sonnet-4-0": "deepseek-reasoner",
+    # Claude 3.x
+    "claude-3-7-sonnet": "deepseek-reasoner",
+    "claude-3-5-sonnet": "deepseek-default",
+    "claude-3-opus": "deepseek-expert-reasoner",
+    "claude-3-sonnet": "deepseek-default",
+    "claude-3-haiku": "deepseek-default",
+    # Search 变体
+    "claude-opus-4-6-search": "deepseek-expert-reasoner-search",
+    "claude-sonnet-4-6-search": "deepseek-reasoner-search",
+    # No-thinking 变体
+    "claude-sonnet-4-6-nothinking": "deepseek-default",
+    "claude-haiku-4-5-nothinking": "deepseek-default",
+}
+
+
+def _resolve_anthropic_model(model: str) -> str:
+    """将 Anthropic 风格模型名映射为 DeepSeek 内部模型名。
+    
+    如果模型名已经是 DeepSeek 原生名（deepseek-*），直接返回。
+    如果在映射表中，返回对应的 DeepSeek 名。
+    否则返回原值（后续 fallback 到 deepseek-default）。
+    """
+    if not model or model.startswith("deepseek-"):
+        return model
+    return ANTHROPIC_MODEL_ALIASES.get(model.lower(), model)
+
 
 @router.post("/v1/messages")
 async def anthropic_messages(request: Request):
@@ -44,6 +83,7 @@ async def anthropic_messages(request: Request):
     )
     body = await request.json()
     model = body.get("model", "deepseek-default")
+    model = _resolve_anthropic_model(model)  # Anthropic 别名映射
 
     # 多账号轮询
     account = config_manager.get_next_account()
@@ -191,13 +231,14 @@ async def anthropic_create_batch_ep(request: Request):
     body = await request.json()
     requests_data = body.get("requests", [])
     model = body.get("model", "deepseek-default")
+    model = _resolve_anthropic_model(model)  # Anthropic 别名映射
     batch = _anthropic_create_batch(requests_data, model)
 
     async def _process_one(req):
         ob = _anthropic_convert_request(req.get("body", {}))
         msgs = ob.get("messages", [])
         cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
-        mi = get_models().get(req.get("body", {}).get("model", model), get_models().get("deepseek-default"))
+        mi = get_models().get(_resolve_anthropic_model(req.get("body", {}).get("model", model)), get_models().get("deepseek-default"))
         if not mi:
             return _anthropic_error_response("Unknown model")
         te, se, _, _ = mi

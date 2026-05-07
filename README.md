@@ -394,6 +394,29 @@ curl http://localhost:8000/v1/messages \
 | GET | `.../results` | 下载批量结果 |
 | DELETE | `/v1/messages/batches/{id}` | 删除批量 |
 
+#### Anthropic 模型名映射
+
+Claude Code CLI 等工具期望 Anthropic 风格的模型名（如 `claude-sonnet-4-6`），无法直接使用 `deepseek-*` 原生名。本代理在 Anthropic 端点内部自动映射：
+
+| Claude 模型名 | → DeepSeek 内部模型 |
+|---|---|
+| `claude-opus-4-6` | `deepseek-expert-reasoner` |
+| `claude-sonnet-4-6` | `deepseek-reasoner` |
+| `claude-haiku-4-5` | `deepseek-default` |
+| `claude-sonnet-4-5` | `deepseek-reasoner` |
+| `claude-3-7-sonnet` | `deepseek-reasoner` |
+| `claude-3-5-sonnet` | `deepseek-default` |
+| `claude-3-opus` | `deepseek-expert-reasoner` |
+
+也支持 Search 变体（`claude-sonnet-4-6-search` → `deepseek-reasoner-search`）和 `-nothinking` 变体。DeepSeek 原生名（`deepseek-*`）继续直接使用，`/v1/models` 返回的仍是原生名，不影响其他软件。
+
+```bash
+# 用 Claude 模型名同样可用
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: sk-dsapi" \
+  -d '{"model":"claude-sonnet-4-6","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}'
+```
+
 ### 7. 模型刷新
 
 ```bash

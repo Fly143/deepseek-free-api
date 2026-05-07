@@ -488,42 +488,6 @@ def _discover_models():
 > git checkout main
 > ```
 
-
-## 工具调用详解
-
-DeepSeek API 原生支持 DSML（DeepSeek Markup Language）格式的工具调用。代理端通过 DSML 提示词注入 + 多策略提取实现：
-
-### DSML 提示词注入
-
-将 OpenAI tools 定义转换为 DSML 格式，注入到 system 消息中：
-
-```xml
-<|DSML|tool_calls>
-  <|DSML|invoke name="search_file">
-    <|DSML|parameter name="query"><![CDATA[config.yaml]]></|DSML|parameter>
-  </|DSML|invoke>
-</|DSML|tool_calls>
-```
-
-### 提取策略
-
-| 优先级 | 格式 | 说明 |
-|--------|------|------|
-| DSML | `<\|DSML\|tool_calls><\|DSML\|invoke name="X">...</\|DSML\|invoke></\|DSML\|tool_calls>` | 主力格式，7 种噪声变体容错 |
-| TOOL_CALL | `TOOL_CALL: name(key=value)` | 旧格式兜底 |
-| JSON | `{"name":"x","arguments":{...}}` | JSON 块解析 |
-| XML | `<tool_call><function=NAME>...</function></tool_call>` | 原生 XML |
-| 混合 | `<function_call>{...}</function_call>` | XML+JSON |
-
-### 容错能力
-
-- **噪声容错** — 支持缺管道、重复 `<`、全宽 `｜`、连字符 `dsml-` 等 7 种变体
-- **围栏代码块** — 自动跳过 markdown 代码块内的 DSML 示例
-- **JSON 修复** — 未加引号 key、缺失数组括号自动修复
-- **CDATA 保护** — content/command/prompt 等参数保留原始字符串
-- **缺失开标签** — 有关闭标签无开头时自动补回
-
-
 ## PoW 求解机制
 
 DeepSeek 对 `/api/v0/chat/completion` 端点要求 **Proof of Work (PoW)** 验证。

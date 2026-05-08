@@ -2643,7 +2643,7 @@ def cleanup_old_sessions():
             remove_old_session(account_label, session_id)
             deleted += 1
             print(f"[Cleanup] Deleted: {session_id[:12]}... ({days_ago}d old)")
-        time.sleep(3)
+        time.sleep(10)
     if deleted:
         print(f"[Cleanup] Done: {deleted}/{len(expired)} deleted")
 

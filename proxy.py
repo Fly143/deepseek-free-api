@@ -2571,7 +2571,7 @@ def upload_file_to_deepseek(file_data: bytes, filename: str, content_type: str =
     session_id = cfg["session_id"]
 
     # Get PoW for upload_file scene
-    pow_response = get_pow_response(target_path="/api/v0/file/upload_file")
+    pow_response = get_pow_response(target_path="/api/v0/file/upload_file", cfg=cfg)
 
     req_headers = build_request_headers(cfg, session_id)
     if pow_response:
@@ -3759,7 +3759,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
     """
     session_id = cfg["session_id"]
     req_headers = build_request_headers(cfg, session_id)
-    pow_response = get_pow_response()
+    pow_response = get_pow_response(cfg=cfg)
     if pow_response:
         req_headers["x-ds-pow-response"] = pow_response
 

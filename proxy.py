@@ -1526,14 +1526,12 @@ app.include_router(anthropic_routes.router)
 
 @app.on_event("startup")
 async def startup_discover():
-    """启动时自动刷新模型列表，清理过期会话。"""
+    """启动时自动刷新模型列表，延迟清理过期会话（后台线程，避免风控）。"""
     print("[启动] 探测模型列表...")
     _discover_models()
-    print("[启动] 检查过期会话...")
-    try:
-        cleanup_old_sessions()
-    except Exception as e:
-        print(f"[启动] 会话清理失败: {e}")
+    print("[启动] 后台清理过期会话...")
+    import threading
+    threading.Thread(target=cleanup_old_sessions, daemon=True).start()
 
 # ── 管理页面 ─────────────────────────────────────────────
 ADMIN = """<!DOCTYPE html>
@@ -2630,12 +2628,12 @@ def _delete_deepseek_session(token: str, session_id: str) -> bool:
 
 
 def cleanup_old_sessions():
-    """清理所有账号中过期的旧会话。"""
+    """清理所有账号中过期的旧会话。每次删除后等待 3 秒，避免触发风控。"""
     expired = get_expired_sessions()
     if not expired:
         return
 
-    print(f"[Cleanup] Found {len(expired)} expired sessions, deleting...")
+    print(f"[Cleanup] Found {len(expired)} expired sessions, deleting with 3s delay...")
     deleted = 0
     for account_label, session_id, model, days_ago in expired:
         token = config_manager.get_token(account_label)
@@ -2645,6 +2643,7 @@ def cleanup_old_sessions():
             remove_old_session(account_label, session_id)
             deleted += 1
             print(f"[Cleanup] Deleted: {session_id[:12]}... ({days_ago}d old)")
+        time.sleep(3)
     if deleted:
         print(f"[Cleanup] Done: {deleted}/{len(expired)} deleted")
 

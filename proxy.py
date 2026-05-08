@@ -22,7 +22,7 @@ def _count_tokens(text: str) -> int:
 from usage_store import add_usage, get_usage, clear_usage
 from session_store import needs_renewal, on_new_session, add_tokens, get_usage_status, get_expired_sessions, remove_old_session
 from response_store import save_response_record, get_response_record, delete_response_record, update_response_record
-from context_manager import enforce_context_limit, token_breakdown, format_token_breakdown, retry_prune
+from context_manager import enforce_context_limit, token_breakdown, format_token_breakdown, retry_prune, estimate_message_tokens
 
 # ── 工具调用处理模块 ─────────────────────────────────
 from tool_call import (
@@ -3250,8 +3250,10 @@ async def chat(request: Request):
                             cfg = dict(cfg)
                             cfg["session_id"] = new_sid
                             if old_sid and old_sid != new_sid:
+                                config_manager.update_account(account_label, session_id=new_sid)
                                 on_new_session(account_label, new_sid, model)
-                            _vlog(f"vision fresh session: {new_sid}")
+                                _delete_deepseek_session(token, old_sid)
+                            _vlog(f"vision fresh session: {new_sid} (account updated)")
         except Exception as e:
             _vlog(f"fresh session failed: {e}")
 
@@ -3293,6 +3295,30 @@ async def chat(request: Request):
         )
         prompt = convert_messages_for_deepseek(pruned_messages, tools)
         prompt_tokens = _count_tokens(prompt)
+        # If still over budget (system messages too large), drop them one by one
+        if len(prompt) > char_budget:
+            # Find system messages sorted by estimated size (largest first)
+            sys_sizes = [(i, estimate_message_tokens(m)) for i, m in enumerate(pruned_messages) if m.get("role") == "system"]
+            sys_sizes.sort(key=lambda x: x[1], reverse=True)
+            for sys_idx, _ in sys_sizes:
+                kept = [m for i, m in enumerate(pruned_messages) if i != sys_idx]
+                candidate = convert_messages_for_deepseek(kept, tools)
+                if len(candidate) <= char_budget:
+                    pruned_messages = kept
+                    prompt = candidate
+                    prompt_tokens = _count_tokens(prompt)
+                    prune_desc = f"dropped system msg ({sys_sizes[0][1]} tok)"
+                    break
+            # Still too long — drop everything except last user message
+            if len(prompt) > char_budget:
+                pruned_messages, _, prune_desc = retry_prune(
+                    pruned_messages, 0, was_aggressive=True
+                )
+                prompt = convert_messages_for_deepseek(pruned_messages, tools)
+                prompt_tokens = _count_tokens(prompt)
+                if len(prompt) > char_budget:
+                    prompt = ""
+                    prune_desc = "dropped all messages (emergency)"
         print(f"[Context] char-limit prune ({char_budget_source}: budget={char_budget} prompt_chars={prompt_chars}>{char_budget}): {prune_desc}")
         print(f"[Tokens] after char-prune: prompt_tokens={prompt_tokens} prompt_chars={len(prompt)}")
 
@@ -3300,6 +3326,7 @@ async def chat(request: Request):
     if needs_renewal(account_label):
         status = get_usage_status(account_label)
         print(f"[Session] {account_label} tokens {status['prompt_tokens']}/{status['threshold']} exceeded, creating new session...")
+        old_sid = cfg.get("session_id", "")  # Capture before new session replaces it
         try:
             token = cfg.get("token", "")
             if token:
@@ -3322,6 +3349,10 @@ async def chat(request: Request):
                             cfg["session_id"] = new_sid
                             config_manager.update_account(account_label, session_id=new_sid)
                             on_new_session(account_label, new_sid, model)
+                            # 立即释放旧 session 来避免 DeepSeek 端累积过多历史会话
+                            if old_sid and old_sid != new_sid:
+                                if _delete_deepseek_session(token, old_sid):
+                                    print(f"[Session] Deleted old session: {old_sid[:12]}...")
                             print(f"[Session] {account_label} new session: {new_sid}")
         except Exception as e:
             print(f"[Session] Failed to create new session: {e}")
@@ -3352,7 +3383,8 @@ async def chat(request: Request):
             print(f"[TOO_LONG] model={model} prompt_chars={prompt_chars} prompt_tokens={prompt_tokens} msgs={len(messages)} max_input={max_input_tokens} attempt={attempt}")
             print(f"[TOO_LONG] prompt_preview[:500]={prompt[:500]}")
             print(f"[TOO_LONG] prompt_preview[-500:]={prompt[-500:]}")
-            pruned_msgs, _, retry_desc = retry_prune(messages, max_input_tokens, was_aggressive=(attempt > 0))
+            retry_budget = int(model_icl * 0.4) if model_icl > 0 else max_input_tokens
+            pruned_msgs, _, retry_desc = retry_prune(messages, retry_budget, was_aggressive=(attempt > 0))
             prompt = convert_messages_for_deepseek(pruned_msgs, tools)
             prompt_tokens = _count_tokens(prompt)
             print(f"[Retry] {retry_desc}")
@@ -4546,6 +4578,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                                             fresh_session_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
                                             if fresh_session_sid:
                                                 retry_cfg["session_id"] = fresh_session_sid
+                                                fresh_headers["referer"] = f"https://chat.deepseek.com/a/chat/s/{fresh_session_sid}"
                                                 new_req_body = dict(req_body)
                                                 new_req_body["chat_session_id"] = fresh_session_sid
                                                 retry_resp = cffi_requests.post(
@@ -4573,10 +4606,16 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                                                                      "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
                                                                 yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                                                             elif etype == "error":
-                                                                print(f"[STREAM_RETRY] fresh session also errored: {val.get('message','')}", flush=True)
+                                                                err_msg = val.get('message', '')
+                                                                print(f"[STREAM_RETRY] fresh session also errored: {err_msg}", flush=True)
+                                                                if "server busy" in err_msg.lower() or "try again" in err_msg.lower():
+                                                                    print(f"[STREAM_RETRY] Server busy, waiting 5s before next strategy...", flush=True)
+                                                                    time.sleep(5)
                                                             elif etype == "done":
                                                                 break
                                                         if _stream_ok:
+                                                            # Persist the fresh session_id so subsequent requests don't re-fail
+                                                            config_manager.update_account(cfg["account_label"], session_id=fresh_session_sid)
                                                             yield "data: [DONE]\n\n"
                                                             return
                                                     else:
@@ -4602,6 +4641,8 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                                     # Get fresh PoW response — original req_headers PoW may be stale by now
                                     fallback_pow = get_pow_response()
                                     fallback_headers = dict(req_headers)
+                                    if fresh_session_sid:
+                                        fallback_headers["referer"] = f"https://chat.deepseek.com/a/chat/s/{fresh_session_sid}"
                                     if fallback_pow:
                                         fallback_headers["x-ds-pow-response"] = fallback_pow
                                     fallback_resp = cffi_requests.post(
@@ -4626,10 +4667,16 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                                                      "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
                                                 yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                                             elif etype == "error":
-                                                print(f"[STREAM_RETRY] fallback also failed: {val.get('message','')}", flush=True)
+                                                fb_err_msg = val.get('message', '')
+                                                print(f"[STREAM_RETRY] fallback also failed: {fb_err_msg}", flush=True)
+                                                if "server busy" in fb_err_msg.lower() or "try again" in fb_err_msg.lower():
+                                                    print(f"[STREAM_RETRY] Server busy, waiting 8s before relogin...", flush=True)
+                                                    time.sleep(8)
                                             elif etype == "done":
                                                 break
                                         if _fb_ok:
+                                            if fresh_session_sid:
+                                                config_manager.update_account(cfg["account_label"], session_id=fresh_session_sid)
                                             yield "data: [DONE]\n\n"
                                             return
                                 except Exception as fb_err:

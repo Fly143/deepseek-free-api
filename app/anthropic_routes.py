@@ -158,6 +158,8 @@ async def anthropic_messages(request: Request):
                         if new_sid:
                             cfg = dict(cfg)
                             cfg["session_id"] = new_sid
+                            config_manager.update_account(account_label, session_id=new_sid)
+                            _vlog(f"vision fresh session: {new_sid} (account updated)")
         except Exception as e:
             _vlog(f"vision fresh session failed: {e}")
 

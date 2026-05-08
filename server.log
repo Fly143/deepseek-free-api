@@ -1,0 +1,7 @@
+{"time": "2026-05-07 13:01:37.794411-07:00", "level": "INFO", "message": "Starting Claude Code Proxy...", "module": "api.runtime", "function": "startup", "line": 102}
+{"time": "2026-05-07 13:01:37.800837-07:00", "level": "INFO", "message": "GlobalRateLimiter (Provider) initialized (40 req / 60.0s, max_concurrency=2)", "module": "providers.rate_limit", "function": "__init__", "line": 63}
+{"time": "2026-05-07 13:01:37.846491-07:00", "level": "INFO", "message": "Configured provider models validated: models=3 providers=1", "module": "providers.registry", "function": "validate_configured_models", "line": 419}
+{"time": "2026-05-07 13:01:37.846612-07:00", "level": "INFO", "message": "Provider model discovery cache already warm: providers=1", "module": "providers.registry", "function": "start_model_list_refresh", "line": 321}
+{"time": "2026-05-07 13:01:37.872880-07:00", "level": "INFO", "message": "Messaging platform disabled by configuration", "module": "messaging.platforms.factory", "function": "create_messaging_platform", "line": 52}
+{"time": "2026-05-07 15:12:51.126506-07:00", "level": "INFO", "message": "Shutdown requested, cleaning up...", "module": "api.runtime", "function": "shutdown", "line": 134}
+{"time": "2026-05-07 15:12:51.137433-07:00", "level": "INFO", "message": "Server shut down cleanly", "module": "api.runtime", "function": "shutdown", "line": 154}

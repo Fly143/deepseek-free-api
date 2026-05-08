@@ -496,8 +496,12 @@ def _make_message_delta(state: StreamState, stop_reason: str = "end_turn", outpu
 
 
 def _make_message_stop() -> str:
-    """发送 message_stop。"""
+    """message_stop SSE 事件。"""
     return _make_sse("message_stop", {"type": "message_stop"})
+
+def _make_error(state: StreamState, message: str) -> str:
+    """error SSE 事件。"""
+    return _make_sse("error", {"type": "error", "error": {"type": "api_error", "message": message}})
 
 
 async def stream_response(
@@ -542,6 +546,16 @@ async def stream_response(
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
+
+        # Check for error events from upstream
+        error_info = obj.get("error")
+        if error_info is not None:
+            err_msg = error_info.get("message", "") if isinstance(error_info, dict) else str(error_info)
+            if "too long" in err_msg.lower():
+                print(f"[TOO_LONG][ANTHRO_STREAM] model={model} error={err_msg[:300]}", flush=True)
+            yield _make_error(state, err_msg)
+            yield _make_message_stop()
+            return
 
         choices = obj.get("choices", [])
         if not choices:

@@ -70,6 +70,7 @@ def _resolve_anthropic_model(model: str) -> str:
 
 
 @router.post("/v1/messages")
+@router.post("/messages")
 async def anthropic_messages(request: Request):
     """Anthropic Messages API 兼容端点（main 分支，支持工具调用+多账号+多模态）"""
     from proxy import (
@@ -79,6 +80,7 @@ async def anthropic_messages(request: Request):
         config_manager, extract_text_files_from_messages, extract_images_from_messages,
         upload_file_to_deepseek, fork_file_to_vision, wait_for_file_parsing,
         get_usage_status,
+        enforce_context_limit, retry_prune,
     )
     body = await request.json()
     model = body.get("model", "deepseek-default")
@@ -98,7 +100,7 @@ async def anthropic_messages(request: Request):
     model_info = get_models().get(model, get_models().get("deepseek-default"))
     if not model_info:
         raise HTTPException(status_code=400, detail=_anthropic_error_response(f"Unknown model: {model}"))
-    thinking_enabled, search_enabled, _, _ = model_info
+    thinking_enabled, search_enabled, max_input_tokens, _ = model_info
 
     cfg = {
         "token": account.token,
@@ -144,16 +146,73 @@ async def anthropic_messages(request: Request):
                     "https://chat.deepseek.com/api/v0/chat_session/create",
                     json={}, headers=auth_h, impersonate="chrome120", timeout=15)
                 if sess_resp.status_code == 200:
-                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
-                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
-                    if new_sid:
-                        cfg = dict(cfg)
-                        cfg["session_id"] = new_sid
+                    sess_data = sess_resp.json()
+                    data_block = sess_data.get("data", {}) or {}
+                    biz_code = data_block.get("biz_code", 0)
+                    if biz_code != 0:
+                        biz_msg = data_block.get("biz_msg", "")
+                        _vlog(f"vision fresh session biz_code error: {biz_code} {biz_msg}")
+                    else:
+                        biz = data_block.get("biz_data", {})
+                        new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                        if new_sid:
+                            cfg = dict(cfg)
+                            cfg["session_id"] = new_sid
         except Exception as e:
             _vlog(f"vision fresh session failed: {e}")
 
     prompt = convert_messages_for_deepseek(messages, tools)
     prompt_tokens = _count_tokens(prompt)
+    prompt_chars = len(prompt)
+
+    # Debug logging for "Content is too long" diagnosis
+    import sys
+    msgs_summary = []
+    for i, m in enumerate(messages):
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if isinstance(content, str):
+            csize = len(content)
+        elif isinstance(content, list):
+            csize = sum(len(p.get("text", "")) for p in content if isinstance(p, dict))
+        else:
+            csize = len(str(content))
+        msgs_summary.append(f"{i}:{role}={csize}")
+    print(f"[ANTHRO_REQ] model={model} msgs={len(messages)} prompt_chars={prompt_chars} prompt_tokens={prompt_tokens} last_role={messages[-1].get('role','?') if messages else '?'}", flush=True)
+    print(f"[ANTHRO_REQ] msgs_summary={' '.join(msgs_summary[-20:])}", flush=True)
+    print(f"[ANTHRO_REQ] raw_body_size={len(json.dumps(body, ensure_ascii=False))}", flush=True)
+    sys.stdout.flush()
+
+    # 主动上下文修剪：在发送给 DeepSeek 之前检查 token 限制，避免 "Content is too long"
+    _, _, max_input_tokens, _ = model_info
+    pruned_messages, _, was_pruned, prune_desc = enforce_context_limit(
+        messages, max_input_tokens, tools
+    )
+    if was_pruned:
+        prompt = convert_messages_for_deepseek(pruned_messages, tools)
+        prompt_tokens = _count_tokens(prompt)
+        prompt_chars = len(prompt)
+        print(f"[ANTHRO_REQ] proactive prune applied: {prune_desc}", flush=True)
+        print(f"[ANTHRO_REQ] after prune: msgs={len(pruned_messages)} tokens={prompt_tokens} chars={prompt_chars}", flush=True)
+        sys.stdout.flush()
+
+    # Character budget check: DeepSeek enforces input_character_limit (icl) at the character level.
+    # Same logic as proxy.py lines 3252-3267.
+    max_chars_from_tokens = int(max_input_tokens / 0.4) if max_input_tokens else 2_621_440
+    char_output_reserve = max(1024, min(16384, int(max_chars_from_tokens * 0.2)))
+    char_budget = max_chars_from_tokens - char_output_reserve
+    if prompt_chars > char_budget:
+        char_token_budget = max(4096, int(char_budget * 0.4))
+        prune_target = pruned_messages if was_pruned else messages
+        pruned_messages, _, char_prune_desc = retry_prune(
+            prune_target, char_token_budget, was_aggressive=False
+        )
+        prompt = convert_messages_for_deepseek(pruned_messages, tools)
+        prompt_tokens = _count_tokens(prompt)
+        prompt_chars = len(prompt)
+        print(f"[ANTHRO_REQ] char-limit prune (chars={prompt_chars}>{char_budget}): {char_prune_desc}", flush=True)
+        print(f"[ANTHRO_REQ] after char-prune: msgs={len(pruned_messages)} tokens={prompt_tokens} chars={prompt_chars}", flush=True)
+        sys.stdout.flush()
 
     # 会话管理：token 超限自动续期
     if needs_renewal(account_label):
@@ -165,26 +224,56 @@ async def anthropic_messages(request: Request):
                     "https://chat.deepseek.com/api/v0/chat_session/create",
                     json={}, headers=auth_h, impersonate="chrome120", timeout=15)
                 if sess_resp.status_code == 200:
-                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
-                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
-                    if new_sid:
-                        cfg = dict(cfg)
-                        cfg["session_id"] = new_sid
-                        config_manager.update_account(account_label, session_id=new_sid)
-                        on_new_session(account_label, new_sid, model)
+                    sess_data = sess_resp.json()
+                    data_block = sess_data.get("data", {}) or {}
+                    biz_code = data_block.get("biz_code", 0)
+                    if biz_code != 0:
+                        biz_msg = data_block.get("biz_msg", "")
+                        _vlog(f"Session renewal biz_code error: {biz_code} {biz_msg}")
+                    else:
+                        biz = data_block.get("biz_data", {})
+                        new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                        if new_sid:
+                            cfg = dict(cfg)
+                            cfg["session_id"] = new_sid
+                            config_manager.update_account(account_label, session_id=new_sid)
+                            on_new_session(account_label, new_sid, model)
         except Exception as e:
             _vlog(f"Session renewal failed: {e}")
 
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
-    if stream:
-        result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=False, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
+    # Retry logic for "Content is too long"
+    max_retries = 1
+    for attempt in range(max_retries + 1):
+        try:
+            if stream:
+                result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=(attempt > 0), has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, messages=messages, max_input_tokens=max_input_tokens)
+            else:
+                result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=False, is_retry=(attempt > 0), has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, messages=messages, max_input_tokens=max_input_tokens)
+            break
+        except HTTPException as e:
+            if attempt >= max_retries:
+                raise
+            error_detail = e.detail
+            if isinstance(error_detail, dict):
+                error_msg = str(error_detail.get("error", {}).get("message", ""))
+            else:
+                error_msg = str(error_detail)
+            if "Content is too long" not in error_msg and "too long" not in error_msg:
+                raise
+            from proxy import retry_prune
+            pruned_msgs, _, retry_desc = retry_prune(messages, 0, was_aggressive=(attempt > 0))
+            prompt = convert_messages_for_deepseek(pruned_msgs, tools)
+            prompt_tokens = _count_tokens(prompt)
+            print(f"[ANTHRO_RETRY] {retry_desc} prompt_chars={len(prompt)} attempt={attempt}", flush=True)
 
+    if stream:
+        orig_iter = result.body_iterator
+        async def _gen():
+            async for chunk in orig_iter:
+                yield chunk
         async def _wrap():
-            orig_iter = result.body_iterator
-            async def _gen():
-                async for chunk in orig_iter:
-                    yield chunk
             async for event in _anthropic_stream_response(_gen(), model, msg_id):
                 yield event
             add_usage(model, prompt_tokens, 0)
@@ -192,8 +281,6 @@ async def anthropic_messages(request: Request):
 
         return StreamingResponse(_wrap(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
     else:
-        result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=False, is_retry=False, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
-
         add_usage(model, prompt_tokens, 0)
         add_tokens(account_label, cfg.get("session_id", ""), prompt_tokens)
 

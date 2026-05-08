@@ -1,0 +1,35 @@
+- generic [ref=e5]:
+  - generic [ref=e7]:
+    - img [ref=e10]
+    - generic [ref=e23]:
+      - textbox "Phone number / email address" [ref=e27]
+      - generic [ref=e31]:
+        - textbox "Password" [ref=e32]
+        - button [ref=e34] [cursor=pointer]:
+          - img [ref=e37]
+      - generic [ref=e42]:
+        - text: By signing up or logging in, you consent to DeepSeek's
+        - link "Terms of Use" [ref=e43] [cursor=pointer]:
+          - /url: https://cdn.deepseek.com/policies/en-US/deepseek-terms-of-use.html?locale=en_US
+        - text: and
+        - link "Privacy Policy" [ref=e44] [cursor=pointer]:
+          - /url: https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html?locale=en_US
+        - text: .
+      - generic [ref=e45]:
+        - button "Forgot password?" [ref=e46] [cursor=pointer]:
+          - generic [ref=e47]: Forgot password?
+        - button "Sign up" [ref=e48] [cursor=pointer]:
+          - generic [ref=e49]: Sign up
+      - button "Log in" [ref=e50] [cursor=pointer]:
+        - generic [ref=e51]: Log in
+      - generic [ref=e54]:
+        - button [ref=e55] [cursor=pointer]:
+          - img [ref=e57]
+        - button [ref=e62] [cursor=pointer]:
+          - img [ref=e64]
+  - generic [ref=e67]:
+    - link "浙ICP备2023025841号" [ref=e68] [cursor=pointer]:
+      - /url: https://beian.miit.gov.cn
+    - generic [ref=e69]: ·
+    - link "Contact us" [ref=e70] [cursor=pointer]:
+      - /url: mailto:service@deepseek.com

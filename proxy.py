@@ -22,6 +22,7 @@ def _count_tokens(text: str) -> int:
 from usage_store import add_usage, get_usage, clear_usage
 from session_store import needs_renewal, on_new_session, add_tokens, get_usage_status, get_expired_sessions, remove_old_session
 from response_store import save_response_record, get_response_record, delete_response_record, update_response_record
+from context_manager import enforce_context_limit, token_breakdown, format_token_breakdown, retry_prune
 
 # ── 工具调用处理模块 ─────────────────────────────────
 from tool_call import (
@@ -1481,6 +1482,19 @@ from app.anthropic_routes import router as _anthropic_router
 app.include_router(_anthropic_router)
 
 
+# ── Path rewrite middleware ──────────────────────────────────────
+# Some clients (e.g. Claude Code CLI) include /v1 in their base URL,
+# causing double-prefixed paths like /v1/v1/messages. Rewrite these.
+@app.middleware("http")
+async def _rewrite_double_v1_prefix(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if path.startswith("/v1/v1/"):
+        request.scope["path"] = path[3:]  # strip leading /v1 → /v1/...
+    elif path == "/v1/v1":
+        request.scope["path"] = "/v1"
+    return await call_next(request)
+
+
 @app.on_event("startup")
 async def startup_discover():
     """启动时自动刷新模型列表，清理过期会话。"""
@@ -1823,6 +1837,17 @@ async def root():
     return RedirectResponse(url="/admin")
 
 
+@app.get("/v1")
+async def v1_root():
+    return {"api": "DeepSeek Proxy", "version": "1.0", "endpoints": ["/v1/chat/completions", "/v1/models", "/v1/messages"]}
+
+
+@app.head("/v1")
+async def v1_root_head():
+    from starlette.responses import Response
+    return Response(status_code=200)
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin():
     from starlette.responses import Response
@@ -1970,9 +1995,15 @@ async def deepseek_login(data: dict):
         session_id = ""
         if session_resp.status_code == 200:
             session_data = session_resp.json()
-            biz = session_data.get("data", {}).get("biz_data", {})
-            session_id = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
-            print(f"[Login] Session created: {session_id}")
+            data_block = session_data.get("data", {}) or {}
+            biz_code = data_block.get("biz_code", 0)
+            if biz_code != 0:
+                biz_msg = data_block.get("biz_msg", "")
+                print(f"[Login] Session create biz_code error: {biz_code} {biz_msg}")
+            else:
+                biz = data_block.get("biz_data", {})
+                session_id = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                print(f"[Login] Session created: {session_id}")
         else:
             print(f"[Login] Session creation failed: {session_resp.status_code} {session_resp.text[:200]}")
 
@@ -2174,6 +2205,7 @@ async def admin_models():
 MODEL_CONFIG_URL = "https://chat.deepseek.com/api/v0/client/settings?scope=model"
 
 _models_cache = {}       # model_id → (thinking, search, max_in, max_out)
+_models_icl_cache = {}   # model_id → input_character_limit (字符预算检查用)
 _models_cache_time = 0
 _MODELS_TTL = 3600       # 缓存1小时
 
@@ -2217,13 +2249,14 @@ def _discover_models() -> dict:
             if not mt or not mc.get("enabled"):
                 continue
 
-            # 上下文大小：优先从 input_character_limit 推算 (V4 系列 ≈ 1M tokens)，
-            # 对 Expert 等 UI 限制偏小的模型硬编码 1M
+            # 上下文大小：优先从 input_character_limit 推算 (V4 系列 ≈ 1M tokens)。
+            # Expert (icl=163840) 等 icl 来自 UI 限制而非模型实际能力，
+            # V4 全系列原生支持 1M 上下文，故 icl<1M 时仍硬编码 1M。
             icl = mc.get("input_character_limit", 0) or 0
             if icl >= 1_000_000:
                 max_in = int(icl * 0.4)      # 2621440 × 0.4 ≈ 1048576 (1M)
             else:
-                max_in = 1_048_576            # Expert 等硬编码 1M
+                max_in = 1_048_576            # V4 全系列原生 1M 上下文
             max_out = max_in                  # DeepSeek V4 输出上限即上下文大小
             has_think = mc.get("think_feature") is not None
             has_search = mc.get("search_feature") is not None
@@ -2231,22 +2264,27 @@ def _discover_models() -> dict:
             # 基础模型
             name = f"deepseek-{mt}" if mt != "default" else "deepseek-default"
             models[name] = (False, False, max_in, max_out)
-            print(f"[模型发现]   {name}: in={max_in}, out={max_out}, think={has_think}, search={has_search}")
+            # 缓存 icl 用于字符预算检查；icl=0 表示"无限制"
+            _models_icl_cache[name] = icl
+            print(f"[模型发现]   {name}: in={max_in}, out={max_out}, icl={icl}, think={has_think}, search={has_search}")
 
-            # 思维链变体
+            # 思维链变体（共享同源 icl）
             if has_think:
                 tname = "deepseek-reasoner" if mt == "default" else f"deepseek-{mt}-reasoner"
                 models[tname] = (True, False, max_in, max_out)
+                _models_icl_cache[tname] = icl
 
             # 搜索变体
             if has_search:
                 sname = "deepseek-search" if mt == "default" else f"deepseek-{mt}-search"
                 models[sname] = (False, True, max_in, max_out)
+                _models_icl_cache[sname] = icl
 
             # 思考+联网 组合变体
             if has_think and has_search:
                 cname = "deepseek-reasoner-search" if mt == "default" else f"deepseek-{mt}-reasoner-search"
                 models[cname] = (True, True, max_in, max_out)
+                _models_icl_cache[cname] = icl
 
         if models:
             # 模型名称为纯英文ID，中文对照见 README.md
@@ -2294,8 +2332,8 @@ def relogin(cfg: dict) -> dict | None:
         if not email:
             return None
         login_payload["email"] = email
-        login_payload["mobile"] = ""
-        login_payload["area_code"] = ""
+        login_payload["mobile"] = None  # Per API spec: null for unused field
+        login_payload["area_code"] = None
     elif login_type == "phone":
         mobile = cfg.get("_mobile", "")
         area_code = cfg.get("_area_code", "+86")
@@ -2303,7 +2341,7 @@ def relogin(cfg: dict) -> dict | None:
             return None
         login_payload["mobile"] = mobile
         login_payload["area_code"] = area_code
-        login_payload["email"] = ""
+        login_payload["email"] = None  # Per API spec: null for unused field
     else:
         return None
 
@@ -2356,9 +2394,15 @@ def relogin(cfg: dict) -> dict | None:
         session_id = ""
         if session_resp.status_code == 200:
             session_data = session_resp.json()
-            biz = session_data.get("data", {}).get("biz_data", {})
-            session_id = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
-            print(f"[Token] 新 session: {session_id}")
+            data_block = session_data.get("data", {}) or {}
+            biz_code = data_block.get("biz_code", 0)
+            if biz_code != 0:
+                biz_msg = data_block.get("biz_msg", "")
+                print(f"[Token] Session create biz_code error: {biz_code} {biz_msg}")
+            else:
+                biz = data_block.get("biz_data", {})
+                session_id = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                print(f"[Token] 新 session: {session_id}")
         else:
             print(f"[Token] Session 创建失败: {session_resp.status_code}")
 
@@ -2401,8 +2445,7 @@ def load_config_with_refresh() -> dict:
 
 
 # ── OpenAI 兼容 API ──────────────────────────────────────
-@app.get("/v1/models")
-async def models():
+def _build_model_list():
     data = []
     for mid, (think, search, mi, mo) in get_models().items():
         data.append({
@@ -2413,6 +2456,17 @@ async def models():
             "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens", "stream"],
         })
     return {"object": "list", "data": data}
+
+# Both /v1/models and bare /models are needed:
+# - /v1/models is the standard OpenAI path
+# - /models is queried by tools like free-claude-code's DeepSeek provider
+@app.get("/v1/models")
+async def models():
+    return _build_model_list()
+
+@app.get("/models")
+async def models_bare():
+    return _build_model_list()
 
 
 @app.get("/v1/models/{model_id}")
@@ -2445,6 +2499,52 @@ async def refresh_models():
             "supported_parameters": ["tools", "tool_choice", "temperature", "max_tokens", "stream"],
         })
     return {"object": "list", "data": data}
+
+
+@app.post("/v1/context/debug")
+async def context_debug(request: Request):
+    """Debug endpoint: analyze token usage for a given request payload without sending it.
+
+    POST with JSON body like /v1/chat/completions:
+      { "messages": [...], "model": "...", "tools": [...] }
+
+    Returns a token breakdown, pruning simulation results, and budget analysis.
+    Useful for diagnosing "Content is too long" errors before they happen.
+    """
+    body = await request.json()
+    messages = body.get("messages", [])
+    tools = body.get("tools", None)
+    model = body.get("model", "deepseek-default")
+
+    model_info = get_models().get(model) or get_models().get("deepseek-default") or (False, False, 1048576, 1048576)
+    _, _, max_input_tokens, _ = model_info
+
+    breakdown = token_breakdown(messages, tools)
+    pruned, pruned_count, was_pruned, desc = enforce_context_limit(messages, max_input_tokens, tools)
+
+    result = {
+        "model": model,
+        "max_input_tokens": max_input_tokens,
+        "message_count": len(messages),
+        "tool_count": len(tools) if tools else 0,
+        "token_breakdown": breakdown,
+        "formatted": format_token_breakdown(breakdown),
+        "within_limit": not was_pruned,
+        "pruned": was_pruned,
+        "prune_description": desc,
+        "pruned_message_count": len(pruned) if was_pruned else None,
+        "pruned_token_count": pruned_count if was_pruned else None,
+    }
+
+    # Also show the most aggressive retry outcome
+    aggressive_msgs, agg_count, agg_desc = retry_prune(messages, max_input_tokens, was_aggressive=False)
+    result["retry_simulation"] = {
+        "aggressive_prune_description": agg_desc,
+        "aggressive_prune_tokens": agg_count,
+        "aggressive_prune_messages": len(aggressive_msgs),
+    }
+
+    return result
 
 
 def build_request_headers(cfg: dict, session_id: str) -> dict:
@@ -2492,18 +2592,201 @@ def get_pow_response(target_path: str = "/api/v0/chat/completion",
         )
         if resp.status_code == 200:
             data = resp.json()
-            challenge = data.get("data", {}).get("biz_data", {}).get("challenge", {})
+            outer = data.get("data") or {}
+            biz_code = outer.get("biz_code", 0)
+            if biz_code != 0:
+                print(f"[PoW] biz_code={biz_code} biz_msg={outer.get('biz_msg','?')}")
+                return None
+            challenge = outer.get("biz_data", {}).get("challenge", {})
             if challenge:
                 pow_response = pow_solver.solve_challenge(challenge)
                 print(f"[PoW] Solved: {pow_response[:50]}...")
                 return pow_response
             else:
-                print(f"[PoW] No challenge: {data}")
+                print(f"[PoW] No challenge: biz_code={biz_code} data={data}")
         else:
-                print(f"[PoW] Request failed {resp.status_code}: {resp.text[:200]}")
+            print(f"[PoW] Request failed {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         print(f"[PoW] Error: {e}")
     return None
+
+
+# ── 停止流式输出 ──────────────────────────────────────────
+
+def stop_deepseek_stream(cfg: dict, message_id: int) -> bool:
+    """Call DeepSeek stop_stream to cancel an in-progress generation."""
+    session_id = cfg.get("session_id", "")
+    if not session_id or not message_id:
+        return False
+    try:
+        headers = build_request_headers(cfg, session_id)
+        resp = cffi_requests.post(
+            "https://chat.deepseek.com/api/v0/chat/stop_stream",
+            headers=headers,
+            json={"chat_session_id": session_id, "message_id": message_id},
+            impersonate="chrome120",
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            print(f"[StopStream] Stopped message_id={message_id}")
+            return True
+        else:
+            print(f"[StopStream] Failed ({resp.status_code}): {resp.text[:100]}")
+            return False
+    except Exception as e:
+        print(f"[StopStream] Error: {e}")
+        return False
+
+
+# ── 编辑消息 ────────────────────────────────────────────
+
+def edit_deepseek_message(cfg: dict, message_id: int, prompt: str,
+                           thinking_enabled: bool, search_enabled: bool) -> dict | None:
+    """Edit a previous message via DeepSeek's edit_message endpoint.
+
+    API: POST /api/v0/chat/edit_message
+    Requires PoW (target_path: /api/v0/chat/edit_message).
+    Returns response containing headers for the caller to read SSE stream.
+    """
+    session_id = cfg.get("session_id", "")
+    if not session_id or not message_id:
+        return None
+    try:
+        headers = build_request_headers(cfg, session_id)
+        pow_response = get_pow_response(target_path="/api/v0/chat/edit_message", cfg=cfg)
+        if pow_response:
+            headers["x-ds-pow-response"] = pow_response
+
+        resp = cffi_requests.post(
+            "https://chat.deepseek.com/api/v0/chat/edit_message",
+            headers=headers,
+            json={
+                "chat_session_id": session_id,
+                "message_id": message_id,
+                "prompt": prompt,
+                "search_enabled": search_enabled,
+                "thinking_enabled": thinking_enabled,
+            },
+            impersonate="chrome120",
+            stream=True,
+            timeout=120,
+        )
+        return resp
+    except Exception as e:
+        print(f"[EditMessage] Error: {e}")
+        return None
+
+
+# ── 编辑消息 HTTP 端点 ─────────────────────────────────────
+
+@app.post("/v1/chat/edit_message")
+async def edit_message_endpoint(request: Request):
+    """编辑最后一条用户消息并重新生成回复。
+
+    请求体:
+      message_id (int): DeepSeek 消息 ID
+      prompt (str): 新提示词
+      model (str, optional): 模型名(默认 deepseek-default)
+
+    返回: OpenAI 兼容的 SSE 流式响应。
+    """
+    account = config_manager.get_next_account()
+    if not account:
+        raise HTTPException(503, detail="没有可用账号，请先访问 /admin 添加并登录账号")
+
+    body = await request.json()
+    message_id = body.get("message_id")
+    prompt = body.get("prompt", "")
+    model = body.get("model", "deepseek-default")
+
+    if not message_id or not prompt:
+        raise HTTPException(400, detail="message_id and prompt are required")
+
+    model_info = get_models().get(model) or get_models().get("deepseek-default") or (False, False, 1048576, 1048576)
+    thinking_enabled, search_enabled, _, _ = model_info
+
+    cfg = {
+        "token": account.token,
+        "session_id": account.session_id,
+        "headers": dict(account.headers),
+        "cookie": account.cookie,
+        "account_label": account.account_label,
+    }
+
+    resp = edit_deepseek_message(cfg, message_id, prompt, thinking_enabled, search_enabled)
+    if resp is None:
+        raise HTTPException(502, detail="编辑消息失败：无法连接到 DeepSeek")
+
+    if resp.status_code != 200:
+        body_sample = ""
+        try:
+            body_sample = resp.text[:500] if hasattr(resp, "text") else f"(status={resp.status_code})"
+        except Exception:
+            body_sample = f"(body unreadable, status={resp.status_code})"
+        raise HTTPException(502, detail=f"DeepSeek edit_message error {resp.status_code}: {body_sample[:200]}")
+
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+
+    async def _stream_edit_response():
+        yield f'data: {json.dumps({"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})}\n\n'
+        try:
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                decoded = line.decode("utf-8", errors="ignore").strip()
+                if not decoded.startswith("data:"):
+                    continue
+                data_str = decoded[5:].strip()
+                if not data_str:
+                    continue
+                try:
+                    obj = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                val = obj.get("v")
+                path = obj.get("p", "")
+
+                if path in ("response/status",) or (isinstance(val, dict) and val.get("type") == "error" and val.get("finish_reason")):
+                    if isinstance(val, dict) and val.get("type") == "error":
+                        yield f'data: {json.dumps({"error": {"message": val.get("content", ""), "type": "server_error", "code": val.get("finish_reason", "")}})}\n\n'
+                        yield "data: [DONE]\n\n"
+                        return
+                    continue
+
+                if path == "response/thinking_content" or path == "response/content":
+                    if isinstance(val, str) and val:
+                        key = "reasoning_content" if path == "response/thinking_content" else "content"
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {key: val}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                elif isinstance(val, str) and val:
+                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {"content": val}, "finish_reason": None}]}
+                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                resp_data = val.get("response", {}) if isinstance(val, dict) else {}
+                if isinstance(resp_data, dict):
+                    frags = resp_data.get("fragments", [])
+                    if frags and isinstance(frags, list):
+                        for frag in frags:
+                            if isinstance(frag, dict):
+                                ftype = frag.get("type", "")
+                                fcontent = frag.get("content", "")
+                                if fcontent and isinstance(fcontent, str):
+                                    key = "reasoning_content" if ftype == "THINK" else "content"
+                                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                         "choices": [{"index": 0, "delta": {key: fcontent}, "finish_reason": None}]}
+                                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+
+            yield f'data: {json.dumps({"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n'
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            print(f"[EditMessage] Stream error: {e}")
+            yield f'data: {json.dumps({"error": {"message": str(e), "type": "server_error"}})}\n\n'
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_stream_edit_response(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 
 # ── 文件上传（Vision 模型支持）──────────────────────────────
@@ -2548,11 +2831,15 @@ def upload_file_to_deepseek(file_data: bytes, filename: str, content_type: str =
         )
         if resp.status_code == 200:
             data = resp.json()
-            file_id = (data.get("data", {})
-                            .get("biz_data", {})
+            data_block = data.get("data", {}) or {}
+            biz_code = data_block.get("biz_code", 0)
+            if biz_code != 0:
+                biz_msg = data_block.get("biz_msg", "")
+                _vlog(f"upload biz_code error: {biz_code} {biz_msg}")
+                return None
+            file_id = (data_block.get("biz_data", {})
                             .get("id", "")
-                       or data.get("data", {})
-                              .get("id", ""))
+                       or data_block.get("id", ""))
             if file_id:
                 _vlog(f"upload OK: {filename} -> {file_id}")
                 return file_id
@@ -2569,11 +2856,21 @@ def upload_file_to_deepseek(file_data: bytes, filename: str, content_type: str =
 def _delete_deepseek_session(token: str, session_id: str) -> bool:
     """调用 DeepSeek API 删除指定会话。"""
     try:
-        headers = {**DS_HEADERS, "authorization": f"Bearer {token}"}
+        # 使用和浏览器一致的 headers，确保 WAF 通过
+        delete_headers = {
+            **DS_HEADERS,
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "authorization": f"Bearer {token}",
+            "priority": "u=1, i",
+            "x-app-version": "2.0.0",
+            "x-client-locale": "en_US",
+            "x-client-timezone-offset": str(-time.timezone // 60),
+        }
         resp = cffi_requests.post(
             "https://chat.deepseek.com/api/v0/chat_session/delete",
             json={"chat_session_id": session_id},
-            headers=headers,
+            headers=delete_headers,
             impersonate="chrome120",
             timeout=15,
         )
@@ -2847,9 +3144,36 @@ async def chat(request: Request):
     print(msg, flush=True)
     _vlog(msg)
 
+    # Debug: log the incoming OpenAI-format request for troubleshooting "Content is too long"
+    try:
+        body_json = await request.json()
+        body_str = json.dumps(body_json, ensure_ascii=False)
+        total_chars = len(body_str)
+        # Log total char size and a summary of message roles + sizes
+        msgs_info = []
+        for i, m in enumerate(messages):
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            if isinstance(content, str):
+                csize = len(content)
+            elif isinstance(content, list):
+                csize = sum(len(p.get("text", "")) for p in content if isinstance(p, dict))
+            else:
+                csize = len(str(content))
+            msgs_info.append(f"{i}:{role}={csize}")
+        print(f"[REQ_BODY] total_chars={total_chars} msgs_summary={' '.join(msgs_info[-10:])} last_role={messages[-1].get('role','?') if messages else '?'} last_size={msgs_info[-1].split('=')[-1] if msgs_info else '?'}", flush=True)
+    except Exception as e:
+        print(f"[REQ_BODY] failed: {e}", flush=True)
+
     # 模型映射
-    model_info = get_models().get(model, get_models().get("deepseek-default"))
-    thinking_enabled, search_enabled, _, _ = model_info
+    model_info = get_models().get(model) or get_models().get("deepseek-default") or (False, False, 1048576, 1048576)
+    thinking_enabled, search_enabled, max_input_tokens, _ = model_info
+    # 字符级预算：使用 DeepSeek 返回的 input_character_limit，而非从 token 数反推（后者可能高估 16x）
+    model_icl = _models_icl_cache.get(model) or _models_icl_cache.get("deepseek-default", 0) or 0
+    if model_icl:
+        print(f"[Budget] model={model} max_input_tokens={max_input_tokens} icl={model_icl}")
+    else:
+        print(f"[Budget] model={model} max_input_tokens={max_input_tokens} icl=N/A (unlimited)")
 
     cfg = {
         "token": account.token,
@@ -2912,21 +3236,65 @@ async def chat(request: Request):
                     "https://chat.deepseek.com/api/v0/chat_session/create",
                     json={}, headers=auth_h, impersonate="chrome120", timeout=15)
                 if sess_resp.status_code == 200:
-                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
-                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
-                    if new_sid:
-                        old_sid = cfg.get("session_id", "")
-                        cfg = dict(cfg)
-                        cfg["session_id"] = new_sid
-                        if old_sid and old_sid != new_sid:
-                            on_new_session(account_label, new_sid, model)
-                        _vlog(f"vision fresh session: {new_sid}")
+                    session_data = sess_resp.json()
+                    data_block = session_data.get("data", {}) or {}
+                    biz_code = data_block.get("biz_code", 0)
+                    if biz_code != 0:
+                        biz_msg = data_block.get("biz_msg", "")
+                        _vlog(f"vision fresh session biz_code error: {biz_code} {biz_msg}")
+                    else:
+                        biz = data_block.get("biz_data", {})
+                        new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                        if new_sid:
+                            old_sid = cfg.get("session_id", "")
+                            cfg = dict(cfg)
+                            cfg["session_id"] = new_sid
+                            if old_sid and old_sid != new_sid:
+                                on_new_session(account_label, new_sid, model)
+                            _vlog(f"vision fresh session: {new_sid}")
         except Exception as e:
             _vlog(f"fresh session failed: {e}")
 
     # 构建 prompt：使用 convert_messages_for_deepseek 处理完整多轮对话
     prompt = convert_messages_for_deepseek(messages, tools)
     prompt_tokens = _count_tokens(prompt)
+
+    pruned_messages, _, was_pruned, prune_desc = enforce_context_limit(
+        messages, max_input_tokens, tools
+    )
+    if was_pruned:
+        prompt = convert_messages_for_deepseek(pruned_messages, tools)
+        prompt_tokens = _count_tokens(prompt)
+        print(f"[Context] {prune_desc}")
+
+    breakdown = token_breakdown(messages if not was_pruned else pruned_messages, tools)
+    _vlog(f"TOKEN_BREAKDOWN: {json.dumps(breakdown, ensure_ascii=False)}")
+    print(f"[Tokens] model={model} max_input={max_input_tokens} prompt_tokens={prompt_tokens} msgs={len(messages)} pruned={was_pruned}")
+
+    # Character budget check: DeepSeek enforces input_character_limit (icl) at the character level.
+    # Token-based budget can overestimate capacity for English-heavy text because tiktoken's
+    # cl100k_base counts ~4 chars/token for English, but icl→tokens uses 2.5 chars/token factor.
+    prompt_chars = len(prompt)
+    if model_icl > 0:
+        # Use the actual input_character_limit reported by DeepSeek.
+        # Reserve a small portion (~5%) for output framing.
+        char_budget = int(model_icl * 0.95)
+        char_budget_source = "icl"
+    else:
+        # Fallback: derive from max_input_tokens (1M tokens → ~2.6M chars, minus 20% reserve)
+        max_chars_from_tokens = int(max_input_tokens / 0.4) if max_input_tokens else 2_621_440
+        char_output_reserve = max(1024, min(16384, int(max_chars_from_tokens * 0.2)))
+        char_budget = max_chars_from_tokens - char_output_reserve
+        char_budget_source = "token-derived"
+    if prompt_chars > char_budget:
+        char_token_budget = max(4096, int(char_budget * 0.4))
+        pruned_messages, _, prune_desc = retry_prune(
+            pruned_messages, char_token_budget, was_aggressive=False
+        )
+        prompt = convert_messages_for_deepseek(pruned_messages, tools)
+        prompt_tokens = _count_tokens(prompt)
+        print(f"[Context] char-limit prune ({char_budget_source}: budget={char_budget} prompt_chars={prompt_chars}>{char_budget}): {prune_desc}")
+        print(f"[Tokens] after char-prune: prompt_tokens={prompt_tokens} prompt_chars={len(prompt)}")
 
     # 会话管理：token 超限时自动建新 DeepSeek session
     if needs_renewal(account_label):
@@ -2940,26 +3308,55 @@ async def chat(request: Request):
                     "https://chat.deepseek.com/api/v0/chat_session/create",
                     json={}, headers=auth_h, impersonate="chrome120", timeout=15)
                 if sess_resp.status_code == 200:
-                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
-                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
-                    if new_sid:
-                        cfg = dict(cfg)
-                        cfg["session_id"] = new_sid
-                        config_manager.update_account(account_label, session_id=new_sid)
-                        on_new_session(account_label, new_sid, model)
-                        print(f"[Session] {account_label} new session: {new_sid}")
+                    session_data = sess_resp.json()
+                    data_block = session_data.get("data", {}) or {}
+                    biz_code = data_block.get("biz_code", 0)
+                    if biz_code != 0:
+                        biz_msg = data_block.get("biz_msg", "")
+                        print(f"[Session] {account_label} session create biz_code error: {biz_code} {biz_msg}")
+                    else:
+                        biz = data_block.get("biz_data", {})
+                        new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                        if new_sid:
+                            cfg = dict(cfg)
+                            cfg["session_id"] = new_sid
+                            config_manager.update_account(account_label, session_id=new_sid)
+                            on_new_session(account_label, new_sid, model)
+                            print(f"[Session] {account_label} new session: {new_sid}")
         except Exception as e:
             print(f"[Session] Failed to create new session: {e}")
 
     has_tools = bool(tools)
 
-    # Try streaming for all models including vision with images.
-    # Old issue: vision stream put everything in thinking_content, but the new
-    # fragments format (THINK/RESPONSE) should handle this correctly now.
-
-    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
-                    is_retry=False, has_tools=has_tools, tools=tools,
-                    ref_file_ids=ref_file_ids)
+    max_retries = 1
+    for attempt in range(max_retries + 1):
+        try:
+            result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
+                            is_retry=(attempt > 0), has_tools=has_tools, tools=tools,
+                            ref_file_ids=ref_file_ids, messages=messages, max_input_tokens=max_input_tokens)
+            if not stream:
+                break
+            break
+        except HTTPException as e:
+            if attempt >= max_retries:
+                raise
+            error_detail = e.detail
+            if isinstance(error_detail, dict):
+                error_msg = str(error_detail.get("error", {}).get("message", ""))
+            else:
+                error_msg = str(error_detail)
+            if "Content is too long" not in error_msg and "too long" not in error_msg:
+                raise
+            # Log the trigger details for debugging
+            prompt_chars = len(prompt)
+            print(f"[TOO_LONG] model={model} prompt_chars={prompt_chars} prompt_tokens={prompt_tokens} msgs={len(messages)} max_input={max_input_tokens} attempt={attempt}")
+            print(f"[TOO_LONG] prompt_preview[:500]={prompt[:500]}")
+            print(f"[TOO_LONG] prompt_preview[-500:]={prompt[-500:]}")
+            pruned_msgs, _, retry_desc = retry_prune(messages, max_input_tokens, was_aggressive=(attempt > 0))
+            prompt = convert_messages_for_deepseek(pruned_msgs, tools)
+            prompt_tokens = _count_tokens(prompt)
+            print(f"[Retry] {retry_desc}")
+            _vlog(f"RETRY: attempt={attempt + 1} prompt_tokens={prompt_tokens} msgs={len(pruned_msgs)}")
 
     # (Vision SSE wrapper removed — all models now stream directly via fragments format)
 
@@ -3708,7 +4105,7 @@ async def delete_response(response_id: str):
     return {"id": response_id, "object": "response", "deleted": True}
 
 
-def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None, ref_file_ids=None):
+def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None, ref_file_ids=None, messages=None, max_input_tokens=None):
     """核心聊天逻辑，支持 token 过期后重试
     
     DeepSeek SSE 流结构（thinking_enabled=True 时）：
@@ -3764,14 +4161,38 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         # Pre-flight: check Content-Type — if DeepSeek returns HTML/text instead of SSE,
         # treat the entire response as an error to avoid silent data loss
         ct = resp.headers.get("content-type", "")
-        if ct and "text/event-stream" not in ct and "application/json" not in ct:
+        if ct and "text/event-stream" not in ct:
+            # Read body from stream — resp.text may be empty for stream=True responses
             body_sample = ""
             try:
-                body_sample = resp.text[:300] if hasattr(resp, "text") else ""
+                body_chunks = []
+                for chunk in resp.iter_content(chunk_size=4096):
+                    if chunk:
+                        body_chunks.append(chunk)
+                if body_chunks:
+                    body_sample = b"".join(body_chunks).decode("utf-8", errors="ignore")[:500]
             except Exception:
                 pass
+            error_msg = f"DeepSeek returned non-SSE response (Content-Type: {ct}): {body_sample}"
+            if body_sample:
+                try:
+                    err_data = json.loads(body_sample)
+                    # Try nested DeepSeek error format: {"data": {"biz_code": N, "biz_msg": "..."}}
+                    data_block = err_data.get("data", {}) or {}
+                    biz_code = data_block.get("biz_code", 0)
+                    if biz_code != 0:
+                        biz_msg = data_block.get("biz_msg", "")
+                        error_msg = f"DeepSeek biz_code error {biz_code}: {biz_msg or body_sample[:200]}"
+                    else:
+                        # Try top-level error format: {"code": N, "msg": "..."}
+                        top_code = err_data.get("code", 0)
+                        if top_code and int(top_code) >= 40000:
+                            top_msg = err_data.get("msg", "") or err_data.get("message", "")
+                            error_msg = f"DeepSeek error {top_code}: {top_msg or body_sample[:200]}"
+                except (json.JSONDecodeError, TypeError):
+                    pass
             yield ("error", {
-                "message": f"DeepSeek returned non-SSE response (Content-Type: {ct}): {body_sample}",
+                "message": error_msg,
                 "code": "bad_content_type"
             })
             return
@@ -3781,6 +4202,8 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         phase = "thinking"
         # New format: track fragment type (THINK/RESPONSE) from metadata events
         fragment_type = None  # None = old format (use phase), "THINK"/"RESPONSE" = new format
+        # Track SSE event type across lines (e.g. event: hint → data: {...})
+        _current_sse_event = ""
         _line_buf = b""
         def _read_lines():
             nonlocal _line_buf
@@ -3802,18 +4225,29 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             if thinking_enabled and line.startswith("data:") and "fragments" in line:
                 _vlog(f"SSE_LINE: {line[:500]}")
 
-            # Skip event: lines (title, update_session, etc.)
+            # ── Handle event: lines ──
+            # SSE events carry semantic meaning: finish (stream complete),
+            # close (session end), hint (error/info), toast (error notification)
             if line.startswith("event:"):
-                if line.startswith("event: hint"):
-                    continue  # handled below via raw line processing
+                _current_sse_event = line[6:].strip()
+                # Terminal events — signal stream end immediately
+                if _current_sse_event in ("finish", "close"):
+                    yield ("done", "")
+                    return
+                # Non-terminal events wait for following data: line
                 continue
+
+            # Reset event tracker after each non-event line (data: lines or raw lines)
+            # But keep it if we're expecting a data: line after an event
+            if not line.startswith("data:") and not line.startswith("{"):
+                _current_sse_event = ""
 
             # Detect raw text/HTML error responses
             if line.startswith("<!DOCTYPE") or line.startswith("<html") or line.startswith("<HTML"):
-                yield ("error", {
-                    "message": f"DeepSeek returned HTML error: {line[:200]}",
-                    "code": "html_response"
-                })
+                err_msg = f"DeepSeek returned HTML error: {line[:200]}"
+                if "too long" in err_msg.lower():
+                    print(f"[TOO_LONG][SSE_PARSE] html error: {err_msg[:300]}", flush=True)
+                yield ("error", {"message": err_msg, "code": "html_response"})
                 return
 
             if non_json_line_count >= 3:
@@ -3844,12 +4278,44 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 if not isinstance(obj, dict):
                     continue
 
-                # Error object: {"type": "error", "content": "...", "finish_reason": "..."}
+                # Ready event: first SSE event carrying message IDs for stop_stream
+                if _current_sse_event == "ready":
+                    meta = {"type": "ready"}
+                    if obj.get("response_message_id") is not None:
+                        meta["response_message_id"] = obj["response_message_id"]
+                    if obj.get("request_message_id") is not None:
+                        meta["request_message_id"] = obj["request_message_id"]
+                    _current_sse_event = ""
+                    yield ("meta", meta)
+                    continue
+
+                # Toast/hint event: server-side notifications
+                if _current_sse_event in ("toast", "hint"):
+                    toast_type = obj.get("type", "")
+                    if toast_type == "error":
+                        content = obj.get("content", "")
+                        fr = obj.get("finish_reason", "")
+                        clear_resp = obj.get("clear_response", False)
+                        error_info = {"message": content or "DeepSeek server error", "code": fr or "server_error"}
+                        if clear_resp:
+                            error_info["clear_response"] = True
+                        _current_sse_event = ""
+                        yield ("error", error_info)
+                        return
+                    # Info-type hints: ignore and continue
+                    _current_sse_event = ""
+                    continue
+
+                # Error object: {"type": "error", "content": "...", "clear_response": true/false, "finish_reason": "..."}
                 obj_type = obj.get("type", "")
                 if obj_type == "error":
                     content = obj.get("content", "")
                     fr = obj.get("finish_reason", "")
-                    yield ("error", {"message": content, "code": fr})
+                    clear_resp = obj.get("clear_response", False)
+                    error_info = {"message": content, "code": fr}
+                    if clear_resp:
+                        error_info["clear_response"] = True
+                    yield ("error", error_info)
                     return
 
                 val = obj.get("v")
@@ -3952,6 +4418,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
 
     def do_stream():
         """SSE streaming for OpenAI-compatible clients."""
+        response_message_id = 0  # For stop_stream on client disconnect
         try:
             resp = cffi_requests.post(
                 "https://chat.deepseek.com/api/v0/chat/completion",
@@ -3983,6 +4450,10 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             if resp.status_code != 200:
                 error_msg = f"DeepSeek returned {resp.status_code}: {resp.text[:300]}"
                 print(f"[Error] {error_msg}")
+                if "too long" in error_msg.lower():
+                    print(f"[TOO_LONG][STREAM_HTTP] model={model} prompt_chars={len(prompt)} error={error_msg[:300]}", flush=True)
+                    print(f"[TOO_LONG][STREAM_HTTP] prompt_preview[:500]={prompt[:500]}", flush=True)
+                    print(f"[TOO_LONG][STREAM_HTTP] prompt_preview[-500:]={prompt[-500:]}", flush=True)
                 yield f'data: {json.dumps({"error": {"message": error_msg, "type": "server_error", "code": resp.status_code}})}\n\n'
                 yield "data: [DONE]\n\n"
                 return
@@ -4010,15 +4481,20 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                              "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
 
-                # 流式筛分 + 并行缓冲：筛分实时播正文，同时攒完整内容做 fallback
-                def _parse_fn(text):
-                    return extract_tool_call(text, get_tool_names(tools) if tools else [])
+            # 流式筛分 + 并行缓冲：筛分实时播正文，同时攒完整内容做 fallback
+            def _parse_fn(text):
+                return extract_tool_call(text, get_tool_names(tools) if tools else [])
 
-                sieve = StreamSieve(parse_fn=_parse_fn)
-                _role_sent = False
-                _full_buf = ""  # 并行缓冲完整内容，flush 时 fallback 解析
+            sieve = StreamSieve(parse_fn=_parse_fn)
+            _role_sent = False
+            _full_buf = ""
 
+            try:
                 for etype, val in _parse_sse(resp):
+                    if etype == "meta":
+                        if val.get("type") == "ready":
+                            response_message_id = val.get("response_message_id", 0)
+                        continue
                     if etype == "content":
                         _full_buf += val
                         for evt in sieve.feed(val):
@@ -4037,81 +4513,261 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                              "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                     elif etype == "error":
+                        err_msg = val.get("message", "")
+                        err_code = val.get("code", "")
+                        if "too long" in err_msg.lower() or err_code == "bad_content_type":
+                            if "too long" in err_msg.lower():
+                                print(f"[TOO_LONG][STREAM] model={model} prompt_chars={len(prompt)} error={err_msg}", flush=True)
+                                print(f"[TOO_LONG][STREAM] prompt_preview[:500]={prompt[:500]}", flush=True)
+                                print(f"[TOO_LONG][STREAM] prompt_preview[-500:]={prompt[-500:]}", flush=True)
+                            # Inline retry: prune, rebuild prompt, and make fresh HTTP request directly
+                            # (bypasses StreamingResponse wrapping which would create an async generator)
+                            if messages is not None and not is_retry:
+                                print(f"[STREAM_RETRY] attempting retry ({err_code}: {err_msg[:80]})...", flush=True)
+                                from proxy import retry_prune as _rp, convert_messages_for_deepseek as _cmd
+                                # Strategy 1: Create a fresh DeepSeek session (session accumulation is root cause)
+                                retry_cfg = dict(cfg)
+                                fresh_session_sid = None
+                                try:
+                                    pow_resp = get_pow_response()
+                                    fresh_headers = dict(req_headers)
+                                    if pow_resp:
+                                        fresh_headers["x-ds-pow-response"] = pow_resp
+                                    sess_resp = cffi_requests.post(
+                                        "https://chat.deepseek.com/api/v0/chat_session/create",
+                                        json={}, headers=fresh_headers, impersonate="chrome120", timeout=15
+                                    )
+                                    if sess_resp.status_code == 200:
+                                        sess_data = sess_resp.json()
+                                        data_block = sess_data.get("data", {}) or {}
+                                        biz_code = data_block.get("biz_code", 0)
+                                        if biz_code == 0:
+                                            biz = data_block.get("biz_data", {})
+                                            fresh_session_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
+                                            if fresh_session_sid:
+                                                retry_cfg["session_id"] = fresh_session_sid
+                                                new_req_body = dict(req_body)
+                                                new_req_body["chat_session_id"] = fresh_session_sid
+                                                retry_resp = cffi_requests.post(
+                                                    "https://chat.deepseek.com/api/v0/chat/completion",
+                                                    headers=fresh_headers,
+                                                    json=new_req_body,
+                                                    impersonate="chrome120",
+                                                    stream=True,
+                                                    timeout=120,
+                                                )
+                                                if retry_resp.status_code == 200:
+                                                    ct = retry_resp.headers.get("content-type", "")
+                                                    if "text/event-stream" in ct:
+                                                        print(f"[STREAM_RETRY] fresh session {fresh_session_sid} OK", flush=True)
+                                                        _stream_ok = False
+                                                        for etype, val in _parse_sse(retry_resp):
+                                                            if etype == "content":
+                                                                _stream_ok = True
+                                                                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                                                     "choices": [{"index": 0, "delta": {"content": sanitize_leaked_output(val)}, "finish_reason": None}]}
+                                                                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                                                            elif etype == "thinking":
+                                                                _stream_ok = True
+                                                                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                                                     "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
+                                                                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                                                            elif etype == "error":
+                                                                print(f"[STREAM_RETRY] fresh session also errored: {val.get('message','')}", flush=True)
+                                                            elif etype == "done":
+                                                                break
+                                                        if _stream_ok:
+                                                            yield "data: [DONE]\n\n"
+                                                            return
+                                                    else:
+                                                        body_sample = retry_resp.text[:500] if hasattr(retry_resp, "text") else ""
+                                                        print(f"[STREAM_RETRY] fresh session non-SSE (ct={ct}): {body_sample}", flush=True)
+                                                else:
+                                                    body_sample = retry_resp.text[:500] if hasattr(retry_resp, "text") else ""
+                                                    print(f"[STREAM_RETRY] fresh session HTTP {retry_resp.status_code}: {body_sample}", flush=True)
+                                except Exception as sess_err:
+                                    print(f"[STREAM_RETRY] fresh session failed: {sess_err}", flush=True)
+                                # Strategy 2: Ultimate fallback — keep only last user message
+                                print(f"[STREAM_RETRY] ultimate fallback: keep only last user message", flush=True)
+                                users = [m for m in messages if m.get("role") == "user"]
+                                pruned_msgs = [users[-1]] if users else []
+                                fallback_prompt = _cmd(pruned_msgs, tools)
+                                fallback_tokens = _count_tokens(fallback_prompt)
+                                print(f"[STREAM_RETRY] ultimate fallback: {len(pruned_msgs)} msgs, {fallback_tokens} tokens", flush=True)
+                                try:
+                                    fallback_req = dict(req_body)
+                                    fallback_req["prompt"] = fallback_prompt
+                                    if fresh_session_sid:
+                                        fallback_req["chat_session_id"] = fresh_session_sid
+                                    # Get fresh PoW response — original req_headers PoW may be stale by now
+                                    fallback_pow = get_pow_response()
+                                    fallback_headers = dict(req_headers)
+                                    if fallback_pow:
+                                        fallback_headers["x-ds-pow-response"] = fallback_pow
+                                    fallback_resp = cffi_requests.post(
+                                        "https://chat.deepseek.com/api/v0/chat/completion",
+                                        headers=fallback_headers,
+                                        json=fallback_req,
+                                        impersonate="chrome120",
+                                        stream=True,
+                                        timeout=120,
+                                    )
+                                    if fallback_resp.status_code == 200:
+                                        _fb_ok = False
+                                        for etype, val in _parse_sse(fallback_resp):
+                                            if etype == "content":
+                                                _fb_ok = True
+                                                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                                     "choices": [{"index": 0, "delta": {"content": sanitize_leaked_output(val)}, "finish_reason": None}]}
+                                                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                                            elif etype == "thinking":
+                                                _fb_ok = True
+                                                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                                     "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
+                                                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                                            elif etype == "error":
+                                                print(f"[STREAM_RETRY] fallback also failed: {val.get('message','')}", flush=True)
+                                            elif etype == "done":
+                                                break
+                                        if _fb_ok:
+                                            yield "data: [DONE]\n\n"
+                                            return
+                                except Exception as fb_err:
+                                    print(f"[STREAM_RETRY] fallback exception: {fb_err}", flush=True)
+                                # Strategy 3: Re-login + fresh session (invalid-token recovery)
+                                if not is_retry:
+                                    print(f"[STREAM_RETRY] strategy 3: relogin...", flush=True)
+                                    try:
+                                        new_cfg = relogin(cfg)
+                                        if new_cfg:
+                                            auth_h = new_cfg.get("headers", {})
+                                            pow_r = get_pow_response()
+                                            rl_headers = dict(auth_h)
+                                            if pow_r:
+                                                rl_headers["x-ds-pow-response"] = pow_r
+                                            # Create fresh session with re-logged-in token
+                                            rl_sess_resp = cffi_requests.post(
+                                                "https://chat.deepseek.com/api/v0/chat_session/create",
+                                                json={}, headers=rl_headers, impersonate="chrome120", timeout=15
+                                            )
+                                            if rl_sess_resp.status_code == 200:
+                                                rl_sess_data = rl_sess_resp.json()
+                                                rl_data_block = rl_sess_data.get("data", {}) or {}
+                                                if rl_data_block.get("biz_code", 0) == 0:
+                                                    rl_biz = rl_data_block.get("biz_data", {})
+                                                    rl_sid = rl_biz.get("chat_session", {}).get("id", "") or rl_biz.get("id", "")
+                                                    if rl_sid:
+                                                        rl_req = dict(req_body)
+                                                        rl_req["chat_session_id"] = rl_sid
+                                                        rl_resp = cffi_requests.post(
+                                                            "https://chat.deepseek.com/api/v0/chat/completion",
+                                                            headers=rl_headers, json=rl_req,
+                                                            impersonate="chrome120", stream=True, timeout=120,
+                                                        )
+                                                        if rl_resp.status_code == 200 and "text/event-stream" in rl_resp.headers.get("content-type", ""):
+                                                            print(f"[STREAM_RETRY] relogin+session OK", flush=True)
+                                                            _rl_ok = False
+                                                            for etype, val in _parse_sse(rl_resp):
+                                                                if etype == "content":
+                                                                    _rl_ok = True
+                                                                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                                                         "choices": [{"index": 0, "delta": {"content": sanitize_leaked_output(val)}, "finish_reason": None}]}
+                                                                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                                                                elif etype == "thinking":
+                                                                    _rl_ok = True
+                                                                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                                                         "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
+                                                                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                                                                elif etype == "error":
+                                                                    print(f"[STREAM_RETRY] relogin retry also errored: {val.get('message','')}", flush=True)
+                                                                elif etype == "done":
+                                                                    break
+                                                            if _rl_ok:
+                                                                yield "data: [DONE]\n\n"
+                                                                return
+                                    except Exception as rl_err:
+                                        print(f"[STREAM_RETRY] relogin retry exception: {rl_err}", flush=True)
+                        if val.get("clear_response"):
+                            _role_sent = True
+                            _full_buf = ""
                         yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
                         yield "data: [DONE]\n\n"
                         return
                     elif etype == "done":
                         break
+            except GeneratorExit:
+                if response_message_id > 0:
+                    stop_deepseek_stream(cfg, response_message_id)
+                raise
 
-                # Flush + fallback：筛分没抓到就用全量解析
-                _had_tool_calls = False
-                for evt in sieve.flush():
-                    if evt.type == "text":
-                        if isinstance(evt.data, str) and evt.data:
-                            if not _role_sent:
-                                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
-                                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                                _role_sent = True
-                            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                 "choices": [{"index": 0, "delta": {"content": sanitize_leaked_output(evt.data)}, "finish_reason": None}]}
-                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    elif evt.type == "tool_calls":
-                        _had_tool_calls = True
-                        for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
-                            yield chunk
-
-                # Fallback: 筛分没抓到，用全量缓冲重试
-                if not _had_tool_calls and _full_buf:
-                    tc_result, _ = extract_tool_call(_full_buf, get_tool_names(tools) if tools else [])
-                    if tc_result:
+            # Flush + fallback
+            _had_tool_calls = False
+            for evt in sieve.flush():
+                if evt.type == "text":
+                    if isinstance(evt.data, str) and evt.data:
                         if not _role_sent:
                             r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                                  "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
                             yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                             _role_sent = True
-                        _had_tool_calls = True
-                        for chunk in _emit_tool_calls(tc_result, chat_id, created, model):
-                            yield chunk
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"content": sanitize_leaked_output(evt.data)}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                elif evt.type == "tool_calls":
+                    _had_tool_calls = True
+                    for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
+                        yield chunk
 
+            if not _had_tool_calls and _full_buf:
+                tc_result, _ = extract_tool_call(_full_buf, get_tool_names(tools) if tools else [])
+                if tc_result:
+                    if not _role_sent:
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                        _role_sent = True
+                    _had_tool_calls = True
+                    for chunk in _emit_tool_calls(tc_result, chat_id, created, model):
+                        yield chunk
+
+            if not _had_tool_calls:
                 if not _role_sent:
                     r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                          "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                     yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                elif not _had_tool_calls:
-                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                yield "data: [DONE]\n\n"
-                return
+                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+            yield "data: [DONE]\n\n"
+            return
 
-            # No tools: normal streaming
-            _stream_think_count = 0
-            _stream_content_count = 0
-            # Send role delta first — many clients need this to start rendering
-            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
-            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-            for etype, val in _parse_sse(resp):
-                if etype == "content":
-                    _stream_content_count += 1
-                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                         "choices": [{"index": 0, "delta": {"content": sanitize_leaked_output(val)}, "finish_reason": None}]}
-                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                elif etype == "thinking":
-                    _stream_think_count += 1
-                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                         "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
-                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                elif etype == "error":
-                    yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
-                    yield "data: [DONE]\n\n"
-                    return
-                elif etype == "done":
-                    if thinking_enabled:
-                        _vlog(f"STREAM_DONE: thinking_chunks={_stream_think_count} content_chunks={_stream_content_count}")
-                    yield "data: [DONE]\n\n"
-                    return
+            if not has_tools:
+                # No tools: normal streaming
+                _stream_think_count = 0
+                _stream_content_count = 0
+                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                for etype, val in _parse_sse(resp):
+                    if etype == "content":
+                        _stream_content_count += 1
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"content": sanitize_leaked_output(val)}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    elif etype == "thinking":
+                        _stream_think_count += 1
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    elif etype == "error":
+                        yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
+                        yield "data: [DONE]\n\n"
+                        return
+                    elif etype == "done":
+                        if thinking_enabled:
+                            _vlog(f"STREAM_DONE: thinking_chunks={_stream_think_count} content_chunks={_stream_content_count}")
+                        yield "data: [DONE]\n\n"
+                        return
 
         except Exception as e:
             print(f"[Error] do_stream failed: {e}")
@@ -4154,6 +4810,8 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 except Exception:
                     body_sample = f"(body unreadable, status={resp.status_code})"
                 print(f"[nonstream] DeepSeek {resp.status_code}: {body_sample[:200]}")
+                if "too long" in body_sample.lower():
+                    print(f"[TOO_LONG][NONSTREAM_HTTP] model={model} prompt_chars={len(prompt)} status={resp.status_code} body={body_sample[:200]}", flush=True)
                 raise HTTPException(502, detail={
                     "error": {
                         "message": f"DeepSeek returned {resp.status_code}: {body_sample[:200]}",
@@ -4169,6 +4827,11 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 elif etype == "thinking":
                     full_thinking += val
                 elif etype == "error":
+                    err_msg = val.get("message", "")
+                    if "too long" in err_msg.lower():
+                        print(f"[TOO_LONG][NONSTREAM] model={model} prompt_chars={len(prompt)} error={err_msg}", flush=True)
+                        print(f"[TOO_LONG][NONSTREAM] prompt_preview[:500]={prompt[:500]}", flush=True)
+                        print(f"[TOO_LONG][NONSTREAM] prompt_preview[-500:]={prompt[-500:]}", flush=True)
                     raise HTTPException(502, detail={"error": {
                         "message": val["message"],
                         "type": "server_error",

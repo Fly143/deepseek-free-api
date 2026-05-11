@@ -1,3 +1,8 @@
+## [v2.2.6] — 2026-05-11
+
+### Changed
+- 版本号同步 main 分支 v2.2.6（no-tools 分支无工具调用相关代码变更）
+
 # 更新日志（Changelog）
 
 本文件记录 deepseek-free-api 的所有重要变更。

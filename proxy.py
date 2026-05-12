@@ -1626,14 +1626,17 @@ a{color:#7dd3fc}
 <body>
 <div class="c">
 <h1>DeepSeek Proxy</h1>
-<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st" data-i18n="waitingCfg">等待配置</span></div>
+<div style="position:absolute;top:32px;right:32px">
+<button onclick="toggleLang()" id="langBtn" style="padding:6px 14px;background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;cursor:pointer;font-size:13px;transition:all .2s">🌐 EN</button>
+</div>
+<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st">等待配置</span></div>
 
 <div class="tab-bar">
 <div class="tab active" onclick="switchTab('phone')">手机号登录</div>
 <div class="tab" onclick="switchTab('email')">邮箱登录</div>
 <div class="tab" onclick="switchTab('usage')">用量统计</div>
 <div class="tab" onclick="switchTab('accounts')">账号管理</div>
-<div class="tab" style="flex:0.4;cursor:pointer" onclick="toggleLang()" id="langBtn">🌐 EN</div>
+</div>
 </div>
 
 <div id="phonePanel" class="panel active">

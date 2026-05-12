@@ -3842,6 +3842,10 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     continue  # handled below via raw line processing
                 continue
 
+            # Skip SSE comment lines (: — used for keepalive/comments)
+            if line.startswith(":") or line == ":":
+                continue
+
             # Detect raw text/HTML error responses
             if line.startswith("<!DOCTYPE") or line.startswith("<html") or line.startswith("<HTML"):
                 yield ("error", {
@@ -3868,7 +3872,14 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     pass
                 continue
 
+            # Skip SSE comment lines (: — used for keepalive/comments)
+            if line.startswith(":") or line == ":":
+                continue
+
             ds = line[6:] if line.startswith("data: ") else line
+            # Skip data: : (SSE empty/commented data events)
+            if ds.strip() == ":":
+                continue
             if ds.strip() == "[DONE]":
                 yield ("done", "")
                 return

@@ -1,3 +1,8 @@
+## [v2.2.7] — 2026-05-12
+
+### 修复
+- **SSE 注释行导致解析失败** — DeepSeek 原始 SSE 中的 `:` 注释行（标准 SSE keepalive）未被过滤，被 `non_json_line_count` 误判为非法内容，3 行后触发错误退出。Hermes 等客户端收到错误后报 `too many non-JSON lines`
+
 ## [v2.2.6] — 2026-05-11
 
 ### Changed

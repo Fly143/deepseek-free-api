@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import tiktoken
 from curl_cffi import requests as cffi_requests
 from app.batch import init_batch_storage as anthropic_init_batch_storage
@@ -1518,6 +1519,13 @@ def build_config(parsed: dict) -> dict:
 
 
 app = FastAPI(title="DeepSeek Proxy")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Anthropic Messages API 路由（格式转换 + 处理）
 from app import anthropic_routes
@@ -1618,45 +1626,46 @@ a{color:#7dd3fc}
 <body>
 <div class="c">
 <h1>DeepSeek Proxy</h1>
-<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st">等待配置</span></div>
+<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st" data-i18n="waitingCfg">等待配置</span></div>
 
 <div class="tab-bar">
 <div class="tab active" onclick="switchTab('phone')">手机号登录</div>
 <div class="tab" onclick="switchTab('email')">邮箱登录</div>
 <div class="tab" onclick="switchTab('usage')">用量统计</div>
 <div class="tab" onclick="switchTab('accounts')">账号管理</div>
+<div class="tab" style="flex:0.4;cursor:pointer" onclick="toggleLang()" id="langBtn">🌐 EN</div>
 </div>
 
 <div id="phonePanel" class="panel active">
 <div class="row">
 <input class="ac" type="tel" id="area_code" value="+86" placeholder="+86">
-<input class="ph" type="tel" id="mobile" placeholder="手机号" autocomplete="tel">
+<input class="ph" type="tel" id="mobile" data-i18n-ph="phonePlaceholder" placeholder="手机号" autocomplete="tel">
 </div>
-<div class="pw-row"><input type="password" id="pw1" placeholder="密码" autocomplete="current-password"></div>
-<button class="btn bp" id="btn1" onclick="doLogin('phone')">登录</button>
+<div class="pw-row"><input type="password" id="pw1" data-i18n-ph="pwdPlaceholder" placeholder="密码" autocomplete="current-password"></div>
+<button class="btn bp" id="btn1" onclick="doLogin('phone')" data-i18n="loginBtn">登录</button>
 </div>
 
 <div id="emailPanel" class="panel">
-<div class="pw-row"><input type="email" id="email" placeholder="邮箱地址" autocomplete="email"></div>
-<div class="pw-row"><input type="password" id="pw2" placeholder="密码" autocomplete="current-password"></div>
-<button class="btn bp" id="btn2" onclick="doLogin('email')">登录</button>
+<div class="pw-row"><input type="email" id="email" data-i18n-ph="emailPlaceholder" placeholder="邮箱地址" autocomplete="email"></div>
+<div class="pw-row"><input type="password" id="pw2" data-i18n-ph="pwdPlaceholder" placeholder="密码" autocomplete="current-password"></div>
+<button class="btn bp" id="btn2" onclick="doLogin('email')" data-i18n="loginBtn">登录</button>
 </div>
 
 <div class="info" id="info"></div>
 
 <div id="apiSection">
-<div class="collapse" onclick="toggleCurl()">高级: 手动粘贴 cURL ▾</div>
+<div class="collapse" onclick="toggleCurl()" data-i18n="advancedCurl">高级: 手动粘贴 cURL ▾</div>
 <div class="curl-box" id="curlBox">
-<textarea id="curl" placeholder="粘贴 cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px"></textarea>
-<button class="btn bp" id="btn3" onclick="saveCurl()" style="margin-top:8px">保存 cURL</button>
+<textarea id="curl" data-i18n-ph="pasteCurl" placeholder="粘贴 cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px"></textarea>
+<button class="btn bp" id="btn3" onclick="saveCurl()" data-i18n="saveCurlBtn" style="margin-top:8px">保存 cURL</button>
 </div>
 
 <hr>
 <div class="step">
-<div class="sl" style="font-weight:600;color:#e2e8f0;">API 配置</div>
+<div class="sl" style="font-weight:600;color:#e2e8f0;" data-i18n="apiConfig">API 配置</div>
 <div class="cfg">
-<div class="cr"><span>API 地址</span><code onclick="cp(this)">http://localhost:""" + str(PROXY_PORT) + """/v1</code></div>
-<div class="cr"><span>API Key</span><code onclick="cp(this)">任意填写</code></div>
+<div class="cr"><span data-i18n="apiAddr">API 地址</span><code onclick="cp(this)">http://localhost:""" + str(PROXY_PORT) + """/v1</code></div>
+<div class="cr"><span data-i18n="apiKey">API Key</span><code onclick="cp(this)" data-i18n="apiKeyVal">任意填写</code></div>
 
 </div>
 </div>
@@ -1669,24 +1678,104 @@ a{color:#7dd3fc}
 <div id="usagePanel" class="panel">
 <div id="usageContent"></div>
 <div style="margin-top:14px">
-<button class="pb ac" onclick="switchPeriod('total')" id="pbTotal">全部</button>
-<button class="pb" onclick="switchPeriod('week')" id="pbWeek">本周</button>
-<button class="pb" onclick="switchPeriod('today')" id="pbToday">今日</button>
-<button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:6px 12px;margin-left:8px" onclick="loadUsage()">刷新</button>
-<button class="btn" style="background:#7f1d1d;color:#fca5a5;font-size:12px;padding:6px 12px;margin-left:4px" onclick="clearUsage()">清空</button>
+<button class="pb ac" onclick="switchPeriod('total')" id="pbTotal" data-i18n="periodAll">全部</button>
+<button class="pb" onclick="switchPeriod('week')" id="pbWeek" data-i18n="periodWeek">本周</button>
+<button class="pb" onclick="switchPeriod('today')" id="pbToday" data-i18n="periodToday">今日</button>
+<button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:6px 12px;margin-left:8px" onclick="loadUsage()" data-i18n="refreshBtn">刷新</button>
+<button class="btn" style="background:#7f1d1d;color:#fca5a5;font-size:12px;padding:6px 12px;margin-left:4px" onclick="clearUsage()" data-i18n="clearBtn">清空</button>
 </div>
 </div>
 
 <div id="accountsPanel" class="panel">
-<div class="acct-stat" id="acctStat">加载中...</div>
+<div class="acct-stat" id="acctStat" data-i18n="loadingAccounts">加载中...</div>
+
+<div class="acct-add">
+<input type="tel" id="acctPhone" data-i18n-ph="phonePlaceholder" placeholder="手机号">
+<select id="acctType"><option value="phone">📱</option></select>
+<input type="password" id="acctPw" data-i18n-ph="pwdPlaceholder" placeholder="密码">
+<button onclick="addAccount()" data-i18n="addAcctBtn">添加</button>
+</div>
 
 <div id="acctList"><div class="acct-empty">暂无账号，请先添加</div></div>
-<button class="acct-btn batch" onclick="reloginAll()">全部重新登录</button>
-<button class="acct-btn batch" onclick="cleanupSessions()" style="background:#7c3aed;color:#fff">清理过期会话</button>
+<button class="acct-btn batch" onclick="reloginAll()" data-i18n="reloginAllBtn">全部重新登录</button>
+<button class="acct-btn batch" onclick="cleanupSessions()" data-i18n="cleanupSessionsBtn" style="background:#7c3aed;color:#fff">清理过期会话</button>
 </div>
 </div>
 <div id="toast" class="toast"></div>
 <script>
+// === i18n ===
+var _lang=localStorage.getItem('ds_lang')||'zh';
+var _I={
+zh:{phoneLogin:'手机号登录',emailLogin:'邮箱登录',usage:'用量统计',accounts:'账号管理',
+phonePlaceholder:'手机号',pwdPlaceholder:'密码',loginBtn:'登录',loginBtnDoing:'登录中...',
+emailPlaceholder:'邮箱地址',waitingCfg:'等待配置',configured:'已配置',connFail:'连接失败',
+loggingDS:'正在登录 DeepSeek...',loginOk:'登录成功',loginFail:'失败:',
+error:'错误:',advancedCurl:'高级: 手动粘贴 cURL',saveCurlBtn:'保存 cURL',
+parsing:'解析中...',saved:'已保存',apiConfig:'API 配置',apiAddr:'API 地址',
+apiKey:'API Key',apiKeyVal:'任意填写',refreshModels:'🔄 刷新模型列表',
+refreshingModels:'刷新中...',foundModels:'✅ 发现',foundModelsSuffix:'个模型:',
+refreshOk:'刷新成功',refreshFail:'刷新失败',
+periodAll:'全部',periodWeek:'本周',periodToday:'今日',refreshBtn:'刷新',clearBtn:'清空',
+noData:'📊 暂无用量数据',loadFail:'加载失败: ',modelHeader:'模型',reqHeader:'请求',
+inputHeader:'输入',outputHeader:'输出',totalHeader:'总计',sumLabel:'📋 合计',
+clearConfirm:'确定清空全部用量数据？',cleared:'已清空',clearFail:'清空失败',
+loadingAccounts:'加载中...',noAccounts:'暂无账号，请先添加',accountHeader:'账号',
+statusHeader:'状态',tokenHeader:'Token',loginTimeHeader:'登录时间',opHeader:'操作',
+valid:'有效',notLogin:'未登录',reloginBtn:'重登',deleteBtn:'删除',
+reloginAllBtn:'全部重新登录',cleanupSessionsBtn:'清理过期会话',
+allRelogining:'登录中...',allReloginDone:'重登完成:',allReloginFail:'失败:',
+deleteConfirm:'确定删除账号',deleted:'已删除',deleteFail:'删除失败:',
+reloginOk:'重新登录成功',reloginFail:'重登失败: ',
+acctCount:'共',acctCount2:'个账号，',acctCount3:'个有效',
+cleanupDone:'清理完成',cleanupFail:'清理失败: ',
+addAcctTitle:'添加账号（手机号登录）',addAcctBtn:'添加',
+phoneRequired:'请输入手机号和密码',emailRequired:'请输入邮箱和密码',
+addOk:'已添加，需登录获取token',addFail:'失败: ',
+pleaseAdd:'暂无账号，请在上方添加',pasteCurl:'粘贴 cURL ...',
+modelCountSuffix:' 个模型: ',acctAddFail:'添加失败: ',unknownErr:'未知错误',
+cleanupBtnDoing:'清理中...',unknown:'未知'},
+en:{phoneLogin:'Phone Login',emailLogin:'Email Login',usage:'Usage',accounts:'Accounts',
+phonePlaceholder:'Phone Number',pwdPlaceholder:'Password',loginBtn:'Login',loginBtnDoing:'Logging in...',
+emailPlaceholder:'Email Address',waitingCfg:'Awaiting Config',configured:'Configured',connFail:'Connection Failed',
+loggingDS:'Logging into DeepSeek...',loginOk:'Login Successful',loginFail:'Failed:',
+error:'Error:',advancedCurl:'Advanced: Paste cURL',saveCurlBtn:'Save cURL',
+parsing:'Parsing...',saved:'Saved',apiConfig:'API Config',apiAddr:'API Endpoint',
+apiKey:'API Key',apiKeyVal:'Any value',refreshModels:'🔄 Refresh Models',
+refreshingModels:'Refreshing...',foundModels:'✅ Found',foundModelsSuffix:'model(s):',
+refreshOk:'Refreshed',refreshFail:'Refresh Failed',
+periodAll:'All',periodWeek:'This Week',periodToday:'Today',refreshBtn:'Refresh',clearBtn:'Clear',
+noData:'📊 No Usage Data',loadFail:'Load failed: ',modelHeader:'Model',reqHeader:'Requests',
+inputHeader:'Input',outputHeader:'Output',totalHeader:'Total',sumLabel:'📋 Total',
+clearConfirm:'Clear all usage data?',cleared:'Cleared',clearFail:'Clear Failed',
+loadingAccounts:'Loading...',noAccounts:'No accounts. Add one above.',accountHeader:'Account',
+statusHeader:'Status',tokenHeader:'Token',loginTimeHeader:'Login Time',opHeader:'Actions',
+valid:'Active',notLogin:'Not Logged In',reloginBtn:'Relogin',deleteBtn:'Delete',
+reloginAllBtn:'Relogin All',cleanupSessionsBtn:'Cleanup Old Sessions',
+allRelogining:'Relogging...',allReloginDone:'Relogin done:',allReloginFail:'Failed:',
+deleteConfirm:'Delete account',deleted:'Deleted',deleteFail:'Delete failed:',
+reloginOk:'Relogin Successful',reloginFail:'Relogin failed: ',
+acctCount:'',acctCount2:' account(s), ',acctCount3:' active',
+cleanupDone:'Cleanup done',cleanupFail:'Cleanup failed: ',
+addAcctTitle:'Add Account (Phone Login)',addAcctBtn:'Add',
+phoneRequired:'Phone number and password required',emailRequired:'Email and password required',
+addOk:'Added. Login needed to get token.',addFail:'Failed: ',
+pleaseAdd:'No accounts. Add one above.',pasteCurl:'Paste cURL ...',
+modelCountSuffix:' model(s): ',acctAddFail:'Add failed: ',unknownErr:'Unknown error',
+cleanupBtnDoing:'Cleaning...',unknown:'Unknown'}};
+function _(k){return (_I[_lang]||_I.zh)[k]||k}
+function toggleLang(){_lang=_lang==='zh'?'en':'zh';localStorage.setItem('ds_lang',_lang);Q('langBtn').textContent=_lang==='zh'?'🌐 EN':'🌐 中';applyI18n()}
+function applyI18n(){
+Qs('[data-i18n]').forEach(function(el){var k=el.getAttribute('data-i18n');if(k){el.textContent=_(k)}});
+Qs('[data-i18n-ph]').forEach(function(el){var k=el.getAttribute('data-i18n-ph');if(k){el.placeholder=_(k)}});
+Qs('[data-i18n-val]').forEach(function(el){var k=el.getAttribute('data-i18n-val');if(k){el.value=_(k)}});
+Qs('[data-i18n-confirm]').forEach(function(el){el.setAttribute('data-i18n-confirm-msg',_(el.getAttribute('data-i18n-confirm')))});
+// Update tab texts
+var tabs=document.querySelectorAll('.tab');var tkeys=['phoneLogin','emailLogin','usage','accounts'];
+for(var i=0;i<4&&i<tabs.length;i++){if(tabs[i]!==Q('langBtn'))tabs[i].textContent=_(tkeys[i])}
+loadUsage();loadAccounts();cs();
+}
+function Qs(s){return document.querySelectorAll(s)}
+document.addEventListener('DOMContentLoaded',function(){Q('langBtn').textContent=_lang==='zh'?'🌐 EN':'🌐 中';applyI18n()});
 function Q(id){return document.getElementById(id)}
 function switchTab(type){
 var ti={'phone':0,'email':1,'usage':2,'accounts':3};
@@ -1701,58 +1790,58 @@ if(type==='accounts')loadAccounts();
 }
 async function cs(){
 try{const r=await fetch('/api/config');const d=await r.json()
-if(d.configured){Q('s').className='s ok';Q('sd').className='d dg';Q('st').textContent='已配置 | '+d.masked}
-else{Q('s').className='s no';Q('sd').className='d dy';Q('st').textContent=d.error||'等待配置'}
-}catch(e){Q('s').className='s err';Q('st').textContent='连接失败'}
+if(d.configured){Q('s').className='s ok';Q('sd').className='d dg';Q('st').textContent=_('configured')+' | '+d.masked}
+else{Q('s').className='s no';Q('sd').className='d dy';Q('st').textContent=d.error||_('waitingCfg')}
+}catch(e){Q('s').className='s err';Q('st').textContent=_('connFail')}
 }
 async function doLogin(type){
 let body={}
 if(type==='phone'){
 const m=Q('mobile').value.trim();const p=Q('pw1').value;const a=Q('area_code').value.trim()
-if(!m||!p){t('请输入手机号和密码',1);return}
+if(!m||!p){t(_('phoneRequired'),1);return}
 body={mobile:m,password:p,area_code:a,login_type:'phone'}
 var btn=Q('btn1')
 }else{
 const e=Q('email').value.trim();const p=Q('pw2').value
-if(!e||!p){t('请输入邮箱和密码',1);return}
+if(!e||!p){t(_('emailRequired'),1);return}
 body={email:e,password:p,login_type:'email'}
 var btn=Q('btn2')
 }
-btn.disabled=true;btn.textContent='登录中...'
-Q('info').style.display='block';Q('info').innerHTML='正在登录 DeepSeek...'
+btn.disabled=true;btn.textContent=_('loginBtnDoing')
+Q('info').style.display='block';Q('info').innerHTML=_('loggingDS')
 try{
 const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
 const d=await r.json()
-if(d.ok){Q('info').innerHTML='登录成功 | Token: '+d.masked+' | Session: '+d.session_id;t('登录成功');cs()}
-else{Q('info').innerHTML='失败: '+d.error;t(d.error,1)}
-}catch(e){Q('info').innerHTML='错误: '+e.message;t(e.message,1)}
-btn.disabled=false;btn.textContent='登录'
+if(d.ok){Q('info').innerHTML=_('loginOk')+' | Token: '+d.masked+' | Session: '+d.session_id;t(_('loginOk'));cs()}
+else{Q('info').innerHTML=_('loginFail')+d.error;t(d.error,1)}
+}catch(e){Q('info').innerHTML=_('error')+e.message;t(e.message,1)}
+btn.disabled=false;btn.textContent=_('loginBtn')
 }
 function toggleCurl(){const b=Q('curlBox');b.style.display=b.style.display==='block'?'none':'block'}
 async function saveCurl(){
-const c=Q('curl').value.trim();if(!c){t('请先粘贴 cURL',1);return}
-const b=Q('btn3');b.disabled=true;b.textContent='保存中...'
-Q('info').style.display='block';Q('info').innerHTML='解析中...'
+const c=Q('curl').value.trim();if(!c){t(_('pasteCurl'),1);return}
+const b=Q('btn3');b.disabled=true;b.textContent=_('saveCurlBtn')+'...'
+Q('info').style.display='block';Q('info').innerHTML=_('parsing')
 try{
 const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({curl:c})})
 const d=await r.json()
-if(d.ok){Q('info').innerHTML='OK | '+d.masked+' | Session '+d.session_id;t('已保存');cs()}
-else{Q('info').innerHTML='失败: '+d.error;t(d.error,1)}
-}catch(e){Q('info').innerHTML='错误: '+e.message;t(e.message,1)}
-b.disabled=false;b.textContent='保存 cURL'
+if(d.ok){Q('info').innerHTML='OK | '+d.masked+' | Session '+d.session_id;t(_('saved'));cs()}
+else{Q('info').innerHTML=_('loginFail')+d.error;t(d.error,1)}
+}catch(e){Q('info').innerHTML=_('error')+e.message;t(e.message,1)}
+b.disabled=false;b.textContent=_('saveCurlBtn')
 }
 function cp(el){navigator.clipboard.writeText(el.textContent);t('已复制')}
 function t(m,e){const x=Q('toast');x.textContent=m;x.className='toast t'+(e?'e':'s');setTimeout(()=>x.className='toast',2500)}
 async function refreshModels(){
 const btn=Q('refreshBtn');const info=Q('modelsInfo')
-btn.disabled=true;btn.textContent='刷新中...';info.style.display='none'
+btn.disabled=true;btn.textContent=_('refreshingModels');info.style.display='none'
 try{
 const r=await fetch('/v1/models/refresh',{method:'POST'})
 const d=await r.json()
 const names=d.data.map(m=>m.id).join(', ')
-info.style.display='block';info.innerHTML='✅ 发现 '+d.data.length+' 个模型: '+names;t('刷新成功')
-}catch(e){info.style.display='block';info.innerHTML='❌ 失败: '+e.message;t('刷新失败',1)}
-btn.disabled=false;btn.textContent='🔄 刷新模型列表'
+info.style.display='block';info.innerHTML=_('foundModels')+' '+d.data.length+_('modelCountSuffix')+names;t(_('refreshOk'))
+}catch(e){info.style.display='block';info.innerHTML='❌ '+_('refreshFail')+': '+e.message;t(_('refreshFail'),1)}
+btn.disabled=false;btn.textContent=_('refreshModels')
 }
 // === 账号管理 ===
 async function loadAccounts(){
@@ -1760,72 +1849,72 @@ try{
 const r=await fetch('/api/accounts');const d=await r.json();
 var h='';
 if(d.accounts&&d.accounts.length>0){
-Q('acctStat').innerHTML='共 '+d.total+' 个账号，'+d.valid+' 个有效';
-h+='<table class="acct-tbl"><tr><th>账号</th><th>状态</th><th>Token</th><th>登录时间</th><th>操作</th></tr>';
+Q('acctStat').innerHTML=_('acctCount')+d.total+_('acctCount2')+d.valid+_('acctCount3');
+h+='<table class="acct-tbl"><tr><th>'+_('accountHeader')+'</th><th>'+_('statusHeader')+'</th><th>'+_('tokenHeader')+'</th><th>'+_('loginTimeHeader')+'</th><th>'+_('opHeader')+'</th></tr>';
 for(var a of d.accounts){
 var st=a.is_valid?'ok':'no';
-var stT=a.is_valid?'有效':'未登录';
+var stT=a.is_valid?_('valid'):_('notLogin');
 var l=encodeURIComponent(a.account_label);
 h+='<tr><td>'+a.account_label+'</td><td><span class="acct-st '+st+'"></span>'+stT+'</td><td>'+(a.token_masked||'***')+'</td><td>'+(a.login_time||'-')+'</td>';
-h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">重登</button><br><button class="acct-btn rm" onclick="removeAccount('${l}')">删除</button></td>`;
+h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">`+_('reloginBtn')+`</button><br><button class="acct-btn rm" onclick="removeAccount('${l}')">`+_('deleteBtn')+`</button></td>`;
 }
 h+='</table>';
-}else{h='<div class="acct-empty">暂无账号，请在上方添加</div>'}
+}else{h='<div class="acct-empty">'+_('noAccounts')+'</div>'}
 Q('acctList').innerHTML=h;
-}catch(e){Q('acctList').innerHTML='<div class="acct-empty">加载失败: '+e.message+'</div>'}
+}catch(e){Q('acctList').innerHTML='<div class="acct-empty">'+_('loadFail')+e.message+'</div>'}
 }
 async function addAccount(){
 var phone=Q('acctPhone').value.trim();
 var code=Q('acctCode').value.trim()||'+86';
 var pw=Q('acctPw').value;
-if(!phone||!pw){t('请输入手机号和密码',1);return}
+if(!phone||!pw){t(_('phoneRequired'),1);return}
 try{
 var r=await fetch('/api/accounts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mobile:phone,area_code:code,password:pw,login_type:'phone'})});
 var d=await r.json();
-if(d.ok){t('已添加，需登录获取token');Q('acctPhone').value='';Q('acctPw').value='';loadAccounts()}
-else{t('失败: '+(d.error||'未知错误'),1)}
-}catch(e){t('添加失败: '+e.message,1)}
+if(d.ok){t(_('addOk'));Q('acctPhone').value='';Q('acctPw').value='';loadAccounts()}
+else{t(_('addFail')+(d.error||_('unknownErr')),1)}
+}catch(e){t(_('acctAddFail')+e.message,1)}
 }
 async function removeAccount(label){
-if(!confirm('确定删除账号 '+decodeURIComponent(label)+'？'))return;
+if(!confirm(_('deleteConfirm')+' '+decodeURIComponent(label)+'？'))return;
 try{
 var r=await fetch('/api/accounts/'+label,{method:'DELETE'});
 var d=await r.json();
-if(d.ok){t('已删除');loadAccounts()}
-else{t('删除失败: '+(d.error||'未知错误'),1)}
-}catch(e){t('删除失败: '+e.message,1)}
+if(d.ok){t(_('deleted'));loadAccounts()}
+else{t(_('deleteFail')+(d.error||_('unknownErr')),1)}
+}catch(e){t(_('deleteFail')+e.message,1)}
 }
 async function reloginAccount(label){
 var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='...'}
 try{
 var r=await fetch('/api/accounts/'+label+'/relogin',{method:'POST'});
 var d=await r.json();
-if(d.ok){t('重新登录成功');loadAccounts()}
-else{t('重登失败: '+(d.error||'未知错误'),1)}
-}catch(e){t('重登失败: '+e.message,1)}
-if(btn){btn.disabled=false;btn.textContent='重登'}
+if(d.ok){t(_('reloginOk'));loadAccounts()}
+else{t(_('reloginFail')+(d.error||_('unknownErr')),1)}
+}catch(e){t(_('reloginFail')+e.message,1)}
+if(btn){btn.disabled=false;btn.textContent=_('reloginBtn')}
 }
 async function reloginAll(){
-var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='登录中...'}
+var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent=_('allRelogining')}
 try{
 var r=await fetch('/api/accounts/relogin-all',{method:'POST'});
 var d=await r.json();
 if(d.results){
 var ok=d.results.filter(x=>x.ok).length;
-t('重登完成: '+ok+'/'+d.total+' 成功');
+t(_('allReloginDone')+' '+ok+'/'+d.total+' '+(ok===d.total?_('loginOk'):''));
 loadAccounts();
-}else{t('失败: '+(d.error||'未知'),1)}
-}catch(e){t('重登失败: '+e.message,1)}
-if(btn){btn.disabled=false;btn.textContent='全部重新登录'}
+}else{t(_('allReloginFail')+(d.error||_('unknown')),1)}
+}catch(e){t(_('allReloginFail')+e.message,1)}
+if(btn){btn.disabled=false;btn.textContent=_('reloginAllBtn')}
 }
 async function cleanupSessions(){
-var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='清理中...'}
+var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent=_('cleanupBtnDoing')}
 try{
 var r=await fetch('/api/cleanup',{method:'POST'});
 var d=await r.json();
-t(d.ok?d.msg:'清理失败: '+(d.msg||'未知'),d.ok?0:1)
-}catch(e){t('清理失败: '+e.message,1)}
-if(btn){btn.disabled=false;btn.textContent='清理过期会话'}
+t(d.ok?d.msg:_('cleanupFail')+(d.msg||_('unknown')),d.ok?0:1)
+}catch(e){t(_('cleanupFail')+e.message,1)}
+if(btn){btn.disabled=false;btn.textContent=_('cleanupSessionsBtn')}
 }
 // === 用量统计 ===
 var _up='total';
@@ -1835,12 +1924,12 @@ try{
 const r=await fetch('/api/usage');const d=await r.json();
 const p=d[_up]||d.total||{};const m=p.models||{};const t=p.total||{};
 const e=Object.entries(m).sort((a,b)=>b[1].total_tokens-a[1].total_tokens);
-if(!e.length&&!t.requests){Q('usageContent').innerHTML='<div class=ue>📊 暂无用量数据</div>';return}
-let h='<div class=us><table class=ut><thead><tr><th class=ml>模型</th><th>请求</th><th>输入</th><th>输出</th><th>总计</th></tr></thead><tbody>';
+if(!e.length&&!t.requests){Q('usageContent').innerHTML='<div class=ue>'+_('noData')+'</div>';return}
+let h='<div class=us><table class=ut><thead><tr><th class=ml>'+_('modelHeader')+'</th><th>'+_('reqHeader')+'</th><th>'+_('inputHeader')+'</th><th>'+_('outputHeader')+'</th><th>'+_('totalHeader')+'</th></tr></thead><tbody>';
 for(const[k,v]of e){h+=`<tr><td class=ml>${k}</td><td>${f(v.requests)}</td><td>${f(v.prompt_tokens)}</td><td>${f(v.completion_tokens)}</td><td>${f(v.total_tokens)}</td></tr>`}
-h+=`<tr class=tr><td class=ml>📋 合计</td><td>${f(t.requests)}</td><td>${f(t.prompt_tokens)}</td><td>${f(t.completion_tokens)}</td><td>${f(t.total_tokens)}</td></tr></tbody></table></div>`;
+h+=`<tr class=tr><td class=ml>`+_('sumLabel')+`</td><td>${f(t.requests)}</td><td>${f(t.prompt_tokens)}</td><td>${f(t.completion_tokens)}</td><td>${f(t.total_tokens)}</td></tr></tbody></table></div>`;
 Q('usageContent').innerHTML=h
-}catch(e){Q('usageContent').innerHTML='<div class=ue>加载失败: '+e.message+'</div>'}
+}catch(e){Q('usageContent').innerHTML='<div class=ue>'+_('loadFail')+e.message+'</div>'}
 }
 function switchPeriod(p){
 _up=p;
@@ -1848,8 +1937,8 @@ _up=p;
 loadUsage()
 }
 async function clearUsage(){
-if(!confirm('确定清空全部用量数据？'))return;
-try{await fetch('/api/usage',{method:'DELETE'});t('已清空');loadUsage()}catch(e){t('清空失败',1)}
+if(!confirm(_('clearConfirm')))return;
+try{await fetch('/api/usage',{method:'DELETE'});t(_('cleared'));loadUsage()}catch(e){t(_('clearFail'),1)}
 }
 cs()
 </script>

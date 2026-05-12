@@ -4,9 +4,11 @@
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![FastAPI](https://img.shields.io/badge/FastAPI-teal)](https://fastapi.tiangolo.com/)
 
-Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-compatible API** for pure chat usage. No tool calling — clean context, better output quality.
+Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-compatible API**. Features dynamic model discovery, automatic PoW solving, token refresh, and tool calling support.
 
 本项目所修改代码均为ai完成，不含任何一句人工代码，望周知！
+
+> 📖 [中文版本](README.md)
 
 [zhangjiabo522](https://github.com/zhangjiabo522) — Thanks for providing model tokens for Vision feature testing!
 
@@ -150,6 +152,9 @@ The `no-tools` branch removes all tool calling logic and DSML prompt injection, 
 | `app/anthropic.py` | Anthropic Messages API format conversion |
 | `app/anthropic_routes.py` | Anthropic API endpoints |
 | `app/batch.py` | Batch processing & message storage |
+| `tool_call.py` | Tool calling aggregation |
+| `tool_dsml.py` | DSML parser for tool calls |
+| `tool_sieve.py` | Streaming tool call sieve |
 | `pow_native.py` | Pure Python PoW solver |
 | `session_store.py` | Session & token tracking |
 | `usage_store.py` | Usage statistics persistence |

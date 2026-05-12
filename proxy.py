@@ -1629,7 +1629,7 @@ a{color:#7dd3fc}
 <div style="position:absolute;top:32px;right:32px">
 <button onclick="toggleLang()" id="langBtn" style="padding:6px 14px;background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;cursor:pointer;font-size:13px;transition:all .2s">🌐 EN</button>
 </div>
-<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st">等待配置</span></div>
+<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st" data-i18n="waitingCfg">等待配置</span></div>
 
 <div class="tab-bar">
 <div class="tab active" onclick="switchTab('phone')">手机号登录</div>
@@ -1672,7 +1672,7 @@ a{color:#7dd3fc}
 </div>
 </div>
 <div class="step" style="margin-top:16px">
-<button class="btn" style="background:#334155;color:#e2e8f0;width:100%;font-size:13px" onclick="refreshModels()" id="refreshBtn">🔄 刷新模型列表</button>
+<button class="btn" style="background:#334155;color:#e2e8f0;width:100%;font-size:13px" onclick="refreshModels()" id="refreshBtn" data-i18n="refreshModels">🔄 刷新模型列表</button>
 <div id="modelsInfo" style="margin-top:8px;font-size:12px;color:#64748b;display:none"></div>
 </div>
 </div>

@@ -1637,7 +1637,6 @@ a{color:#7dd3fc}
 <div class="tab" onclick="switchTab('usage')">用量统计</div>
 <div class="tab" onclick="switchTab('accounts')">账号管理</div>
 </div>
-</div>
 
 <div id="phonePanel" class="panel active">
 <div class="row">

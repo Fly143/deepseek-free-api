@@ -34,6 +34,7 @@
   - [流式对话](#3-流式对话)
   - [模型刷新](#7-模型刷新)
 - [Anthropic Messages API](#6-anthropic-messages-api)
+- [Responses API](#5-responses-apiopenai-兼容)
 - [模型系统](#模型系统)
   - [动态模型发现](#动态模型发现)
   - [当前可用模型](#当前可用模型)
@@ -134,6 +135,12 @@ chmod +x deploy.sh
 ```
 
 部署完成后访问：**http://localhost:8000/admin**
+
+### Docker 部署
+
+```bash
+docker run -d -p 8000:8000 -v $(pwd)/config.json:/app/config.json ghcr.io/fly143/deepseek-free-api:latest
+```
 
 > 💡 **不需要工具调用？** 克隆 [`no-tools` 分支](https://github.com/Fly143/deepseek-free-api/tree/no-tools) 即可获得更干净的纯对话版本（无 prompt 注入，输出质量更高）。
 
@@ -384,7 +391,7 @@ curl http://localhost:8000/v1/messages \
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| POST | `/v1/messages` | 发送消息（文本/思考链） |
+| POST | `/v1/messages` | 发送消息（文本/思考链/工具调用） |
 | POST | `/v1/messages/count_tokens` | 计算 token 数 |
 | GET | `/v1/messages/{id}` | 查询已发送的消息 |
 | POST | `/v1/messages/batches` | 创建批量请求 |
@@ -393,6 +400,8 @@ curl http://localhost:8000/v1/messages \
 | POST | `.../cancel` | 取消批量 |
 | GET | `.../results` | 下载批量结果 |
 | DELETE | `/v1/messages/batches/{id}` | 删除批量 |
+
+> **注意：** no-tools 分支的 `/v1/messages` 端点**不支持** `tools` 参数，纯对话场景使用更简洁。
 
 #### Anthropic 模型名映射
 
@@ -482,13 +491,71 @@ def _discover_models():
 
 | 分支 | 特点 |
 |------|------|
-| `no-tools`（当前分支） | 纯对话代理 — 无工具调用 prompt 注入，输出更干净。适合写作、翻译、代码生成等场景 |
-| `main` | 完整功能版 — 支持 DSML 工具调用、流式筛分、会话管理等。需要工具调用时使用 |
+| `main`（当前分支） | 完整功能版 — 支持 DSML 工具调用、流式筛分、会话管理等。需要工具调用时使用 |
+| `no-tools` | 纯对话代理 — 无工具调用 prompt 注入，输出更干净。适合写作、翻译、代码生成等场景 |
 
-> 当前你正在使用 `no-tools` 分支。如需工具调用功能，请切换到 `main` 分支：
+> 当前你正在使用 `main` 分支。如需纯对话版本（无工具调用），请切换到 `no-tools` 分支：
 > ```bash
-> git checkout main
+> git checkout no-tools
 > ```
+
+
+## 工具调用详解
+
+DeepSeek 网页端**不支持** OpenAI function calling 格式。本代理通过 **DSML 提示词注入 + 多策略提取**实现工具调用：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-dsapi" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [{"role": "user", "content": "北京天气怎么样？"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取天气信息",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+```
+
+### DSML 提示词注入
+
+将 OpenAI tools 定义转换为 DSML 格式，注入到 system 消息中：
+
+```xml
+<|DSML|tool_calls>
+  <|DSML|invoke name="search_file">
+    <|DSML|parameter name="query"><![CDATA[config.yaml]]></|DSML|parameter>
+  </|DSML|invoke>
+</|DSML|tool_calls>
+```
+
+### 提取策略
+
+| 优先级 | 格式 | 说明 |
+|--------|------|------|
+| DSML | `<\|DSML\|tool_calls><\|DSML\|invoke name="X">...</\|DSML\|invoke></\|DSML\|tool_calls>` | 主力格式，7 种噪声变体容错 |
+| TOOL_CALL | `TOOL_CALL: name(key=value)` | 旧格式兜底 |
+| JSON | `{"name":"x","arguments":{...}}` | JSON 块解析 |
+| XML | `<tool_call><function=NAME>...</function></tool_call>` | 原生 XML |
+| 混合 | `<function_call>{...}</function_call>` | XML+JSON |
+
+### 容错能力
+
+- **噪声容错** — 支持缺管道、重复 `<`、全宽 `｜`、连字符 `dsml-` 等 7 种变体
+- **围栏代码块** — 自动跳过 markdown 代码块内的 DSML 示例
+- **JSON 修复** — 未加引号 key、缺失数组括号自动修复
+- **CDATA 保护** — content/command/prompt 等参数保留原始字符串
+- **缺失开标签** — 有关闭标签无开头时自动补回
+
 
 ## PoW 求解机制
 

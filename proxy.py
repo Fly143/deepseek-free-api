@@ -19,18 +19,6 @@ def _count_tokens(text: str) -> int:
 # ── 用量统计 ───────────────────────────────────
 from usage_store import add_usage, get_usage, clear_usage
 
-# ── 工具调用处理模块 ─────────────────────────────────
-from tool_call import (
-    build_tool_prompt,
-    extract_tool_call,
-    get_tool_names,
-    convert_messages_for_deepseek,
-)
-
-# ── 流式筛分 + DSML 解析 ────────────────────────────
-from tool_sieve import StreamSieve, SieveEvent
-from tool_dsml import parse_dsml_tool_calls as _parse_dsml
-
 # ── PoW (Proof of Work) Solver — 纯 Python 实现（无 WASM 依赖）────────
 from pow_native import DeepSeekPOW
 
@@ -1107,6 +1095,65 @@ def _parse_image_url(url_or_data: str) -> dict | None:
 
 
 
+
+
+# ── 消息格式转换 ──────────────────────────────────────────
+
+def _convert_messages(messages):
+    """将 OpenAI 消息列表转换为 DeepSeek 原生 prompt 格式（无工具版本）。"""
+    BOS = "<｜begin▁of▁sentence｜>"
+    SYS = "<｜System｜>"
+    USER = "<｜User｜>"
+    ASST = "<｜Assistant｜>"
+    TOOL = "<｜Tool｜>"
+    EOS = "<｜end▁of▁sentence｜>"
+    TOOL_END = "<｜end▁of▁toolresults｜>"
+    SYS_END = "<｜end▁of▁instructions｜>"
+
+    parts = [BOS]
+    last_role = ""
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        if role == "system":
+            text = str(content) if content else ""
+            if text.strip():
+                parts.append(SYS + text + SYS_END)
+            last_role = "system"
+        elif role == "user":
+            if isinstance(content, list):
+                text = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            else:
+                text = str(content)
+            parts.append(USER + text)
+            last_role = "user"
+        elif role == "assistant":
+            segs = []
+            reasoning = msg.get("reasoning_content", "")
+            if reasoning:
+                segs.append(reasoning)
+            if content and str(content).strip():
+                segs.append(str(content).strip())
+            if segs:
+                parts.append(ASST + "\n\n".join(segs) + EOS)
+            elif content:
+                parts.append(ASST + str(content) + EOS)
+            last_role = "assistant"
+        elif role == "tool":
+            result = str(content) if content else ""
+            if result:
+                parts.append(TOOL + result[:500] + TOOL_END)
+            last_role = "tool"
+
+    if last_role != "assistant":
+        parts.append(ASST)
+    return "".join(parts)
+
+
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     if not CONFIG_FILE.exists():
@@ -1191,21 +1238,9 @@ async def chat(request: Request):
         except Exception as e:
             _vlog(f"fresh session failed: {e}")
 
-    # 构建 prompt：使用 convert_messages_for_deepseek 处理完整多轮对话
-    prompt = convert_messages_for_deepseek(messages, tools)
+    prompt = _convert_messages(messages)
     prompt_tokens = _count_tokens(prompt)
-
-    # 如果有 tools 定义，将工具提示词注入到最后一个 USER 标记之前
-    tool_prompt = build_tool_prompt(tools) if tools else ""
-    if tool_prompt:
-        # 原生格式：找最后一个 <｜User｜>
-        last_user_idx = prompt.rfind("<｜User｜>")
-        if last_user_idx != -1:
-            prompt = prompt[:last_user_idx] + tool_prompt + "\n" + prompt[last_user_idx:]
-        else:
-            prompt = tool_prompt + "\n" + prompt
-
-    has_tools = bool(tools)
+    has_tools = False
 
     # Try streaming for all models including vision with images.
     # Old issue: vision stream put everything in thinking_content, but the new
@@ -1503,104 +1538,6 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 yield "data: [DONE]\n\n"
                 return
 
-            if has_tools:
-                # 输出 tool_calls SSE 事件的辅助函数
-                def _emit_tool_calls(tc_result, _cid, _created, _model):
-                    if tc_result:
-                        for i, tc in enumerate(tc_result):
-                            delta = {"role": "assistant", "content": None,
-                                     "tool_calls": [{"index": i, "id": tc["id"], "type": "function",
-                                                     "function": {"name": tc["function"]["name"], "arguments": ""}}]}
-                            r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
-                                 "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                            args = tc["function"]["arguments"]
-                            r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
-                                 "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": args}}]}, "finish_reason": None}]}
-                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                        r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
-                             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
-                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    else:
-                        r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
-                             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-
-                # 流式筛分 + 并行缓冲：筛分实时播正文，同时攒完整内容做 fallback
-                def _parse_fn(text):
-                    return extract_tool_call(text, get_tool_names(tools) if tools else [])
-
-                sieve = StreamSieve(parse_fn=_parse_fn)
-                _role_sent = False
-                _full_buf = ""  # 并行缓冲完整内容，flush 时 fallback 解析
-
-                for etype, val in _parse_sse(resp):
-                    if etype == "content":
-                        _full_buf += val
-                        for evt in sieve.feed(val):
-                            if evt.type == "text":
-                                if isinstance(evt.data, str) and evt.data:
-                                    if not _role_sent:
-                                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
-                                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                                        _role_sent = True
-                                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                         "choices": [{"index": 0, "delta": {"content": evt.data}, "finish_reason": None}]}
-                                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    elif etype == "thinking":
-                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                             "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
-                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    elif etype == "error":
-                        yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
-                        yield "data: [DONE]\n\n"
-                        return
-                    elif etype == "done":
-                        break
-
-                # Flush + fallback：筛分没抓到就用全量解析
-                _had_tool_calls = False
-                for evt in sieve.flush():
-                    if evt.type == "text":
-                        if isinstance(evt.data, str) and evt.data:
-                            if not _role_sent:
-                                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
-                                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                                _role_sent = True
-                            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                 "choices": [{"index": 0, "delta": {"content": evt.data}, "finish_reason": None}]}
-                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    elif evt.type == "tool_calls":
-                        _had_tool_calls = True
-                        for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
-                            yield chunk
-
-                # Fallback: 筛分没抓到，用全量缓冲重试
-                if not _had_tool_calls and _full_buf:
-                    tc_result, _ = extract_tool_call(_full_buf, get_tool_names(tools) if tools else [])
-                    if tc_result:
-                        if not _role_sent:
-                            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
-                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                            _role_sent = True
-                        _had_tool_calls = True
-                        for chunk in _emit_tool_calls(tc_result, chat_id, created, model):
-                            yield chunk
-
-                if not _role_sent:
-                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                elif not _had_tool_calls:
-                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                yield "data: [DONE]\n\n"
-                return
-
             # No tools: normal streaming
             _stream_think_count = 0
             _stream_content_count = 0
@@ -1701,22 +1638,12 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             _vlog(f"NONSTREAM_THINKING[:500]: {full_thinking[:500]}")
             _vlog(f"NONSTREAM_CONTENT[:500]: {full_content[:500]}")
 
-        # 如果有 tools，检查 content 中是否包含 tool_call 标签
         finish_reason = "stop"
-        tc_result = None
         final_content = full_content
-        if has_tools:
-            tc_result, final_content = extract_tool_call(full_content, get_tool_names(tools) if tools else None)
-            if tc_result:
-                finish_reason = "tool_calls"
 
         msg = {"role": "assistant", "content": final_content}
         if full_thinking:
             msg["reasoning_content"] = full_thinking
-        if tc_result:
-            msg["tool_calls"] = tc_result
-            if final_content is None:
-                msg["content"] = None
 
         # Build and validate response — pre-serialize to catch any issues early
         response_body = {

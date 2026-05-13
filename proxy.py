@@ -527,7 +527,7 @@ async def deepseek_login(data: dict):
 
         raw_text = (login_resp.text or "").strip()
         if not raw_text:
-            return {"ok": False, "error": f"登录失败: 服务器返回空响应 (HTTP {login_resp.status_code})，可能是 IP 被风控"}
+            return {"ok": False, "error": f"登录失败: 服务器返回空响应 (HTTP {login_resp.status_code})，可能是 IP 被风控或需要完成人机验证"}
 
         try:
             login_data = login_resp.json()
@@ -817,7 +817,6 @@ def relogin(cfg: dict) -> dict | None:
             headers=DS_HEADERS,
             timeout=30,
         )
-
         # WAF 检测
         if login_resp.status_code == 202 and login_resp.headers.get("x-amzn-waf-action"):
             print(f"[Token] 自动登录被 AWS WAF 拦截 (HTTP 202)")

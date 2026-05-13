@@ -36,6 +36,7 @@ Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-comp
 - [Model System](#model-system)
   - [Dynamic Model Discovery](#dynamic-model-discovery)
   - [Currently Available Models](#currently-available-models)
+- [Tool Calling](#tool-calling)
 - [Branch Info](#branch-info)
 - [PoW Solver](#pow-solver)
 - [Token Auto-Refresh](#token-auto-refresh)
@@ -75,13 +76,19 @@ Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-comp
 ┌──────────────────────────────────────────────────────────┐
 │             DeepSeek Free API Proxy (FastAPI)              │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
-│  │ Routes  │  │ PoW Solver   │  │   Token Refresh     │ │
-│  │ /v1/*   │──│ (Node+Python)│──│ (auto-relogin)      │ │
-│  └─────────┘  └──────────────┘  └──────────────────────┘ │
+│  │ Routes  │  │  tool_call   │  │  tool_sieve │ tool_dsml │ │
+│  │ /v1/*   │──│ (DSML prompt)│──│ (streaming  │ (DSML     │ │
+│  └─────────┘  │ injection)   │  │ sieve)     │  parser)  │ │
+│               └──────────────┘  └──────────────────────┘ │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
-│  │ Model   │  │   curl_cffi  │  │   Vision / Files    │ │
-│  │ Disc.   │  │ (Chrome TLS) │  │ (upload→fork→wait)  │ │
+│  │ Model   │  │ PoW Solver   │  │   Token Refresh     │ │
+│  │ Disc.   │  │ (Node+Python)│  │ (auto-relogin)      │ │
 │  └─────────┘  └──────────────┘  └──────────────────────┘ │
+│  ┌─────────┐  ┌──────────────┐                            │
+│  │ curl    │  │ Vision/Files │                            │
+│  │ (Chrome │  │ (upload→fork │                            │
+│  │  TLS)   │  │  →wait)      │                            │
+│  └─────────┘  └──────────────┘                            │
 └───────────────┬──────────────────────────────────────────┘
                 │  HTTPS (curl_cffi, Chrome fingerprint)
                 ▼
@@ -127,6 +134,12 @@ chmod +x deploy.sh
 ```
 
 After deployment, visit: **http://localhost:8000/admin**
+
+### Docker
+
+```bash
+docker run -d -p 8000:8000 -v $(pwd)/config.json:/app/config.json ghcr.io/fly143/deepseek-free-api:latest
+```
 
 > 💡 **No tools needed?** Clone the [`no-tools` branch](https://github.com/Fly143/deepseek-free-api/tree/no-tools) for a cleaner pure chat edition (no prompt injection, higher output quality).
 
@@ -469,16 +482,72 @@ The model list **changes dynamically with DeepSeek**. Currently 3 base models ×
 > - All models explicitly set `model_type` (`default` / `expert` / `vision`) to ensure correct DeepSeek routing
 > - Model names are English-only IDs; Chinese names are in the table above
 
+## Tool Calling
+
+DeepSeek's web UI **does not** support OpenAI function calling format. This proxy implements tool calling via **DSML prompt injection + multi-strategy extraction**:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-dsapi" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get weather information",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+```
+
+### DSML Prompt Injection
+
+OpenAI tools definitions are converted to DSML format and injected into the system message:
+
+```xml
+<|DSML|tool_calls>
+  <|DSML|invoke name="search_file">
+    <|DSML|parameter name="query"><![CDATA[config.yaml]]></|DSML|parameter>
+  </|DSML|invoke>
+</|DSML|tool_calls>
+```
+
+### Extraction Strategies
+
+| Priority | Format | Description |
+|----------|--------|-------------|
+| DSML | `<\|DSML\|tool_calls><\|DSML\|invoke name="X">...</\|DSML\|invoke></\|DSML\|tool_calls>` | Primary format, 7 noise variant tolerances |
+| TOOL_CALL | `TOOL_CALL: name(key=value)` | Legacy format fallback |
+| JSON | `{"name":"x","arguments":{...}}` | JSON block parsing |
+| XML | `<tool_call><function=NAME>...</function></tool_call>` | Native XML |
+| Mixed | `<function_call>{...}</function_call>` | XML+JSON |
+
+### Fault Tolerance
+
+- **Noise tolerance** — Supports missing pipes, duplicate `<`, fullwidth `｜`, hyphen `dsml-`, and 5 other variants
+- **Fenced code blocks** — Automatically skips DSML examples inside markdown code blocks
+- **JSON repair** — Auto-fixes unquoted keys, missing array brackets
+- **CDATA protection** — content/command/prompt parameters retain original strings
+- **Missing open tags** — Auto-restores `<|DSML|tool_calls>` wrapper when only closing tag is present
+
 ## Branch Info
 
 This repository provides two branches:
 
 | Branch | Characteristics |
 |--------|----------------|
-| `no-tools` (current) | Pure chat proxy — no tool call prompt injection, cleaner output. Ideal for writing, translation, code generation, etc. |
-| `main` | Full-featured — supports DSML tool calling, streaming sieve, session management, etc. Use when tool calling is needed |
+| `main` (current) | Full-featured — supports DSML tool calling, streaming sieve, session management, etc. Use when tool calling is needed |
+| `no-tools` | Pure chat proxy — no tool call prompt injection, cleaner output. Ideal for writing, translation, code generation, etc. |
 
-> You are currently on the `no-tools` branch. For tool calling, switch to `main`:
+> You are currently on the `main` branch. For pure chat without tools, switch to `no-tools`:
 > ```bash
 > git checkout main
 > ```
@@ -558,6 +627,9 @@ curl http://localhost:8000/health
 ```
 ds-free-api/
 ├── proxy.py              # Main: FastAPI app, SSE parser, OpenAI endpoints, admin panel
+├── tool_call.py          # Tool calling aggregation (prompt injection, extraction)
+├── tool_dsml.py          # DSML parser (prefix stripping, CDATA, structured params)
+├── tool_sieve.py         # Streaming tool call sieve (real-time separation)
 ├── response_store.py     # Responses API local persistence (JSON file)
 ├── pow_native.py         # PoW solver: Node.js WASM primary + Python fallback
 ├── pow_solver.js         # Node.js PoW solve script (calls WASM)
@@ -680,6 +752,6 @@ MIT License
 **Reference projects:**
 - [NIyueeE/ds-free-api](https://github.com/NIyueeE/ds-free-api) — Rust original, provided the DeepSeek API reverse-engineering approach and PoW algorithm reference
 - [CJackHwang/ds2api](https://github.com/CJackHwang/ds2api) — DSML tool calling format, streaming sieve architecture, DeepSeek native dialogue markers
-- [GoblinHonest/mimo2api_mimoapi](https://github.com/GoblinHonest/mimo2api_mimoapi) — Session management (message fingerprint continuation, token overflow auto-clear) design reference
+- [GoblinHonest/mimo2api_mimoapi](https://github.com/GoblinHonest/mimo2api_mimoapi) — Session management design reference
 - [Acidmoon](https://github.com/Acidmoon) — Submitted PR #2, implementing the OpenAI Responses API compatibility layer
 - [xstjmark21-cmyk](https://github.com/xstjmark21-cmyk) — Provided model tokens for Vision feature testing

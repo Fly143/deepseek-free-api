@@ -8,7 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-RUN test -f config.json || cp config.example.json config.json
+RUN test -f config.json || (test -f token.example.json && cp token.example.json token.json || true)
 
 EXPOSE 8000
 

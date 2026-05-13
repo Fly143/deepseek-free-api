@@ -54,6 +54,7 @@ class ConfigManager:
         self.lock = threading.RLock()
         self.account_idx = 0
         self.accounts: List[DsAccount] = []
+        self._proxy_url: str = ""
         self.load()
 
     def _migrate_legacy(self):
@@ -119,6 +120,7 @@ class ConfigManager:
                                  if k in DsAccount.__dataclass_fields__})
                     for acc in data.get('accounts', [])
                 ]
+                self._proxy_url = data.get('proxy', '') or ''
         except Exception as e:
             print(f"[Config] 加载配置失败: {e}")
             self.accounts = []
@@ -130,6 +132,7 @@ class ConfigManager:
             try:
                 data = {
                     "accounts": [acc.to_save_dict() for acc in self.accounts],
+                    "proxy": self._proxy_url or "",
                 }
                 with open(self.config_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
@@ -204,6 +207,17 @@ class ConfigManager:
         """获取所有账号的摘要信息（无敏感字段）"""
         with self.lock:
             return [acc.to_dict() for acc in self.accounts]
+
+    def get_proxy(self) -> str:
+        """获取代理地址。返回空字符串表示未配置代理。"""
+        with self.lock:
+            return self._proxy_url or ""
+
+    def set_proxy(self, url: str):
+        """设置代理地址。传空字符串清除代理。"""
+        with self.lock:
+            self._proxy_url = (url or "").strip()
+            self.save()
 
     def get_token(self, label: str) -> str:
         """获取指定账号的 token。"""

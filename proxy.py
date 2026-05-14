@@ -106,7 +106,7 @@ ADMIN = """<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;justify-content:center;align-items:flex-start;padding-top:40px}
-.c{background:#1e293b;border-radius:16px;padding:32px;width:600px;max-width:95vw;border:1px solid #334155}
+.c{background:#1e293b;border-radius:16px;padding:32px;width:600px;max-width:95vw;border:1px solid #334155;position:relative}
 h1{font-size:22px;margin-bottom:20px}
 .s{display:flex;align-items:center;gap:8px;padding:12px 16px;border-radius:10px;margin-bottom:20px;font-size:14px}
 .ok{background:#064e3b;color:#6ee7b7}.no{background:#1e293b;color:#94a3b8}.err{background:#450a0a;color:#fca5a5}
@@ -160,50 +160,53 @@ a{color:#7dd3fc}
 <body>
 <div class="c">
 <h1>DeepSeek Proxy</h1>
-<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st">等待配置</span></div>
+<div style="position:absolute;top:32px;right:32px">
+<button onclick="toggleLang()" id="langBtn" style="padding:6px 14px;background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;cursor:pointer;font-size:13px;transition:all .2s">🌐 EN</button>
+</div>
+<div id="s" class="s no"><span id="sd" class="d dy"></span><span id="st" data-i18n="waitingCfg">等待配置</span></div>
 
 <div class="tab-bar">
-<div class="tab active" onclick="switchTab('phone')">手机号登录</div>
-<div class="tab" onclick="switchTab('email')">邮箱登录</div>
-<div class="tab" onclick="switchTab('usage')">用量统计</div>
-<div class="tab" onclick="switchTab('settings')">设置</div>
+<div class="tab active" onclick="switchTab('phone')" data-i18n="phoneLogin">手机号登录</div>
+<div class="tab" onclick="switchTab('email')" data-i18n="emailLogin">邮箱登录</div>
+<div class="tab" onclick="switchTab('usage')" data-i18n="usage">用量统计</div>
+<div class="tab" onclick="switchTab('settings')" data-i18n="settings">设置</div>
 </div>
 
 <div id="phonePanel" class="panel active">
 <div class="row">
 <input class="ac" type="tel" id="area_code" value="+86" placeholder="+86">
-<input class="ph" type="tel" id="mobile" placeholder="手机号" autocomplete="tel">
+<input class="ph" type="tel" id="mobile" data-i18n-ph="phonePlaceholder" placeholder="手机号" autocomplete="tel">
 </div>
-<div class="pw-row"><input type="password" id="pw1" placeholder="密码" autocomplete="current-password"></div>
-<button class="btn bp" id="btn1" onclick="doLogin('phone')">登录</button>
+<div class="pw-row"><input type="password" id="pw1" data-i18n-ph="pwdPlaceholder" placeholder="密码" autocomplete="current-password"></div>
+<button class="btn bp" id="btn1" onclick="doLogin('phone')" data-i18n="loginBtn">登录</button>
 </div>
 
 <div id="emailPanel" class="panel">
-<div class="pw-row"><input type="email" id="email" placeholder="邮箱地址" autocomplete="email"></div>
-<div class="pw-row"><input type="password" id="pw2" placeholder="密码" autocomplete="current-password"></div>
-<button class="btn bp" id="btn2" onclick="doLogin('email')">登录</button>
+<div class="pw-row"><input type="email" id="email" data-i18n-ph="emailPlaceholder" placeholder="邮箱地址" autocomplete="email"></div>
+<div class="pw-row"><input type="password" id="pw2" data-i18n-ph="pwdPlaceholder" placeholder="密码" autocomplete="current-password"></div>
+<button class="btn bp" id="btn2" onclick="doLogin('email')" data-i18n="loginBtn">登录</button>
 </div>
 
 <div class="info" id="info"></div>
 
 <div id="apiSection">
-<div class="collapse" onclick="toggleCurl()">高级: 手动粘贴 cURL ▾</div>
+<div class="collapse" onclick="toggleCurl()" data-i18n="advancedCurl">高级: 手动粘贴 cURL ▾</div>
 <div class="curl-box" id="curlBox">
-<textarea id="curl" placeholder="粘贴 cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px"></textarea>
-<button class="btn bp" id="btn3" onclick="saveCurl()" style="margin-top:8px">保存 cURL</button>
+<textarea id="curl" data-i18n-ph="pasteCurl" placeholder="粘贴 cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px"></textarea>
+<button class="btn bp" id="btn3" onclick="saveCurl()" data-i18n="saveCurlBtn" style="margin-top:8px">保存 cURL</button>
 </div>
 
 <hr>
 <div class="step">
-<div class="sl" style="font-weight:600;color:#e2e8f0;">API 配置</div>
+<div class="sl" style="font-weight:600;color:#e2e8f0;" data-i18n="apiConfig">API 配置</div>
 <div class="cfg">
-<div class="cr"><span>API 地址</span><code onclick="cp(this)">http://localhost:""" + str(PROXY_PORT) + """/v1</code></div>
-<div class="cr"><span>API Key</span><code onclick="cp(this)">任意填写</code></div>
+<div class="cr"><span data-i18n="apiAddr">API 地址</span><code onclick="cp(this)">http://localhost:""" + str(PROXY_PORT) + """/v1</code></div>
+<div class="cr"><span data-i18n="apiKey">API Key</span><code onclick="cp(this)" data-i18n="apiKeyVal">任意填写</code></div>
 
 </div>
 </div>
 <div class="step" style="margin-top:16px">
-<button class="btn" style="background:#334155;color:#e2e8f0;width:100%;font-size:13px" onclick="refreshModels()" id="refreshBtn">🔄 刷新模型列表</button>
+<button class="btn" style="background:#334155;color:#e2e8f0;width:100%;font-size:13px" onclick="refreshModels()" id="refreshBtn" data-i18n="refreshModels">🔄 刷新模型列表</button>
 <div id="modelsInfo" style="margin-top:8px;font-size:12px;color:#64748b;display:none"></div>
 </div>
 </div>
@@ -211,29 +214,73 @@ a{color:#7dd3fc}
 <div id="usagePanel" class="panel">
 <div id="usageContent"></div>
 <div style="margin-top:14px">
-<button class="pb ac" onclick="switchPeriod('total')" id="pbTotal">全部</button>
-<button class="pb" onclick="switchPeriod('week')" id="pbWeek">本周</button>
-<button class="pb" onclick="switchPeriod('today')" id="pbToday">今日</button>
-<button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:6px 12px;margin-left:8px" onclick="loadUsage()">刷新</button>
-<button class="btn" style="background:#7f1d1d;color:#fca5a5;font-size:12px;padding:6px 12px;margin-left:4px" onclick="clearUsage()">清空</button>
+<button class="pb ac" onclick="switchPeriod('total')" id="pbTotal" data-i18n="periodAll">全部</button>
+<button class="pb" onclick="switchPeriod('week')" id="pbWeek" data-i18n="periodWeek">本周</button>
+<button class="pb" onclick="switchPeriod('today')" id="pbToday" data-i18n="periodToday">今日</button>
+<button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:6px 12px;margin-left:8px" onclick="loadUsage()" data-i18n="refreshBtn">刷新</button>
+<button class="btn" style="background:#7f1d1d;color:#fca5a5;font-size:12px;padding:6px 12px;margin-left:4px" onclick="clearUsage()" data-i18n="clearBtn">清空</button>
 </div>
 </div>
 
 <div id="settingsPanel" class="panel">
-<div class="sl" style="font-weight:600;color:#e2e8f0;">代理配置</div>
+<div class="sl" style="font-weight:600;color:#e2e8f0;" data-i18n="proxyTitle">代理配置</div>
 <div class="cr" style="margin-top:12px">
-  <span style="color:#94a3b8;font-size:13px">绕过 AWS WAF 拦截。格式：http://127.0.0.1:7890 或 socks5://127.0.0.1:7891</span>
+  <span style="color:#94a3b8;font-size:13px" data-i18n="proxyHint">绕过 AWS WAF 拦截。格式：http://127.0.0.1:7890 或 socks5://127.0.0.1:7891</span>
 </div>
 <div class="pw-row" style="margin-top:12px">
   <input type="text" id="proxyUrl" placeholder="http://127.0.0.1:7890" style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-size:14px">
 </div>
-<button class="btn bp" onclick="saveProxy()" style="margin-top:8px">保存代理设置</button>
+<button class="btn bp" onclick="saveProxy()" data-i18n="proxySaveBtn" style="margin-top:8px">保存代理设置</button>
 <div id="proxyStatus" style="margin-top:8px;font-size:12px;color:#64748b"></div>
 </div>
 </div>
 
 <div id="toast" class="toast"></div>
 <script>
+// === i18n ===
+var _lang=localStorage.getItem('ds_lang')||'zh';
+var _I={
+zh:{phoneLogin:'手机号登录',emailLogin:'邮箱登录',usage:'用量统计',settings:'设置',
+phonePlaceholder:'手机号',pwdPlaceholder:'密码',loginBtn:'登录',loginBtnDoing:'登录中...',
+emailPlaceholder:'邮箱地址',waitingCfg:'等待配置',configured:'已配置',connFail:'连接失败',
+loggingDS:'正在登录 DeepSeek...',loginOk:'登录成功',loginFail:'失败:',
+error:'错误:',advancedCurl:'高级: 手动粘贴 cURL',saveCurlBtn:'保存 cURL',
+parsing:'解析中...',saved:'已保存',apiConfig:'API 配置',apiAddr:'API 地址',
+apiKey:'API Key',apiKeyVal:'任意填写',refreshModels:'🔄 刷新模型列表',
+refreshingModels:'刷新中...',foundModels:'✅ 发现',foundModelsSuffix:'个模型:',
+refreshOk:'刷新成功',refreshFail:'刷新失败',
+periodAll:'全部',periodWeek:'本周',periodToday:'今日',refreshBtn:'刷新',clearBtn:'清空',
+noData:'📊 暂无用量数据',loadFail:'加载失败: ',modelHeader:'模型',reqHeader:'请求',
+inputHeader:'输入',outputHeader:'输出',totalHeader:'总计',sumLabel:'📋 合计',
+clearConfirm:'确定清空全部用量数据？',cleared:'已清空',clearFail:'清空失败',
+proxyTitle:'代理配置',proxyHint:'绕过 AWS WAF 拦截。格式：http://127.0.0.1:7890 或 socks5://127.0.0.1:7891',proxySaveBtn:'保存代理设置',proxySaved:'已保存',proxySaveFail:'保存失败: ',proxyLoadFail:'加载失败: ',
+phoneRequired:'请输入手机号和密码',emailRequired:'请输入邮箱和密码',
+pasteCurl:'粘贴 cURL ...',modelCountSuffix:' 个模型: ',unknownErr:'未知错误'},
+en:{phoneLogin:'Phone Login',emailLogin:'Email Login',usage:'Usage',settings:'Settings',
+phonePlaceholder:'Phone Number',pwdPlaceholder:'Password',loginBtn:'Login',loginBtnDoing:'Logging in...',
+emailPlaceholder:'Email Address',waitingCfg:'Awaiting Config',configured:'Configured',connFail:'Connection Failed',
+loggingDS:'Logging into DeepSeek...',loginOk:'Login Successful',loginFail:'Failed:',
+error:'Error:',advancedCurl:'Advanced: Paste cURL',saveCurlBtn:'Save cURL',
+parsing:'Parsing...',saved:'Saved',apiConfig:'API Config',apiAddr:'API Endpoint',
+apiKey:'API Key',apiKeyVal:'Any value',refreshModels:'🔄 Refresh Models',
+refreshingModels:'Refreshing...',foundModels:'✅ Found',foundModelsSuffix:' model(s):',
+refreshOk:'Refreshed',refreshFail:'Refresh Failed',
+periodAll:'All',periodWeek:'This Week',periodToday:'Today',refreshBtn:'Refresh',clearBtn:'Clear',
+noData:'📊 No Usage Data',loadFail:'Load failed: ',modelHeader:'Model',reqHeader:'Requests',
+inputHeader:'Input',outputHeader:'Output',totalHeader:'Total',sumLabel:'📋 Total',
+clearConfirm:'Clear all usage data?',cleared:'Cleared',clearFail:'Clear Failed',
+proxyTitle:'Proxy Config',proxyHint:'Bypass AWS WAF. Format: http://127.0.0.1:7890 or socks5://127.0.0.1:7891',proxySaveBtn:'Save Proxy',proxySaved:'Saved',proxySaveFail:'Save failed: ',proxyLoadFail:'Load failed: ',
+phoneRequired:'Phone number and password required',emailRequired:'Email and password required',
+pasteCurl:'Paste cURL ...',modelCountSuffix:' model(s): ',unknownErr:'Unknown error'}};
+function _(k){return (_I[_lang]||_I.zh)[k]||k}
+function toggleLang(){_lang=_lang==='zh'?'en':'zh';localStorage.setItem('ds_lang',_lang);Q('langBtn').textContent=_lang==='zh'?'🌐 EN':'🌐 中';applyI18n()}
+function applyI18n(){
+Qs('[data-i18n]').forEach(function(el){var k=el.getAttribute('data-i18n');if(k){el.textContent=_(k)}});
+Qs('[data-i18n-ph]').forEach(function(el){var k=el.getAttribute('data-i18n-ph');if(k){el.placeholder=_(k)}});
+Qs('[data-i18n-val]').forEach(function(el){var k=el.getAttribute('data-i18n-val');if(k){el.value=_(k)}});
+loadUsage();cs();
+}
+function Qs(s){return document.querySelectorAll(s)}
 function Q(id){return document.getElementById(id)}
 function switchTab(type){
 var ti={'phone':0,'email':1,'usage':2,'settings':3};
@@ -248,58 +295,58 @@ if(type==='settings')loadProxy();
 }
 async function cs(){
 try{const r=await fetch('/api/config');const d=await r.json()
-if(d.configured){Q('s').className='s ok';Q('sd').className='d dg';Q('st').textContent='已配置 | '+d.masked}
-else{Q('s').className='s no';Q('sd').className='d dy';Q('st').textContent=d.error||'等待配置'}
-}catch(e){Q('s').className='s err';Q('st').textContent='连接失败'}
+if(d.configured){Q('s').className='s ok';Q('sd').className='d dg';Q('st').textContent=_('configured')+' | '+d.masked}
+else{Q('s').className='s no';Q('sd').className='d dy';Q('st').textContent=d.error||_('waitingCfg')}
+}catch(e){Q('s').className='s err';Q('st').textContent=_('connFail')}
 }
 async function doLogin(type){
 let body={}
 if(type==='phone'){
 const m=Q('mobile').value.trim();const p=Q('pw1').value;const a=Q('area_code').value.trim()
-if(!m||!p){t('请输入手机号和密码',1);return}
+if(!m||!p){t(_('phoneRequired'),1);return}
 body={mobile:m,password:p,area_code:a,login_type:'phone'}
 var btn=Q('btn1')
 }else{
 const e=Q('email').value.trim();const p=Q('pw2').value
-if(!e||!p){t('请输入邮箱和密码',1);return}
+if(!e||!p){t(_('emailRequired'),1);return}
 body={email:e,password:p,login_type:'email'}
 var btn=Q('btn2')
 }
-btn.disabled=true;btn.textContent='登录中...'
-Q('info').style.display='block';Q('info').innerHTML='正在登录 DeepSeek...'
+btn.disabled=true;btn.textContent=_('loginBtnDoing')
+Q('info').style.display='block';Q('info').innerHTML=_('loggingDS')
 try{
 const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
 const d=await r.json()
-if(d.ok){Q('info').innerHTML='登录成功 | Token: '+d.masked+' | Session: '+d.session_id;t('登录成功');cs()}
-else{Q('info').innerHTML='失败: '+d.error;t(d.error,1)}
-}catch(e){Q('info').innerHTML='错误: '+e.message;t(e.message,1)}
-btn.disabled=false;btn.textContent='登录'
+if(d.ok){Q('info').innerHTML=_('loginOk')+' | Token: '+d.masked+' | Session: '+d.session_id;t(_('loginOk'));cs()}
+else{Q('info').innerHTML=_('loginFail')+d.error;t(d.error,1)}
+}catch(e){Q('info').innerHTML=_('error')+e.message;t(e.message,1)}
+btn.disabled=false;btn.textContent=_('loginBtn')
 }
 function toggleCurl(){const b=Q('curlBox');b.style.display=b.style.display==='block'?'none':'block'}
 async function saveCurl(){
 const c=Q('curl').value.trim();if(!c){t('请先粘贴 cURL',1);return}
-const b=Q('btn3');b.disabled=true;b.textContent='保存中...'
-Q('info').style.display='block';Q('info').innerHTML='解析中...'
+const b=Q('btn3');b.disabled=true;b.textContent=_('parsing')
+Q('info').style.display='block';Q('info').innerHTML=_('parsing')
 try{
 const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({curl:c})})
 const d=await r.json()
-if(d.ok){Q('info').innerHTML='OK | '+d.masked+' | Session '+d.session_id;t('已保存');cs()}
-else{Q('info').innerHTML='失败: '+d.error;t(d.error,1)}
-}catch(e){Q('info').innerHTML='错误: '+e.message;t(e.message,1)}
-b.disabled=false;b.textContent='保存 cURL'
+if(d.ok){Q('info').innerHTML='OK | '+d.masked+' | Session '+d.session_id;t(_('saved'));cs()}
+else{Q('info').innerHTML=_('loginFail')+d.error;t(d.error,1)}
+}catch(e){Q('info').innerHTML=_('error')+e.message;t(e.message,1)}
+b.disabled=false;b.textContent=_('saveCurlBtn')
 }
-function cp(el){navigator.clipboard.writeText(el.textContent);t('已复制')}
+function cp(el){navigator.clipboard.writeText(el.textContent);t('Copied')}
 function t(m,e){const x=Q('toast');x.textContent=m;x.className='toast t'+(e?'e':'s');setTimeout(()=>x.className='toast',2500)}
 async function refreshModels(){
 const btn=Q('refreshBtn');const info=Q('modelsInfo')
-btn.disabled=true;btn.textContent='刷新中...';info.style.display='none'
+btn.disabled=true;btn.textContent=_('refreshingModels');info.style.display='none'
 try{
 const r=await fetch('/v1/models/refresh',{method:'POST'})
 const d=await r.json()
 const names=d.data.map(m=>m.id).join(', ')
-info.style.display='block';info.innerHTML='✅ 发现 '+d.data.length+' 个模型: '+names;t('刷新成功')
-}catch(e){info.style.display='block';info.innerHTML='❌ 失败: '+e.message;t('刷新失败',1)}
-btn.disabled=false;btn.textContent='🔄 刷新模型列表'
+info.style.display='block';info.innerHTML=_('foundModels')+d.data.length+_('modelCountSuffix')+names;t(_('refreshOk'))
+}catch(e){info.style.display='block';info.innerHTML='❌ '+_('loginFail')+e.message;t(_('refreshFail'),1)}
+btn.disabled=false;btn.textContent=_('refreshModels')
 }
 // === 用量统计 ===
 var _up='total';
@@ -309,12 +356,12 @@ try{
 const r=await fetch('/api/usage');const d=await r.json();
 const p=d[_up]||d.total||{};const m=p.models||{};const t=p.total||{};
 const e=Object.entries(m).sort((a,b)=>b[1].total_tokens-a[1].total_tokens);
-if(!e.length&&!t.requests){Q('usageContent').innerHTML='<div class=ue>📊 暂无用量数据</div>';return}
-let h='<div class=us><table class=ut><thead><tr><th class=ml>模型</th><th>请求</th><th>输入</th><th>输出</th><th>总计</th></tr></thead><tbody>';
+if(!e.length&&!t.requests){Q('usageContent').innerHTML='<div class=ue>'+_('noData')+'</div>';return}
+let h='<div class=us><table class=ut><thead><tr><th class=ml>'+_('modelHeader')+'</th><th>'+_('reqHeader')+'</th><th>'+_('inputHeader')+'</th><th>'+_('outputHeader')+'</th><th>'+_('totalHeader')+'</th></tr></thead><tbody>';
 for(const[k,v]of e){h+=`<tr><td class=ml>${k}</td><td>${f(v.requests)}</td><td>${f(v.prompt_tokens)}</td><td>${f(v.completion_tokens)}</td><td>${f(v.total_tokens)}</td></tr>`}
-h+=`<tr class=tr><td class=ml>📋 合计</td><td>${f(t.requests)}</td><td>${f(t.prompt_tokens)}</td><td>${f(t.completion_tokens)}</td><td>${f(t.total_tokens)}</td></tr></tbody></table></div>`;
+h+='<tr class=tr><td class=ml>'+_('sumLabel')+'</td><td>'+f(t.requests)+'</td><td>'+f(t.prompt_tokens)+'</td><td>'+f(t.completion_tokens)+'</td><td>'+f(t.total_tokens)+'</td></tr></tbody></table></div>';
 Q('usageContent').innerHTML=h
-}catch(e){Q('usageContent').innerHTML='<div class=ue>加载失败: '+e.message+'</div>'}
+}catch(e){Q('usageContent').innerHTML='<div class=ue>'+_('loadFail')+e.message+'</div>'}
 }
 function switchPeriod(p){
 _up=p;
@@ -322,8 +369,8 @@ _up=p;
 loadUsage()
 }
 async function clearUsage(){
-if(!confirm('确定清空全部用量数据？'))return;
-try{await fetch('/api/usage',{method:'DELETE'});t('已清空');loadUsage()}catch(e){t('清空失败',1)}
+if(!confirm(_('clearConfirm')))return;
+try{await fetch('/api/usage',{method:'DELETE'});t(_('cleared'));loadUsage()}catch(e){t(_('clearFail'),1)}
 }
 // === 代理配置 ===
 async function loadProxy(){
@@ -331,18 +378,18 @@ try{
 const r=await fetch('/api/proxy');const d=await r.json();
 Q('proxyUrl').value=d.proxy||'';
 var st=Q('proxyStatus');
-st.textContent=d.proxy?'已保存':'';
+st.textContent=d.proxy?_('proxySaved'):'';
 st.style.color=d.proxy?'#22c55e':'#64748b';
-}catch(e){Q('proxyStatus').textContent='加载失败: '+e.message}
+}catch(e){Q('proxyStatus').textContent=_('proxyLoadFail')+e.message}
 }
 async function saveProxy(){
 var url=Q('proxyUrl').value.trim();
 try{
 const r=await fetch('/api/proxy',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy:url})});
 const d=await r.json();
-if(d.ok){Q('proxyStatus').textContent='已保存';Q('proxyStatus').style.color='#22c55e';t('已保存')}
-else{Q('proxyStatus').textContent='保存失败: '+d.msg;t('保存失败: '+(d.msg||''),1)}
-}catch(e){Q('proxyStatus').textContent='保存失败: '+e.message;t('保存失败: '+e.message,1)}
+if(d.ok){Q('proxyStatus').textContent=_('proxySaved');Q('proxyStatus').style.color='#22c55e';t(_('proxySaved'))}
+else{Q('proxyStatus').textContent=_('proxySaveFail')+(d.msg||'');t(_('proxySaveFail')+(d.msg||''),1)}
+}catch(e){Q('proxyStatus').textContent=_('proxySaveFail')+e.message;t(_('proxySaveFail')+e.message,1)}
 }
 cs()
 </script>

@@ -152,9 +152,6 @@ hr{border:none;border-top:1px solid #334155;margin:24px 0}
 .pb.ac{background:#2563eb;color:#fff;border-color:#2563eb}
 .period-btn.active{background:#2563eb;color:#fff}
 a{color:#7dd3fc}
-.collapse{cursor:pointer;user-select:none;color:#64748b;font-size:12px;margin-top:8px}
-.collapse:hover{color:#94a3b8}
-.curl-box{display:none;margin-top:10px}
 </style>
 </head>
 <body>
@@ -190,11 +187,16 @@ a{color:#7dd3fc}
 <div class="info" id="info"></div>
 
 <div id="apiSection">
-<div class="collapse" onclick="toggleCurl()" data-i18n="advancedCurl">高级: 手动粘贴 cURL ▾</div>
-<div class="curl-box" id="curlBox">
-<textarea id="curl" data-i18n-ph="pasteCurl" placeholder="粘贴 cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px"></textarea>
-<button class="btn bp" id="btn3" onclick="saveCurl()" data-i18n="saveCurlBtn" style="margin-top:8px">保存 cURL</button>
+<div class="sl" style="font-weight:600;color:#e2e8f0;margin-bottom:10px" data-i18n="curlTitle">📋 cURL 导入</div>
+<div class="curl-help" style="font-size:12px;color:#94a3b8;margin-bottom:12px;line-height:1.7">
+  <div style="margin-bottom:6px;color:#7dd3fc;font-weight:500" data-i18n="curlSteps">导入步骤：</div>
+  <div data-i18n="curlStep1">1. 打开 chat.deepseek.com 并登录</div>
+  <div data-i18n="curlStep2">2. 按 F12 → Network 面板</div>
+  <div data-i18n="curlStep3">3. 发送任意消息，找到 completion 请求</div>
+  <div data-i18n="curlStep4">4. 右键 → Copy as cURL，粘贴到下方</div>
 </div>
+<textarea id="curl" data-i18n-ph="pasteCurl" placeholder="粘贴 cURL ..." style="width:100%;height:120px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-family:monospace;font-size:11px;resize:vertical"></textarea>
+<button class="btn bp" id="btn3" onclick="saveCurl()" data-i18n="saveCurlBtn" style="margin-top:8px">保存 cURL</button>
 
 <hr>
 <div class="step">
@@ -244,7 +246,7 @@ zh:{phoneLogin:'手机号登录',emailLogin:'邮箱登录',usage:'用量统计',
 phonePlaceholder:'手机号',pwdPlaceholder:'密码',loginBtn:'登录',loginBtnDoing:'登录中...',
 emailPlaceholder:'邮箱地址',waitingCfg:'等待配置',configured:'已配置',connFail:'连接失败',
 loggingDS:'正在登录 DeepSeek...',loginOk:'登录成功',loginFail:'失败:',
-error:'错误:',advancedCurl:'高级: 手动粘贴 cURL',saveCurlBtn:'保存 cURL',
+error:'错误:',saveCurlBtn:'保存 cURL',
 parsing:'解析中...',saved:'已保存',apiConfig:'API 配置',apiAddr:'API 地址',
 apiKey:'API Key',apiKeyVal:'任意填写',refreshModels:'🔄 刷新模型列表',
 refreshingModels:'刷新中...',foundModels:'✅ 发现',foundModelsSuffix:'个模型:',
@@ -255,12 +257,15 @@ inputHeader:'输入',outputHeader:'输出',totalHeader:'总计',sumLabel:'📋 �
 clearConfirm:'确定清空全部用量数据？',cleared:'已清空',clearFail:'清空失败',
 proxyTitle:'代理配置',proxyHint:'绕过 AWS WAF 拦截。格式：http://127.0.0.1:7890 或 socks5://127.0.0.1:7891',proxySaveBtn:'保存代理设置',proxySaved:'已保存',proxySaveFail:'保存失败: ',proxyLoadFail:'加载失败: ',
 phoneRequired:'请输入手机号和密码',emailRequired:'请输入邮箱和密码',
-pasteCurl:'粘贴 cURL ...',modelCountSuffix:' 个模型: ',unknownErr:'未知错误'},
+pasteCurl:'粘贴 cURL ...',modelCountSuffix:' 个模型: ',unknownErr:'未知错误',
+curlTitle:'📋 cURL 导入',curlSteps:'导入步骤：',
+curlStep1:'1. 打开 chat.deepseek.com 并登录',curlStep2:'2. 按 F12 → Network 面板',
+curlStep3:'3. 发送任意消息，找到 completion 请求',curlStep4:'4. 右键 → Copy as cURL，粘贴到下方'},
 en:{phoneLogin:'Phone Login',emailLogin:'Email Login',usage:'Usage',settings:'Settings',
 phonePlaceholder:'Phone Number',pwdPlaceholder:'Password',loginBtn:'Login',loginBtnDoing:'Logging in...',
 emailPlaceholder:'Email Address',waitingCfg:'Awaiting Config',configured:'Configured',connFail:'Connection Failed',
 loggingDS:'Logging into DeepSeek...',loginOk:'Login Successful',loginFail:'Failed:',
-error:'Error:',advancedCurl:'Advanced: Paste cURL',saveCurlBtn:'Save cURL',
+error:'Error:',saveCurlBtn:'Save cURL',
 parsing:'Parsing...',saved:'Saved',apiConfig:'API Config',apiAddr:'API Endpoint',
 apiKey:'API Key',apiKeyVal:'Any value',refreshModels:'🔄 Refresh Models',
 refreshingModels:'Refreshing...',foundModels:'✅ Found',foundModelsSuffix:' model(s):',
@@ -271,7 +276,10 @@ inputHeader:'Input',outputHeader:'Output',totalHeader:'Total',sumLabel:'📋 Tot
 clearConfirm:'Clear all usage data?',cleared:'Cleared',clearFail:'Clear Failed',
 proxyTitle:'Proxy Config',proxyHint:'Bypass AWS WAF. Format: http://127.0.0.1:7890 or socks5://127.0.0.1:7891',proxySaveBtn:'Save Proxy',proxySaved:'Saved',proxySaveFail:'Save failed: ',proxyLoadFail:'Load failed: ',
 phoneRequired:'Phone number and password required',emailRequired:'Email and password required',
-pasteCurl:'Paste cURL ...',modelCountSuffix:' model(s): ',unknownErr:'Unknown error'}};
+pasteCurl:'Paste cURL ...',modelCountSuffix:' model(s): ',unknownErr:'Unknown error',
+curlTitle:'📋 cURL Import',curlSteps:'Steps:',
+curlStep1:'1. Open chat.deepseek.com and log in',curlStep2:'2. Press F12 → Network tab',
+curlStep3:'3. Send any message, find the completion request',curlStep4:'4. Right-click → Copy as cURL, paste below'}};
 function _(k){return (_I[_lang]||_I.zh)[k]||k}
 function toggleLang(){_lang=_lang==='zh'?'en':'zh';localStorage.setItem('ds_lang',_lang);Q('langBtn').textContent=_lang==='zh'?'🌐 EN':'🌐 中';applyI18n()}
 function applyI18n(){
@@ -322,9 +330,8 @@ else{Q('info').innerHTML=_('loginFail')+d.error;t(d.error,1)}
 }catch(e){Q('info').innerHTML=_('error')+e.message;t(e.message,1)}
 btn.disabled=false;btn.textContent=_('loginBtn')
 }
-function toggleCurl(){const b=Q('curlBox');b.style.display=b.style.display==='block'?'none':'block'}
 async function saveCurl(){
-const c=Q('curl').value.trim();if(!c){t('请先粘贴 cURL',1);return}
+const c=Q('curl').value.trim();if(!c){t(_('pasteCurl'),1);return}
 const b=Q('btn3');b.disabled=true;b.textContent=_('parsing')
 Q('info').style.display='block';Q('info').innerHTML=_('parsing')
 try{

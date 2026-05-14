@@ -12,7 +12,7 @@ Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-comp
 
 [zhangjiabo522](https://github.com/zhangjiabo522) — Thanks for providing model tokens for Vision feature testing!
 
-> **💡 Need pure chat without tools?** If your use case is pure conversation (writing, translation, coding, Q&A), use the [`no-tools` branch](#branch-info) — no tool prompt injection, cleaner context, higher output quality.
+> **💡 Need tool calling?** If your use case requires function calling or tool use, switch to the [`main` branch](https://github.com/Fly143/deepseek-free-api/tree/main) — full-featured edition with DSML tool calling support.
 
 > **Reference project:** [NIyueeE/ds-free-api](https://github.com/NIyueeE/ds-free-api) (Rust). This is a Python rewrite using pure HTTP forwarding (curl_cffi with Chrome TLS fingerprint) instead of browser automation, with lower resource usage.
 
@@ -22,21 +22,22 @@ Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-comp
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
   - [One-Click Deploy (Recommended)](#one-click-deploy-recommended)
+  - [Docker Deploy](#docker-deploy)
   - [Manual Install](#manual-install)
 - [Authentication](#authentication)
-  - [Method 1: Phone/Email Login (Recommended)](#method-1-phoneemail-login-recommended)
+  - [Method 1: Password Login](#method-1-password-login)
   - [Method 2: cURL Import](#method-2-curl-import)
-  - [Method 3: Cookie Import](#method-3-cookie-import)
 - [API Usage](#api-usage)
   - [List Models](#1-list-models)
   - [Non-streaming Chat](#2-non-streaming-chat)
   - [Streaming Chat](#3-streaming-chat)
+  - [File Upload (Text & Image)](#4-file-upload-text--image)
+  - [Responses API (OpenAI Compatible)](#5-responses-apiopenai-compatible)
+  - [Anthropic Messages API](#6-anthropic-messages-api)
   - [Model Refresh](#7-model-refresh)
-- [Anthropic Messages API](#6-anthropic-messages-api)
 - [Model System](#model-system)
   - [Dynamic Model Discovery](#dynamic-model-discovery)
   - [Currently Available Models](#currently-available-models)
-- [Tool Calling](#tool-calling)
 - [Branch Info](#branch-info)
 - [PoW Solver](#pow-solver)
 - [Token Auto-Refresh](#token-auto-refresh)
@@ -141,7 +142,7 @@ After deployment, visit: **http://localhost:8000/admin**
 docker run -d -p 8000:8000 -v $(pwd)/config.json:/app/config.json ghcr.io/fly143/deepseek-free-api:latest
 ```
 
-> 💡 **No tools needed?** Clone the [`no-tools` branch](https://github.com/Fly143/deepseek-free-api/tree/no-tools) for a cleaner pure chat edition (no prompt injection, higher output quality).
+> 💡 **Need tool calling?** Switch to the [`main` branch](https://github.com/Fly143/deepseek-free-api/tree/main) for the full-featured edition (DSML tool calling, streaming sieve, etc.).
 
 ### Manual Install
 
@@ -161,7 +162,7 @@ python3 proxy.py
 
 Open the admin panel at http://localhost:8000/admin to configure.
 
-### Method 1: Phone/Email Login (Recommended)
+### Method 1: Password Login
 
 The easiest way, same experience as the web login:
 
@@ -180,14 +181,6 @@ The system automatically completes: login to get Token → create chat Session �
 4. Right-click → **Copy as cURL**
 5. In the admin panel, expand **Advanced: Paste cURL** and paste it
 6. Click **Save cURL**
-
-### Method 3: Cookie Import
-
-1. Log in to chat.deepseek.com
-2. Open **DevTools** → **Application** → **Cookies**
-3. Find cookies for `chat.deepseek.com`
-4. Export the cookie string containing `userToken`
-5. Paste into the admin panel → Save
 
 ## API Usage
 
@@ -482,72 +475,16 @@ The model list **changes dynamically with DeepSeek**. Currently 3 base models ×
 > - All models explicitly set `model_type` (`default` / `expert` / `vision`) to ensure correct DeepSeek routing
 > - Model names are English-only IDs; Chinese names are in the table above
 
-## Tool Calling
-
-DeepSeek's web UI **does not** support OpenAI function calling format. This proxy implements tool calling via **DSML prompt injection + multi-strategy extraction**:
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk-dsapi" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-chat",
-    "messages": [{"role": "user", "content": "What is the weather in Beijing?"}],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get weather information",
-        "parameters": {
-          "type": "object",
-          "properties": {"city": {"type": "string"}},
-          "required": ["city"]
-        }
-      }
-    }]
-  }'
-```
-
-### DSML Prompt Injection
-
-OpenAI tools definitions are converted to DSML format and injected into the system message:
-
-```xml
-<|DSML|tool_calls>
-  <|DSML|invoke name="search_file">
-    <|DSML|parameter name="query"><![CDATA[config.yaml]]></|DSML|parameter>
-  </|DSML|invoke>
-</|DSML|tool_calls>
-```
-
-### Extraction Strategies
-
-| Priority | Format | Description |
-|----------|--------|-------------|
-| DSML | `<\|DSML\|tool_calls><\|DSML\|invoke name="X">...</\|DSML\|invoke></\|DSML\|tool_calls>` | Primary format, 7 noise variant tolerances |
-| TOOL_CALL | `TOOL_CALL: name(key=value)` | Legacy format fallback |
-| JSON | `{"name":"x","arguments":{...}}` | JSON block parsing |
-| XML | `<tool_call><function=NAME>...</function></tool_call>` | Native XML |
-| Mixed | `<function_call>{...}</function_call>` | XML+JSON |
-
-### Fault Tolerance
-
-- **Noise tolerance** — Supports missing pipes, duplicate `<`, fullwidth `｜`, hyphen `dsml-`, and 5 other variants
-- **Fenced code blocks** — Automatically skips DSML examples inside markdown code blocks
-- **JSON repair** — Auto-fixes unquoted keys, missing array brackets
-- **CDATA protection** — content/command/prompt parameters retain original strings
-- **Missing open tags** — Auto-restores `<|DSML|tool_calls>` wrapper when only closing tag is present
-
 ## Branch Info
 
 This repository provides two branches:
 
 | Branch | Characteristics |
 |--------|----------------|
-| `main` (current) | Full-featured — supports DSML tool calling, streaming sieve, session management, etc. Use when tool calling is needed |
-| `no-tools` | Pure chat proxy — no tool call prompt injection, cleaner output. Ideal for writing, translation, code generation, etc. |
+| `no-tools` (current) | Pure chat proxy — no tool call prompt injection, cleaner output. Ideal for writing, translation, code generation, etc. |
+| `main` | Full-featured — supports DSML tool calling, streaming sieve, session management, etc. Use when tool calling is needed |
 
-> You are currently on the `main` branch. For pure chat without tools, switch to `no-tools`:
+> You are currently on the `no-tools` branch. For tool calling features, switch to `main`:
 > ```bash
 > git checkout main
 > ```
@@ -584,7 +521,7 @@ Token validity is approximately **24 hours**. When a request returns 401:
 3. Obtain new Token → create new Session → save to `token.json`
 4. Retry current request with new Token (transparent to user)
 
-> **Prerequisite:** Initial configuration must use **account password login**. Pure cURL/Cookie imports do not include passwords and cannot auto-refresh.
+> **Note:** cURL import does not include a password and cannot auto-refresh tokens. For auto-refresh, use password login.
 
 ## Management Commands
 
@@ -737,7 +674,7 @@ A: Check if Node.js is installed (`node --version`). If Node.js solving fails, t
 A: Verify your password is correct. DeepSeek passwords require at least 8 characters with letters + numbers. You may need to complete a captcha first in some cases.
 
 **Q: What happens when Token expires?**
-A: If configured via **account password login**, the proxy auto-relogins and refreshes the Token on 401. If configured via cURL/Cookie import, manual re-import is required.
+A: If configured via **account password login**, the proxy auto-relogins and refreshes the Token on 401. If configured via cURL import, manual re-import is required.
 
 **Q: Specified expert model but conversation appears in "Quick Mode" (default)?**
 A: Usually caused by expired Token or Session. DeepSeek silently downgrades requests to the default model when credentials are invalid. Solution: **re-login** with phone/email on the admin panel at `http://localhost:8000/admin` — the login will auto-refresh both Token and Session.

@@ -9,3 +9,24 @@ __pycache__/
 config.json
 *.bak
 *.bak
+# Ruflo / Anthropic operational cache
+.anthropic_batches/
+
+# Testing & Coverage
+.coverage
+.pytest_cache/
+.playwright-mcp/
+
+# Type checkers & Linters
+.mypy_cache/
+.ruff_cache/
+
+# Project internal orchestrator data
+.sisyphus/
+
+# Python environment & compilation
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+

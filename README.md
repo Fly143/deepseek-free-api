@@ -41,6 +41,7 @@
 - [无工具分支 (no-tools)](#无工具分支-no-tools)
 - [PoW 求解机制](#pow-求解机制)
 - [Token 自动刷新](#token-自动刷新)
+- [修复与改进](#修复与改进)
 - [管理命令](#管理命令)
 - [项目结构](#项目结构)
 - [配置参考](#配置参考)
@@ -551,6 +552,69 @@ Token 有效期约 **24 小时**。当请求返回 401 时：
 4. 用新 Token **重试当前请求**（用户无感知）
 
 > **前提：** 首次配置时必须通过**账号密码登录**方式。纯 cURL/Cookie 导入不含密码，无法自动刷新。
+
+## 修复与改进
+
+本项目持续修复了以下问题，按严重程度分类：
+
+### 🚨 严重修复
+
+| 修复 | 说明 | 提交 |
+|------|------|------|
+| **"Content is too long" 错误** | 新增 `context_manager.py` 模块，实现两级上下文裁剪：4 级渐进式清除（旧轮次→工具定义→历史消息→系统提示） + 2 级激进回退（激进裁剪→终极后备）。主入口 `enforce_context_limit()` 在请求发出前检查并自动裁减超长上下文。含 515 行单元测试 + 236 行集成测试。详见 [`REMEDIATION_REPORT.md`](REMEDIATION_REPORT.md) | `937f861` |
+| **工具调用修复** | 修复代理工具调用在各 API 端点中的异常，涵盖 `proxy.py` 的 chat completions 路由和 `app/anthropic_routes.py` 的 Messages API 路由 | `d51dbc1` |
+| **工具 prompt 上下文溢出** | 将工具定义 prompt 嵌入 system message，修复工具调用描述过长时超过 DeepSeek 上下文限制的问题 | `50330d4` |
+| **Anthropic 消息 API：多账号 + Vision** | 修复 Anthropic `/v1/messages` 端点未接入多账号轮询、ref_file_ids 硬编码为空、tool_result block 遗漏、工具定义未注入 prompt 等问题 | `74fd560` |
+
+### 🧹 输出卫生修复
+
+| 修复 | 说明 | 提交 |
+|------|------|------|
+| **DSML 标记泄漏** | `sanitize_leaked_output()` 过滤流式输出中泄漏的 DSML 格式标记（如 `<｜end_of_sentence｜>`、`<｜tool｜>`），修复 Hermes 等工具对话时文本泄漏 | `00451d9` |
+| **DSML 标记全覆盖** | 将 sanitize 应用到 no-tools 流式路径和非流式路径（之前仅覆盖 has_tools 流式路径） | `414298f` |
+| **`[citation:N]` 清理** | 添加对 DeepSeek 输出中 `[citation:N]` 引文标记的清洗 | `15c6230`、`84a8447` |
+
+### 🔁 多账号修复
+
+| 修复 | 说明 | 提交 |
+|------|------|------|
+| **401 死循环** | 401 重登失败后标记账号为无效，避免死循环重试 | `c78eedc` |
+| **`relogin()` key 不一致** | 修复 `relogin()` 中 key 名不一致导致 Token 写不回账号池 | `c78eedc` |
+| **管理面板 JS 转义** | 使用模板字符串替代 Python 三重引号，避免管理面板 JS 输出时语法错误 | `5169e26` |
+
+### 🧠 Responses API 修复
+
+| 修复 | 说明 | 提交 |
+|------|------|------|
+| **fc_id 一致性** | 修复 Responses API 工具调用 `fc_id` 在 output_item 事件间不一致的问题 | `8b04df0` |
+| **推理链 + 多余括号** | 修复 Responses API 流式输出中推理链为空和 `{}{}` 多余括号问题 | `2f96cf4` |
+
+### 🗄️ 会话管理
+
+| 修复 | 说明 | 提交 |
+|------|------|------|
+| **旧会话自动清理** | `session_store` 跟踪会话续期，TTL=3 天后自动清理。新增 `delete_session` API、启动时清理、Vision 模式下归档旧会话。含管理面板手动清理按钮 | `c50cbce`、`243ead2` |
+
+### 📱 管理面板 UI
+
+| 修复 | 说明 | 提交 |
+|------|------|------|
+| **移动端适配** | Token/账号文本截断、按钮竖排堆叠、加载文字清理、标签栏 `nowrap` | `d080908` |
+| **移除重复登录按钮** | 管理页面同时有「登录」标签和「重新登录」按钮，删除按钮（留标签） | `b56eb78` |
+
+### 📖 文档修复
+
+| 修复 | 说明 | 提交 |
+|------|------|------|
+| **分支说明反了** | README 中 main 分支标记为 no-tools（实际反了） | `d6f0113` |
+| **config.json 追踪** | 停止追踪 `config.json`，加入 `.gitignore` | `dc5428c` |
+
+### 🔬 内部改进
+
+| 改进 | 说明 | 提交 |
+|------|------|------|
+| **Anthropic 模型名映射** | 新增 `ANTHROPIC_MODEL_ALIASES` 映射表，Claude Code CLI 等工具可使用 `claude-sonnet-4-6` 等 Anthropic 风格名调用 | `71717e5` |
+| **Anthropic 路由模块化** | 将 Anthropic 适配器拆分为 `app/anthropic_routes.py`（APIRouter）+ `app/anthropic.py` + `app/batch.py` | `faac19b` |
 
 ## 管理命令
 

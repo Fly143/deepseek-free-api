@@ -218,9 +218,8 @@ a{color:#7dd3fc}
 <button class="btn" style="background:#7f1d1d;color:#fca5a5;font-size:12px;padding:6px 12px;margin-left:4px" onclick="clearUsage()">清空</button>
 </div>
 </div>
-</div>
 
-<div id="settingsPanel" class="panel" style="display:none">
+<div id="settingsPanel" class="panel">
 <div class="sl" style="font-weight:600;color:#e2e8f0;">代理配置</div>
 <div class="cr" style="margin-top:12px">
   <span style="color:#94a3b8;font-size:13px">绕过 AWS WAF 拦截。格式：http://127.0.0.1:7890 或 socks5://127.0.0.1:7891</span>
@@ -230,6 +229,7 @@ a{color:#7dd3fc}
 </div>
 <button class="btn bp" onclick="saveProxy()" style="margin-top:8px">保存代理设置</button>
 <div id="proxyStatus" style="margin-top:8px;font-size:12px;color:#64748b"></div>
+</div>
 </div>
 
 <div id="toast" class="toast"></div>

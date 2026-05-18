@@ -1486,7 +1486,12 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         if ref_file_ids:
             _vlog(f"chat request files={ref_file_ids} thinking={thinking_enabled}")
     elif "expert" in model:
-        req_body["model_type"] = "expert"
+        if ref_file_ids:
+            # 专家模式不支持文件上传，自动降级到快速模式
+            print(f"[Chat] 专家模式不支持文件上传，自动降级到快速模式 (files={len(ref_file_ids)})")
+            req_body["model_type"] = "default"
+        else:
+            req_body["model_type"] = "expert"
     else:
         req_body["model_type"] = "default"
 

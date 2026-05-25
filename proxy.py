@@ -2360,6 +2360,93 @@ def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, h
         yield "data: [DONE]\n\n"
 
 
+# ── Responses API ──────────────────────────────────
+
+
+def _responses_stream(record: dict, chat_result):
+    """Simplified stream wrapper for Responses API."""
+    response_id = record.get("id", _gen_response_id())
+    created = int(time.time())
+    yield f"data: {json.dumps({'type': 'response.output_text.delta', 'data': '', 'response_id': response_id})}\n\n"
+    if isinstance(chat_result, StreamingResponse):
+        for chunk in chat_result.body_iterator:
+            yield f"data: {json.dumps({'type': 'response.output_text.delta', 'data': str(chunk), 'response_id': response_id})}\n\n"
+    yield f"data: {json.dumps({'type': 'response.done', 'data': None, 'response_id': response_id})}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def _chat_completion_to_response_record(record: dict, chat_result, body) -> dict:
+    """Simplified: wrap chat completion result as Responses API response."""
+    if isinstance(chat_result, dict):
+        content = chat_result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    else:
+        content = str(chat_result) if chat_result else ""
+    record["output"] = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": content}]}]
+    return record
+
+
+@app.post("/v1/responses")
+async def responses(request: Request):
+    account = config_manager.get_next_account()
+    if not account:
+        raise HTTPException(503, detail="没有可用账号，请先访问 /admin 添加并登录账号")
+
+    body = await request.json()
+    model = _resolve_responses_model(body)
+    stream = body.get("stream", False)
+    previous_response_id = body.get("previous_response_id")
+    body["_response_id"] = _gen_response_id()
+
+    messages, parsed_tools = _messages_from_responses_request(body)
+    messages = _merge_previous_response_context(messages, previous_response_id)
+    tools = _normalize_response_tools(body, parsed_tools)
+
+    chat_body = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+        "max_tokens": body.get("max_output_tokens", 4096),
+    }
+    if tools:
+        chat_body["tools"] = tools
+
+    model_info = get_models().get(model, get_models().get("deepseek-default"))
+    if not model_info:
+        raise HTTPException(400, detail=f"Unknown model: {model}")
+    thinking_enabled, search_enabled, _, _ = model_info
+
+    account_label = account.account_label
+    account_token = account.token
+    account_session_id = account.session_id
+
+    cfg = {
+        "token": account_token,
+        "session_id": account_session_id,
+        "account": account_label,
+    }
+
+    search_enabled = body.get("tools", []) or search_enabled
+    chat_result = _do_chat(
+        cfg, _convert_messages(messages),
+        model, thinking_enabled, search_enabled,
+        stream=stream, tools=tools,
+        ref_file_ids=None,
+    )
+
+    add_usage(account_label, model, prompt_tokens=0, completion_tokens=0)
+    record = _build_responses_record(body)
+    record["model"] = model
+    save_response_record(record)
+
+    if stream:
+        return StreamingResponse(
+            _responses_stream(record, chat_result),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    return _chat_completion_to_response_record(record, chat_result, body)
+
 # ── 路由挂载 ─────────────────────────────────────
 from app.anthropic_routes import router as _anthropic_router
 app.include_router(_anthropic_router)

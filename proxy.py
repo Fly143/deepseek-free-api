@@ -1768,7 +1768,7 @@ def _parse_image_url(url_or_data: str) -> dict | None:
 
 # ── 消息格式转换 ──────────────────────────────────────────
 
-def _convert_messages(messages):
+def _convert_messages(messages, tools=None):
     """将 OpenAI 消息列表转换为 DeepSeek 原生 prompt 格式（无工具版本）。"""
     BOS = "<｜begin▁of▁sentence｜>"
     SYS = "<｜System｜>"

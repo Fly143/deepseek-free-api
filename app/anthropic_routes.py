@@ -73,12 +73,11 @@ def _resolve_anthropic_model(model: str) -> str:
 async def anthropic_messages(request: Request):
     """Anthropic Messages API 兼容端点（main 分支，支持工具调用+多账号+多模态）"""
     from proxy import (
-        CONFIG_FILE, _count_tokens, convert_messages_for_deepseek,
+        CONFIG_FILE, _count_tokens, _convert_messages,
         get_models, needs_renewal, on_new_session, _vlog,
         add_usage, add_tokens, _do_chat, cffi_requests, JSONResponse,
         config_manager, extract_text_files_from_messages, extract_images_from_messages,
         upload_file_to_deepseek, fork_file_to_vision, wait_for_file_parsing,
-        get_usage_status,
     )
     body = await request.json()
     model = body.get("model", "deepseek-default")
@@ -152,7 +151,7 @@ async def anthropic_messages(request: Request):
         except Exception as e:
             _vlog(f"vision fresh session failed: {e}")
 
-    prompt = convert_messages_for_deepseek(messages, tools)
+    prompt = _convert_messages(messages, tools)
     prompt_tokens = _count_tokens(prompt)
 
     # 会话管理：token 超限自动续期

@@ -2,14 +2,16 @@
 DeepSeek 网页 → API 代理（纯 HTTP 转发，无浏览器依赖）
 用法: python proxy.py → 打开 http://localhost:8000/admin → 粘贴 cURL → 保存 → 用
 """
-import json, os, shlex, time, uuid, webbrowser, base64, re, secrets
+import json, os, shlex, time, uuid, webbrowser, base64, re, secrets, threading
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import tiktoken
 from curl_cffi import requests as cffi_requests
-from app.config import config_manager
+from app.config import config_manager, DsAccount
+from app.batch import init_batch_storage as anthropic_init_batch_storage
 
 # ── Tokenizer ───────────────────────────────────
 _enc = tiktoken.get_encoding("cl100k_base")
@@ -19,6 +21,9 @@ def _count_tokens(text: str) -> int:
 
 # ── 用量统计 ───────────────────────────────────
 from usage_store import add_usage, get_usage, clear_usage
+
+# ── 会话管理 ───────────────────────────────────
+from session_store import needs_renewal, on_new_session, add_tokens, get_expired_sessions, remove_old_session
 
 # ── PoW (Proof of Work) Solver — 纯 Python 实现（无 WASM 依赖）────────
 from pow_native import DeepSeekPOW
@@ -30,6 +35,16 @@ BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "token.json"
 VISION_LOG = BASE_DIR / "vision.log"
 _DEBUG = os.getenv("DS_DEBUG", "").lower() in ("1", "true", "yes")
+
+# ── DeepSeek API 通用 Headers ─────────────────────
+DS_HEADERS = {
+    "content-type": "application/json",
+    "origin": "https://chat.deepseek.com",
+    "referer": "https://chat.deepseek.com/",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
+    "x-client-version": "2.0.2",
+    "x-client-platform": "web",
+}
 
 def _vlog(msg: str):
     """Log vision-related messages. File logging only when DS_DEBUG=1."""
@@ -89,13 +104,30 @@ def build_config(parsed: dict) -> dict:
 
 
 app = FastAPI(title="DeepSeek Proxy")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
 async def startup_discover():
-    """启动时自动刷新模型列表。"""
+    """启动时自动刷新模型列表，延迟清理过期会话（后台线程，避免风控）。"""
     print("[启动] 探测模型列表...")
     _discover_models()
+    # 后台延迟清理过期会话
+    def _bg_cleanup():
+        import time as _t
+        _t.sleep(10)
+        try:
+            cleanup_old_sessions()
+        except Exception:
+            pass
+    import threading as _th
+    _th.Thread(target=_bg_cleanup, daemon=True).start()
 
 # ── 管理页面 ─────────────────────────────────────────────
 ADMIN = """<!DOCTYPE html>
@@ -152,6 +184,26 @@ hr{border:none;border-top:1px solid #334155;margin:24px 0}
 .pb.ac{background:#2563eb;color:#fff;border-color:#2563eb}
 .period-btn.active{background:#2563eb;color:#fff}
 a{color:#7dd3fc}
+/* Account management */
+.acct-tbl{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}
+.acct-tbl th,.acct-tbl td{padding:8px 10px;text-align:left;border-bottom:1px solid #334155}
+.acct-tbl th{color:#94a3b8;font-weight:500;font-size:11px;white-space:nowrap}
+.acct-tbl td{font-variant-numeric:tabular-nums}
+.acct-tbl td:nth-child(3){max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acct-tbl td:last-child{white-space:nowrap}
+.acct-st{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle}
+.acct-st.ok{background:#22c55e}.acct-st.no{background:#64748b}.acct-st.er{background:#ef4444}
+.acct-btn{padding:4px 10px;border-radius:4px;border:none;cursor:pointer;font-size:12px;font-weight:500}
+.acct-btn.rm{background:#7f1d1d;color:#fca5a5}.acct-btn.rm:hover{background:#991b1b}
+.acct-btn.rl{background:#1e3a5f;color:#7dd3fc}.acct-btn.rl:hover{background:#1e40af}
+.acct-btn.batch{background:#2563eb;color:#fff;width:100%;margin-top:12px;padding:10px;border-radius:8px;border:none;cursor:pointer;font-size:13px;font-weight:500}
+.acct-btn.batch:hover{background:#1d4ed8}
+.acct-add{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.acct-add input{flex:1;min-width:100px;padding:8px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:13px}
+.acct-add button{padding:8px 16px;background:#2563eb;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
+.acct-add button:hover{background:#1d4ed8}
+.acct-empty{text-align:center;color:#64748b;padding:30px 0;font-size:13px}
+.acct-stat{font-size:12px;color:#94a3b8;margin-bottom:8px}
 </style>
 </head>
 <body>
@@ -166,6 +218,7 @@ a{color:#7dd3fc}
 <div class="tab active" onclick="switchTab('phone')" data-i18n="phoneLogin">手机号登录</div>
 <div class="tab" onclick="switchTab('email')" data-i18n="emailLogin">邮箱登录</div>
 <div class="tab" onclick="switchTab('usage')" data-i18n="usage">用量统计</div>
+<div class="tab" onclick="switchTab('accounts')" data-i18n="accounts">账号管理</div>
 <div class="tab" onclick="switchTab('settings')" data-i18n="settings">设置</div>
 </div>
 
@@ -224,6 +277,18 @@ a{color:#7dd3fc}
 </div>
 </div>
 
+<div id="accountsPanel" class="panel">
+<div class="acct-stat" id="acctStat" data-i18n="loadingAccounts">加载中...</div>
+<div class="acct-add">
+<input type="tel" id="acctAreaCode" value="+86" placeholder="+86" style="width:70px;flex:none">
+<input type="tel" id="acctPhone" placeholder="手机号" data-i18n-ph="phonePlaceholder">
+<input type="password" id="acctPw" placeholder="密码" data-i18n-ph="pwdPlaceholder">
+<button onclick="addAccount()" data-i18n="addAcctBtn">添加</button>
+</div>
+<div id="acctList"><div class="acct-empty" data-i18n="noAccounts">暂无账号，请先添加</div></div>
+<button class="acct-btn batch" onclick="reloginAll()" data-i18n="reloginAllBtn">全部重新登录</button>
+</div>
+
 <div id="settingsPanel" class="panel">
 <div class="sl" style="font-weight:600;color:#e2e8f0;" data-i18n="proxyTitle">代理配置</div>
 <div class="cr" style="margin-top:12px">
@@ -255,6 +320,15 @@ periodAll:'全部',periodWeek:'本周',periodToday:'今日',refreshBtn:'刷新',
 noData:'📊 暂无用量数据',loadFail:'加载失败: ',modelHeader:'模型',reqHeader:'请求',
 inputHeader:'输入',outputHeader:'输出',totalHeader:'总计',sumLabel:'📋 合计',
 clearConfirm:'确定清空全部用量数据？',cleared:'已清空',clearFail:'清空失败',
+accounts:'账号管理',loadingAccounts:'加载中...',noAccounts:'暂无账号，请先添加',
+addAcctBtn:'添加',reloginAllBtn:'全部重新登录',
+accountHeader:'账号',statusHeader:'状态',tokenHeader:'Token',
+loginTimeHeader:'登录时间',opHeader:'操作',valid:'有效',notLogin:'未登录',
+reloginBtn:'重登',deleteBtn:'删除',
+deleteConfirm:'确定删除账号',deleted:'已删除',deleteFail:'删除失败:',
+reloginOk:'重新登录成功',reloginFail:'重登失败: ',
+addFail:'添加失败: ',
+allRelogining:'全部重新登录中...',allReloginDone:'重登完成:',allReloginFail:'失败:',
 proxyTitle:'代理配置',proxyHint:'绕过 AWS WAF 拦截。格式：http://127.0.0.1:7890 或 socks5://127.0.0.1:7891',proxySaveBtn:'保存代理设置',proxySaved:'已保存',proxySaveFail:'保存失败: ',proxyLoadFail:'加载失败: ',
 phoneRequired:'请输入手机号和密码',emailRequired:'请输入邮箱和密码',
 pasteCurl:'粘贴 cURL ...',modelCountSuffix:' 个模型: ',unknownErr:'未知错误',
@@ -274,6 +348,15 @@ periodAll:'All',periodWeek:'This Week',periodToday:'Today',refreshBtn:'Refresh',
 noData:'📊 No Usage Data',loadFail:'Load failed: ',modelHeader:'Model',reqHeader:'Requests',
 inputHeader:'Input',outputHeader:'Output',totalHeader:'Total',sumLabel:'📋 Total',
 clearConfirm:'Clear all usage data?',cleared:'Cleared',clearFail:'Clear Failed',
+accounts:'Accounts',loadingAccounts:'Loading...',noAccounts:'No accounts, add one first',
+addAcctBtn:'Add',reloginAllBtn:'Relogin All',
+accountHeader:'Account',statusHeader:'Status',tokenHeader:'Token',
+loginTimeHeader:'Login Time',opHeader:'Action',valid:'Valid',notLogin:'Not Logged In',
+reloginBtn:'Relogin',deleteBtn:'Delete',
+deleteConfirm:'Delete account',deleted:'Deleted',deleteFail:'Delete failed:',
+reloginOk:'Relogin successful',reloginFail:'Relogin failed: ',
+addFail:'Add failed: ',
+allRelogining:'Relogging all...',allReloginDone:'Done:',allReloginFail:'Failed:',
 proxyTitle:'Proxy Config',proxyHint:'Bypass AWS WAF. Format: http://127.0.0.1:7890 or socks5://127.0.0.1:7891',proxySaveBtn:'Save Proxy',proxySaved:'Saved',proxySaveFail:'Save failed: ',proxyLoadFail:'Load failed: ',
 phoneRequired:'Phone number and password required',emailRequired:'Email and password required',
 pasteCurl:'Paste cURL ...',modelCountSuffix:' model(s): ',unknownErr:'Unknown error',
@@ -293,12 +376,14 @@ function Q(id){return document.getElementById(id)}
 function switchTab(type){
 var ti={'phone':0,'email':1,'usage':2,'settings':3};
 document.querySelectorAll('.tab').forEach((t,i)=>{t.className='tab'+(i===ti[type]?' active':'');});
-Q('phonePanel').className='panel'+(type==='phone'?' active':'');
-Q('emailPanel').className='panel'+(type==='email'?' active':'');
+if(Q('phonePanel'))Q('phonePanel').className='panel'+(type==='phone'?' active':'');
+if(Q('emailPanel'))Q('emailPanel').className='panel'+(type==='email'?' active':'');
 if(Q('usagePanel'))Q('usagePanel').className='panel'+(type==='usage'?' active':'');
+if(Q('accountsPanel'))Q('accountsPanel').className='panel'+(type==='accounts'?' active':'');
 if(Q('settingsPanel'))Q('settingsPanel').className='panel'+(type==='settings'?' active':'');
-var as=Q('apiSection');if(as)as.style.display=(type==='usage'||type==='settings')?'none':'';
+var as=Q('apiSection');if(as)as.style.display=(type==='usage'||type==='accounts'||type==='settings')?'none':'';
 if(type==='usage')loadUsage();
+if(type==='accounts')loadAccounts();
 if(type==='settings')loadProxy();
 }
 async function cs(){
@@ -378,6 +463,67 @@ loadUsage()
 async function clearUsage(){
 if(!confirm(_('clearConfirm')))return;
 try{await fetch('/api/usage',{method:'DELETE'});t(_('cleared'));loadUsage()}catch(e){t(_('clearFail'),1)}
+}
+// === 账号管理 ===
+async function loadAccounts(){
+try{
+const r=await fetch('/api/accounts');const d=await r.json();
+Q('acctStat').textContent=d.total+' '+_('accounts')+', '+d.valid+' '+_('valid');
+if(d.accounts&&d.accounts.length){
+var h='<table class="acct-tbl"><tr><th>'+_('accountHeader')+'</th><th>'+_('statusHeader')+'</th><th>'+_('tokenHeader')+'</th><th>'+_('loginTimeHeader')+'</th><th>'+_('opHeader')+'</th></tr>';
+for(const a of d.accounts){
+var st=a.is_valid?'ok':'no';
+var stl=a.is_valid?_('valid'):_('notLogin');
+var tk=a.token_masked||'***';
+var lt=a.login_time||'-';
+var l=encodeURIComponent(a.account_label);
+h+='<tr><td>'+a.account_label+'</td><td><span class="acct-st '+st+'"></span>'+stl+'</td><td>'+tk+'</td><td>'+lt+'</td>';
+h+='<td><button class="acct-btn rl" onclick="reloginAccount(\''+l+'\')">'+_('reloginBtn')+'</button><button class="acct-btn rm" onclick="removeAccount(\''+l+'\')">'+_('deleteBtn')+'</button></td></tr>';
+}
+h+='</table>';
+Q('acctList').innerHTML=h;
+}else{Q('acctList').innerHTML='<div class="acct-empty">'+_('noAccounts')+'</div>'}
+}catch(e){Q('acctList').innerHTML='<div class="acct-empty">'+_('loadFail')+e.message+'</div>'}
+}
+async function addAccount(){
+var area=Q('acctAreaCode').value.trim()||'+86';
+var phone=Q('acctPhone').value.trim();
+var pw=Q('acctPw').value;
+if(!phone||!pw){t(_('phoneRequired'),1);return}
+try{
+const r=await fetch('/api/accounts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({login_type:'phone',area_code:area,mobile:phone,password:pw})});
+const d=await r.json();
+if(d.ok){t(_('saved'));Q('acctPhone').value='';Q('acctPw').value='';loadAccounts()}
+else{t(_('addFail')+(d.detail||d.error||''),1)}
+}catch(e){t(_('addFail')+e.message,1)}
+}
+async function removeAccount(label){
+if(!confirm(_('deleteConfirm')+' '+decodeURIComponent(label)+'？'))return;
+try{
+const r=await fetch('/api/accounts/'+label,{method:'DELETE'});
+const d=await r.json();
+if(d.ok){t(_('deleted'));loadAccounts()}
+else{t(_('deleteFail')+(d.detail||''),1)}
+}catch(e){t(_('deleteFail')+e.message,1)}
+}
+async function reloginAccount(label){
+try{
+const r=await fetch('/api/accounts/'+label+'/relogin',{method:'POST'});
+const d=await r.json();
+if(d.ok){t(_('reloginOk'));loadAccounts()}
+else{t(_('reloginFail')+(d.error||''),1)}
+}catch(e){t(_('reloginFail')+e.message,1)}
+}
+async function reloginAll(){
+var btn=document.querySelector('.acct-btn.batch');
+btn.disabled=true;btn.textContent=_('allRelogining');
+try{
+const r=await fetch('/api/accounts/relogin-all',{method:'POST'});
+const d=await r.json();
+t(_('allReloginDone')+' '+d.success+'/'+d.total+(_('allReloginFail')?', '+_('allReloginFail')+' '+(d.total-d.success):''));
+loadAccounts()
+}catch(e){t(_('allReloginFail')+e.message,1)}
+btn.disabled=false;btn.textContent=_('reloginAllBtn');
 }
 // === 代理配置 ===
 async function loadProxy(){
@@ -637,6 +783,133 @@ async def set_proxy(data: dict):
     url = data.get("proxy", "").strip()
     config_manager.set_proxy(url)
     return {"ok": True, "proxy": url}
+
+
+# ─── 多账号管理 API ───────────────────────────────────────
+
+
+@app.get("/api/accounts")
+async def list_accounts():
+    """获取所有账号列表"""
+    return {
+        "accounts": config_manager.get_all_accounts(),
+        "total": config_manager.count(),
+        "valid": config_manager.count_valid(),
+    }
+
+
+@app.post("/api/accounts")
+async def add_account(data: dict):
+    """手动添加账号"""
+    login_type = data.get("login_type", "phone")
+    password = data.get("password", "").strip()
+    if not password:
+        raise HTTPException(400, "请提供密码")
+
+    if login_type == "email":
+        email = data.get("email", "").strip()
+        if not email:
+            raise HTTPException(400, "请提供邮箱")
+        account_label = email
+    else:
+        mobile = data.get("mobile", "").strip()
+        area_code = data.get("area_code", "+86").strip()
+        if not mobile:
+            raise HTTPException(400, "请提供手机号")
+        account_label = f"{area_code} {mobile}"
+
+    existing = config_manager.get_account_by_label(account_label)
+    if existing:
+        if existing.token:
+            return {"ok": True, "account_label": account_label, "exist": True}
+
+    ds_account = DsAccount(
+        account_label=account_label,
+        login_type=login_type,
+        _password=password,
+        _mobile=mobile if login_type == "phone" else "",
+        _area_code=area_code if login_type == "phone" else "+86",
+        _email=email if login_type == "email" else "",
+        login_time="",
+        is_valid=False,
+    )
+    added = config_manager.add_account(ds_account)
+    return {"ok": True, "account_label": account_label, "added": added}
+
+
+@app.delete("/api/accounts/{account_label}")
+async def remove_account(account_label: str):
+    """删除账号"""
+    from urllib.parse import unquote
+    label = unquote(account_label)
+    if config_manager.remove_account(label):
+        return {"ok": True, "account_label": label}
+    raise HTTPException(404, f"账号 {label} 不存在")
+
+
+@app.post("/api/accounts/{account_label}/relogin")
+async def relogin_account(account_label: str):
+    """重新登录指定账号"""
+    from urllib.parse import unquote
+    label = unquote(account_label)
+    account = config_manager.get_account_by_label(label)
+    if not account:
+        raise HTTPException(404, f"账号 {label} 不存在")
+
+    login_type = account.login_type
+    password = account._password
+    if not password:
+        raise HTTPException(400, f"账号 {label} 无保存密码，无法自动登录")
+
+    cfg = {
+        "login_type": login_type,
+        "_password": password,
+        "_email": account._email,
+        "_mobile": account._mobile,
+        "_area_code": account._area_code,
+        "account": label,
+    }
+
+    new_cfg = relogin(cfg)
+    if new_cfg:
+        return {"ok": True, "account_label": label, "token_masked": new_cfg.get("token", "")[:20] + "..."}
+    return {"ok": False, "error": "重新登录失败"}
+
+
+@app.post("/api/accounts/relogin-all")
+async def relogin_all():
+    """重新登录所有有效账号"""
+    accounts = config_manager.get_all_accounts()
+    results = []
+    for acc in accounts:
+        label = acc.get("account_label", "")
+        account = config_manager.get_account_by_label(label)
+        if not account or not account._password:
+            results.append({"label": label, "ok": False, "error": "无密码"})
+            continue
+
+        cfg = {
+            "login_type": account.login_type,
+            "_password": account._password,
+            "_email": account._email,
+            "_mobile": account._mobile,
+            "_area_code": account._area_code,
+            "account": label,
+        }
+        new_cfg = relogin(cfg)
+        results.append({"label": label, "ok": bool(new_cfg), "error": None if new_cfg else "登录失败"})
+
+    return {"results": results, "total": len(results), "success": sum(1 for r in results if r["ok"])}
+
+
+@app.post("/api/cleanup")
+async def manual_cleanup():
+    """手动触发会话清理。"""
+    try:
+        cleanup_old_sessions()
+        return {"ok": True, "msg": "清理完成"}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
 
 
 # ─── 模型列表（免鉴权，供管理页面使用） ───────────────────────
@@ -1155,6 +1428,51 @@ def _fetch_file_statuses(cfg: dict, file_ids: list[str]) -> dict | None:
     except Exception as e:
         print(f"[Vision] fetch_files error: {e}")
     return None
+
+
+# ── 会话清理 ─────────────────────────────────────
+
+
+def _delete_deepseek_session(token: str, session_id: str) -> bool:
+    """调用 DeepSeek API 删除指定会话。"""
+    try:
+        headers = {**DS_HEADERS, "authorization": f"Bearer {token}"}
+        resp = cffi_requests.post(
+            "https://chat.deepseek.com/api/v0/chat_session/delete",
+            json={"chat_session_id": session_id},
+            headers=headers,
+            impersonate="chrome120",
+            timeout=15,
+            proxies=_get_proxy_dict(),
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("data", {}).get("biz_code") == 0
+        return False
+    except Exception as e:
+        print(f"[Cleanup] Delete session {session_id} failed: {e}")
+        return False
+
+
+def cleanup_old_sessions():
+    """清理所有账号中过期的旧会话。每次删除后等待 3 秒，避免触发风控。"""
+    expired = get_expired_sessions()
+    if not expired:
+        return
+
+    print(f"[Cleanup] Found {len(expired)} expired sessions, deleting with 10s delay...")
+    deleted = 0
+    for account_label, session_id, model, days_ago in expired:
+        token = config_manager.get_token(account_label)
+        if not token:
+            continue
+        if _delete_deepseek_session(token, session_id):
+            remove_old_session(account_label, session_id)
+            deleted += 1
+            print(f"[Cleanup] Deleted: {session_id[:12]}... ({days_ago}d old)")
+        time.sleep(10)
+    if deleted:
+        print(f"[Cleanup] Done: {deleted}/{len(expired)} deleted")
 
 
 def extract_images_from_messages(messages: list) -> list[dict]:
@@ -1865,8 +2183,35 @@ def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, h
         yield "data: [DONE]\n\n"
 
 
+# ── 响应存储 ─────────────────────────────────────
+_response_store: dict = {}
+_response_lock = threading.Lock()
+
+
+def _save_response(response_id: str, data: dict):
+    with _response_lock:
+        _response_store[response_id] = data
+
+
+def _get_response(response_id: str) -> dict | None:
+    with _response_lock:
+        return _response_store.get(response_id)
+
+
+def _delete_response(response_id: str):
+    with _response_lock:
+        _response_store.pop(response_id, None)
+
+
+# ── 路由挂载 ─────────────────────────────────────
+from app.anthropic_routes import router as _anthropic_router
+app.include_router(_anthropic_router)
+
 # ── 启动 ─────────────────────────────────────────────────
 if __name__ == "__main__":
+    import os as _anthropic_os
     import uvicorn
+    anthropic_init_batch_storage(_anthropic_os.path.join(_anthropic_os.path.dirname(_anthropic_os.path.abspath(__file__)), ".anthropic_batches"))
+    print(f" Anthropic: /v1/messages, /v1/messages/count_tokens, /v1/messages/batches, /v1/messages/{{id}}")
     print(f"DeepSeek Proxy\n Admin: http://localhost:{PROXY_PORT}/admin\n API: http://localhost:{PROXY_PORT}/v1")
     uvicorn.run(app, host="0.0.0.0", port=PROXY_PORT, log_level="info")

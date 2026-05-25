@@ -1,11 +1,10 @@
 """
-Anthropic Messages API 路由处理（no-tools 分支，无工具调用支持）。
+Anthropic Messages API 路由处理。
 
 依赖 proxy.py 的全局函数（_do_chat、get_models 等），通过局部导入避免循环依赖。
 """
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from fastapi.responses import JSONResponse
 import json, uuid, asyncio
 from .anthropic import (
     convert_request as _anthropic_convert_request,
@@ -72,11 +71,11 @@ def _resolve_anthropic_model(model: str) -> str:
 
 @router.post("/v1/messages")
 async def anthropic_messages(request: Request):
-    """Anthropic Messages API 兼容端点（no-tools 分支，无工具调用，支持多账号+多模态）"""
+    """Anthropic Messages API 兼容端点（main 分支，支持工具调用+多账号+多模态）"""
     from proxy import (
-        CONFIG_FILE, _count_tokens, _convert_messages_for_deepseek,
+        CONFIG_FILE, _count_tokens, convert_messages_for_deepseek,
         get_models, needs_renewal, on_new_session, _vlog,
-        add_usage, add_tokens, _do_chat, cffi_requests,
+        add_usage, add_tokens, _do_chat, cffi_requests, JSONResponse,
         config_manager, extract_text_files_from_messages, extract_images_from_messages,
         upload_file_to_deepseek, fork_file_to_vision, wait_for_file_parsing,
         get_usage_status,
@@ -92,7 +91,9 @@ async def anthropic_messages(request: Request):
 
     openai_body = _anthropic_convert_request(body)
     messages = openai_body.get("messages", [])
+    tools = openai_body.get("tools", None)
     stream = openai_body.get("stream", False)
+    has_tools = bool(tools)
 
     model_info = get_models().get(model, get_models().get("deepseek-default"))
     if not model_info:
@@ -151,7 +152,7 @@ async def anthropic_messages(request: Request):
         except Exception as e:
             _vlog(f"vision fresh session failed: {e}")
 
-    prompt = _convert_messages_for_deepseek(messages)
+    prompt = convert_messages_for_deepseek(messages, tools)
     prompt_tokens = _count_tokens(prompt)
 
     # 会话管理：token 超限自动续期
@@ -177,33 +178,21 @@ async def anthropic_messages(request: Request):
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     if stream:
-        result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled,
-                         stream=True, is_retry=False, ref_file_ids=ref_file_ids)
+        result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=False, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
 
         async def _wrap():
             orig_iter = result.body_iterator
-
             async def _gen():
                 async for chunk in orig_iter:
                     yield chunk
-
             async for event in _anthropic_stream_response(_gen(), model, msg_id):
                 yield event
-
             add_usage(model, prompt_tokens, 0)
             add_tokens(account_label, cfg.get("session_id", ""), prompt_tokens)
 
-        return StreamingResponse(
-            _wrap(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-            }
-        )
+        return StreamingResponse(_wrap(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
     else:
-        result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled,
-                         stream=False, is_retry=False, ref_file_ids=ref_file_ids)
+        result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=False, is_retry=False, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
 
         add_usage(model, prompt_tokens, 0)
         add_tokens(account_label, cfg.get("session_id", ""), prompt_tokens)
@@ -221,13 +210,12 @@ async def anthropic_messages(request: Request):
 @router.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens_ep(request: Request):
     body = await request.json()
-    from proxy import _enc
-    return _anthropic_count_tokens(body, _enc)
+    return _anthropic_count_tokens(body, _get_encoder())
 
 
 @router.post("/v1/messages/batches")
 async def anthropic_create_batch_ep(request: Request):
-    from proxy import CONFIG_FILE, _count_tokens, _convert_messages_for_deepseek, get_models, _do_chat
+    from proxy import CONFIG_FILE, _count_tokens, convert_messages_for_deepseek, get_models, _do_chat, JSONResponse
     body = await request.json()
     requests_data = body.get("requests", [])
     model = body.get("model", "deepseek-default")
@@ -242,8 +230,8 @@ async def anthropic_create_batch_ep(request: Request):
         if not mi:
             return _anthropic_error_response("Unknown model")
         te, se, _, _ = mi
-        pr = _convert_messages_for_deepseek(msgs)
-        r = _do_chat(cfg, pr, model, te, se, stream=False, is_retry=False, ref_file_ids=[])
+        pr = convert_messages_for_deepseek(msgs)
+        r = _do_chat(cfg, pr, model, te, se, stream=False, is_retry=False, has_tools=False, tools=None, ref_file_ids=[])
         if isinstance(r, JSONResponse):
             return json.loads(r.body)
         return r
@@ -296,3 +284,9 @@ async def anthropic_get_msg_ep(message_id: str):
     if msg is None:
         raise HTTPException(status_code=404, detail=_anthropic_error_response(f"Message {message_id} not found", "not_found_error"))
     return msg
+
+
+def _get_encoder():
+    """延迟获取 tiktoken 编码器以避免循环导入问题。"""
+    from proxy import _enc
+    return _enc

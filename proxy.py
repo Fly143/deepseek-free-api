@@ -4,6 +4,7 @@ DeepSeek 网页 → API 代理（纯 HTTP 转发，无浏览器依赖）
 """
 import json, os, shlex, time, uuid, webbrowser, base64, re, secrets, threading
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
@@ -24,6 +25,9 @@ from usage_store import add_usage, get_usage, clear_usage
 
 # ── 会话管理 ───────────────────────────────────
 from session_store import needs_renewal, on_new_session, add_tokens, get_expired_sessions, remove_old_session
+
+# ── 响应存储 ───────────────────────────────────
+from response_store import save_response_record, get_response_record, delete_response_record, update_response_record
 
 # ── PoW (Proof of Work) Solver — 纯 Python 实现（无 WASM 依赖）────────
 from pow_native import DeepSeekPOW
@@ -54,6 +58,179 @@ def _vlog(msg: str):
             f.write(f"[{ts}] {msg}\n")
     print(f"[Vision] {msg}", flush=True)
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
+
+# ── Responses API 辅助 ──────────────────────────
+
+
+def _gen_response_id() -> str:
+    return f"resp_{uuid.uuid4().hex}"
+
+
+def _ensure_list(value: Any) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _normalize_response_tool_output(output: Any) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, (dict, list)):
+        return json.dumps(output, ensure_ascii=False)
+    return str(output)
+
+
+def _normalize_response_tool(tool: Any) -> dict | None:
+    if not isinstance(tool, dict):
+        return None
+    tid = tool.get("id") or tool.get("tool_use_id") or ""
+    name = tool.get("name") or tool.get("function", {}).get("name", "")
+    inp = tool.get("input") or tool.get("arguments") or tool.get("function", {}).get("arguments", "")
+    if not tid or not name:
+        return None
+    inp_str = _normalize_response_tool_output(inp)
+    return {
+        "type": "function",
+        "id": tid or "",
+        "function": {"name": name, "arguments": inp_str},
+    }
+
+
+def _normalize_input_file_part(part: dict) -> dict:
+    """Normalize input_items file parts for DeepSeek vision."""
+    fid = part.get("file_id") or part.get("file", {}).get("file_id", "") or part.get("file", {}).get("file_data", "")
+    if fid:
+        return {"type": "file", "file_id": fid, "model_type": "vision"}
+    return {}
+
+
+def _extract_response_messages_and_tools(input_items: Any) -> tuple[list[dict], list[dict] | None]:
+    if isinstance(input_items, str):
+        return [{"role": "user", "content": input_items}], None
+    if not isinstance(input_items, list):
+        return [], None
+
+    messages = []
+    all_tools: list[dict] = []
+    for item in input_items:
+        role = item.get("role", "user")
+        content = item.get("content", "")
+
+        if role == "developer":
+            role = "system"
+
+        if isinstance(content, list):
+            text_parts = []
+            tool_results = []
+            for block in content:
+                if isinstance(block, dict):
+                    bt = block.get("type", "")
+                    if bt == "input_text":
+                        text_parts.append(block.get("text", ""))
+                    elif bt == "input_file":
+                        fp = _normalize_input_file_part(block)
+                        if fp:
+                            text_parts.append(f"[file: {fp.get('file_id', '')}]")
+            if text_parts:
+                messages.append({"role": role, "content": "\n".join(text_parts)})
+            continue
+
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+
+    return messages, all_tools or None
+
+
+def _merge_previous_response_context(messages: list[dict], previous_response_id: str | None) -> list[dict]:
+    if not previous_response_id:
+        return messages
+    prev = get_response_record(previous_response_id)
+    if not prev:
+        raise HTTPException(404, detail={"error": {"message": f"response {previous_response_id} not found"}})
+    merged = list(messages)
+    prev_output = prev.get("output", [])
+    for out in prev_output if isinstance(prev_output, list) else [prev_output]:
+        if isinstance(out, dict) and out.get("type") == "message":
+            mc = out.get("content", [])
+            for c in mc if isinstance(mc, list) else [mc]:
+                if isinstance(c, dict):
+                    merged.append({"role": "assistant", "content": c.get("text", "")})
+    return merged
+
+
+def _normalize_response_tools(body: dict, parsed_tools: list[dict] | None) -> list[dict] | None:
+    tools = body.get("tools")
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for source in (parsed_tools or []) + (tools if isinstance(tools, list) else []):
+        normalized = _normalize_response_tool(source)
+        if normalized and normalized.get("function", {}).get("name", "") not in seen:
+            seen.add(normalized["function"]["name"])
+            merged.append(normalized)
+    return merged or None
+
+
+def _has_web_search_tool(body: dict) -> bool:
+    tools = body.get("tools", [])
+    if isinstance(tools, list):
+        for t in tools:
+            if isinstance(t, dict) and t.get("type") == "web_search":
+                return True
+    return False
+
+
+def _resolve_responses_model(body: dict) -> str:
+    model = body.get("model", "deepseek-default")
+    if not _has_web_search_tool(body) or "search" in model:
+        return model
+
+    candidates = []
+    if model.endswith("-reasoner"):
+        candidates.append(f"{model}-search")
+    candidates.append(f"{model}-search")
+    if model == "deepseek-default":
+        candidates.append("deepseek-search")
+    if model == "deepseek-reasoner":
+        candidates.append("deepseek-reasoner-search")
+
+    models = get_models()
+    for candidate in candidates:
+        if candidate in models:
+            return candidate
+    return model
+
+
+def _messages_from_responses_request(body: dict) -> tuple[list[dict], list[dict] | None]:
+    input_items = body.get("input", [])
+    if isinstance(input_items, str):
+        messages, tools = [{"role": "user", "content": input_items}], None
+    else:
+        messages, tools = _extract_response_messages_and_tools(input_items)
+
+    instructions = body.get("instructions", "")
+    if instructions:
+        messages.insert(0, {"role": "system", "content": instructions})
+
+    return messages, tools
+
+
+def _build_responses_record(body: dict) -> dict:
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    return {
+        "id": body.get("_response_id", _gen_response_id()),
+        "object": "response",
+        "created_at": now,
+        "status": "completed",
+        "model": body.get("model", "deepseek-default"),
+        "output": [],
+        "error": None,
+        "incomplete_details": None,
+    }
+
 
 # ── cURL 解析 ──────────────────────────────────────────
 def parse_curl(curl: str) -> dict:
@@ -2181,26 +2358,6 @@ def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, h
     else:
         yield f"data: {json.dumps({'error': {'message': 'Retry returned non-stream', 'type': 'server_error'}})}\n\n"
         yield "data: [DONE]\n\n"
-
-
-# ── 响应存储 ─────────────────────────────────────
-_response_store: dict = {}
-_response_lock = threading.Lock()
-
-
-def _save_response(response_id: str, data: dict):
-    with _response_lock:
-        _response_store[response_id] = data
-
-
-def _get_response(response_id: str) -> dict | None:
-    with _response_lock:
-        return _response_store.get(response_id)
-
-
-def _delete_response(response_id: str):
-    with _response_lock:
-        _response_store.pop(response_id, None)
 
 
 # ── 路由挂载 ─────────────────────────────────────

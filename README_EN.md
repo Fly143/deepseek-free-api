@@ -1,3 +1,5 @@
+> ⚠️ **Warning:** DeepSeek's official detection is currently strict. Do not exceed 2 concurrent requests per account. Do not click "Test Connection" in clients like Chatbox or RikkaHub, as this may result in a 1-day account ban. It is recommended to add multiple accounts for round-robin usage to reduce per-account risk (round-robin is enabled by default, just add multiple accounts). Add at least 3 accounts, rather than waiting for one to get banned before switching to another.
+
 # DeepSeek Free API Proxy
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
@@ -592,7 +594,7 @@ Full `token.json` configuration:
 
 ```json
 {
-  "token": "eyJ...",
+  "token": "***",
   "session_id": "abc-def-123...",
   "headers": {
     "content-type": "application/json",

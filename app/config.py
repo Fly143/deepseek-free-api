@@ -55,6 +55,7 @@ class ConfigManager:
         self.account_idx = 0
         self.accounts: List[DsAccount] = []
         self._proxy_url: str = ""
+        self._admin_password: str = "admin"
         self.load()
 
     def _migrate_legacy(self):
@@ -121,6 +122,7 @@ class ConfigManager:
                     for acc in data.get('accounts', [])
                 ]
                 self._proxy_url = data.get('proxy', '') or ''
+                self._admin_password = data.get('admin_password', 'admin')
         except Exception as e:
             print(f"[Config] 加载配置失败: {e}")
             self.accounts = []
@@ -133,6 +135,7 @@ class ConfigManager:
                 data = {
                     "accounts": [acc.to_save_dict() for acc in self.accounts],
                     "proxy": self._proxy_url or "",
+                    "admin_password": self._admin_password,
                 }
                 with open(self.config_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
@@ -217,6 +220,17 @@ class ConfigManager:
         """设置代理地址。传空字符串清除代理。"""
         with self.lock:
             self._proxy_url = (url or "").strip()
+            self.save()
+
+    def get_admin_password(self) -> str:
+        """获取管理员密码。"""
+        with self.lock:
+            return self._admin_password
+
+    def set_admin_password(self, password: str):
+        """设置管理员密码。"""
+        with self.lock:
+            self._admin_password = password or "admin"
             self.save()
 
     def get_token(self, label: str) -> str:

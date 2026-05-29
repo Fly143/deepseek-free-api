@@ -6,12 +6,14 @@ import json, os, shlex, time, uuid, webbrowser, base64, re, secrets, threading
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.security import HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
 import tiktoken
 from curl_cffi import requests as cffi_requests
 from app.config import config_manager, DsAccount
+from app.auth import verify_admin
 from app.batch import init_batch_storage as anthropic_init_batch_storage
 
 # ── Tokenizer ───────────────────────────────────
@@ -211,7 +213,16 @@ a{color:#7dd3fc}
 </style>
 </head>
 <body>
-<div class="c">
+<div class="c" id="loginBox">
+<h1>DeepSeek Proxy</h1>
+<div style="margin-bottom:20px">
+<div class="sl" style="font-weight:600;color:#e2e8f0;margin-bottom:10px" data-i18n="adminLogin">管理员登录</div>
+<div class="pw-row"><input type="password" id="adminPwd" data-i18n-ph="adminPwdPlaceholder" placeholder="请输入管理员密码" autocomplete="current-password"></div>
+<button class="btn bp" onclick="doAdminLogin()" data-i18n="adminLoginBtn">登录</button>
+<div id="loginError" style="margin-top:8px;font-size:12px;color:#fca5a5;display:none"></div>
+</div>
+</div>
+<div class="c" id="mainContent" style="display:none">
 <h1>DeepSeek Proxy</h1>
 <div style="position:absolute;top:32px;right:32px">
 <button onclick="toggleLang()" id="langBtn" style="padding:6px 14px;background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;cursor:pointer;font-size:13px;transition:all .2s">🌐 EN</button>
@@ -338,7 +349,8 @@ phoneRequired:'请输入手机号和密码',emailRequired:'请输入邮箱和密
 pasteCurl:'粘贴 cURL ...',modelCountSuffix:' 个模型: ',unknownErr:'未知错误',
 curlTitle:'📋 cURL 导入',curlSteps:'导入步骤：',
 curlStep1:'1. 打开 chat.deepseek.com 并登录',curlStep2:'2. 按 F12 → Network 面板',
-curlStep3:'3. 发送任意消息，找到 completion 请求',curlStep4:'4. 右键 → Copy as cURL，粘贴到下方'},
+curlStep3:'3. 发送任意消息，找到 completion 请求',curlStep4:'4. 右键 → Copy as cURL，粘贴到下方',
+adminLogin:'管理员登录',adminPwdPlaceholder:'请输入管理员密码',adminLoginBtn:'登录',adminPwdRequired:'请输入密码',adminLoginFail:'密码错误'},
 en:{phoneLogin:'Phone Login',emailLogin:'Email Login',usage:'Usage',settings:'Settings',
 phonePlaceholder:'Phone Number',pwdPlaceholder:'Password',loginBtn:'Login',loginBtnDoing:'Logging in...',
 emailPlaceholder:'Email Address',waitingCfg:'Awaiting Config',configured:'Configured',connFail:'Connection Failed',
@@ -366,7 +378,8 @@ phoneRequired:'Phone number and password required',emailRequired:'Email and pass
 pasteCurl:'Paste cURL ...',modelCountSuffix:' model(s): ',unknownErr:'Unknown error',
 curlTitle:'📋 cURL Import',curlSteps:'Steps:',
 curlStep1:'1. Open chat.deepseek.com and log in',curlStep2:'2. Press F12 → Network tab',
-curlStep3:'3. Send any message, find the completion request',curlStep4:'4. Right-click → Copy as cURL, paste below'}};
+curlStep3:'3. Send any message, find the completion request',curlStep4:'4. Right-click → Copy as cURL, paste below',
+adminLogin:'Admin Login',adminPwdPlaceholder:'Enter admin password',adminLoginBtn:'Login',adminPwdRequired:'Password required',adminLoginFail:'Wrong password'}};
 function _(k){return (_I[_lang]||_I.zh)[k]||k}
 function toggleLang(){_lang=_lang==='zh'?'en':'zh';localStorage.setItem('ds_lang',_lang);Q('langBtn').textContent=_lang==='zh'?'🌐 EN':'🌐 中';applyI18n()}
 function applyI18n(){
@@ -548,6 +561,58 @@ if(d.ok){Q('proxyStatus').textContent=_('proxySaved');Q('proxyStatus').style.col
 else{Q('proxyStatus').textContent=_('proxySaveFail')+(d.msg||'');t(_('proxySaveFail')+(d.msg||''),1)}
 }catch(e){Q('proxyStatus').textContent=_('proxySaveFail')+e.message;t(_('proxySaveFail')+e.message,1)}
 }
+// 管理员登录
+function doAdminLogin(){
+var pwd=Q('adminPwd').value;
+if(!pwd){Q('loginError').textContent=_('adminPwdRequired');Q('loginError').style.display='block';return}
+// 使用 Basic Auth 尝试访问 /api/config
+var headers=new Headers();
+headers.set('Authorization','Basic '+btoa('admin:'+pwd));
+fetch('/api/config',{headers:headers}).then(function(r){
+if(r.ok){
+// 登录成功，保存密码到 sessionStorage
+sessionStorage.setItem('ds_admin_pwd',pwd);
+Q('loginBox').style.display='none';
+Q('mainContent').style.display='';
+// 设置全局认证头
+window._adminAuth='Basic '+btoa('admin:'+pwd);
+cs();
+}else{
+Q('loginError').textContent=_('adminLoginFail');
+Q('loginError').style.display='block';
+}
+}).catch(function(e){
+Q('loginError').textContent=_('adminLoginFail');
+Q('loginError').style.display='block';
+});
+}
+// 检查是否已登录
+function checkAdminLogin(){
+var pwd=sessionStorage.getItem('ds_admin_pwd');
+if(pwd){
+window._adminAuth='Basic '+btoa('admin:'+pwd);
+Q('loginBox').style.display='none';
+Q('mainContent').style.display='';
+return true;
+}
+return false;
+}
+// 修改 fetch 默认行为，自动添加认证头
+var _origFetch=window.fetch;
+window.fetch=function(url,options){
+if(!options)options={};
+if(!options.headers)options.headers=new Headers();
+if(window._adminAuth){
+if(options.headers instanceof Headers){
+options.headers.set('Authorization',window._adminAuth);
+}else{
+options.headers['Authorization']=window._adminAuth;
+}
+}
+return _origFetch(url,options);
+};
+// 页面加载时检查登录状态
+checkAdminLogin();
 cs()
 </script>
 </body>
@@ -557,12 +622,12 @@ cs()
 from starlette.responses import RedirectResponse
 
 @app.get("/")
-async def root():
+async def root(creds: HTTPBasicCredentials = Depends(verify_admin)):
     return RedirectResponse(url="/admin")
 
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin():
+async def admin(creds: HTTPBasicCredentials = Depends(verify_admin)):
     from starlette.responses import Response
     html = ADMIN
     return Response(content=html, media_type="text/html", headers={
@@ -582,7 +647,7 @@ def _load_config_sync() -> dict:
 
 
 @app.get("/api/config")
-async def get_config():
+async def get_config(creds: HTTPBasicCredentials = Depends(verify_admin)):
     if not CONFIG_FILE.exists():
         return {"configured": False, "error": "未配置"}
     d = _load_config_sync()
@@ -595,7 +660,7 @@ async def get_config():
 
 
 @app.post("/api/config")
-async def save_config(data: dict):
+async def save_config(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
     curl = data.get("curl", "").strip()
     if not curl: raise HTTPException(400, "请提供 cURL")
     parsed = parse_curl(curl)
@@ -752,12 +817,12 @@ async def health():
 # ─── 用量统计 API ─────────────────────────────────────────────
 
 @app.get("/api/usage")
-async def usage_stats():
+async def usage_stats(creds: HTTPBasicCredentials = Depends(verify_admin)):
     return get_usage()
 
 
 @app.delete("/api/usage")
-async def clear_usage_stats():
+async def clear_usage_stats(creds: HTTPBasicCredentials = Depends(verify_admin)):
     clear_usage()
     return {"ok": True}
 
@@ -775,14 +840,14 @@ def _get_proxy_dict() -> dict | None:
 
 
 @app.get("/api/proxy")
-async def get_proxy():
+async def get_proxy(creds: HTTPBasicCredentials = Depends(verify_admin)):
     """获取当前代理配置"""
     proxy_url = config_manager.get_proxy()
     return {"proxy": proxy_url or ""}
 
 
 @app.put("/api/proxy")
-async def set_proxy(data: dict):
+async def set_proxy(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
     """设置代理地址。传 {"proxy": "http://127.0.0.1:7890"} 或 {"proxy": ""} 清除。"""
     url = data.get("proxy", "").strip()
     config_manager.set_proxy(url)
@@ -793,7 +858,7 @@ async def set_proxy(data: dict):
 
 
 @app.get("/api/accounts")
-async def list_accounts():
+async def list_accounts(creds: HTTPBasicCredentials = Depends(verify_admin)):
     """获取所有账号列表"""
     return {
         "accounts": config_manager.get_all_accounts(),
@@ -803,7 +868,7 @@ async def list_accounts():
 
 
 @app.post("/api/accounts")
-async def add_account(data: dict):
+async def add_account(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
     """手动添加账号"""
     login_type = data.get("login_type", "phone")
     password = data.get("password", "").strip()
@@ -842,7 +907,7 @@ async def add_account(data: dict):
 
 
 @app.delete("/api/accounts/{account_label}")
-async def remove_account(account_label: str):
+async def remove_account(account_label: str, creds: HTTPBasicCredentials = Depends(verify_admin)):
     """删除账号"""
     from urllib.parse import unquote
     label = unquote(account_label)
@@ -852,7 +917,7 @@ async def remove_account(account_label: str):
 
 
 @app.post("/api/accounts/{account_label}/relogin")
-async def relogin_account(account_label: str):
+async def relogin_account(account_label: str, creds: HTTPBasicCredentials = Depends(verify_admin)):
     """重新登录指定账号"""
     from urllib.parse import unquote
     label = unquote(account_label)
@@ -881,7 +946,7 @@ async def relogin_account(account_label: str):
 
 
 @app.post("/api/accounts/relogin-all")
-async def relogin_all():
+async def relogin_all(creds: HTTPBasicCredentials = Depends(verify_admin)):
     """重新登录所有有效账号"""
     accounts = config_manager.get_all_accounts()
     results = []
@@ -907,7 +972,7 @@ async def relogin_all():
 
 
 @app.post("/api/cleanup")
-async def manual_cleanup():
+async def manual_cleanup(creds: HTTPBasicCredentials = Depends(verify_admin)):
     """手动触发会话清理。"""
     try:
         cleanup_old_sessions()
@@ -919,7 +984,7 @@ async def manual_cleanup():
 # ─── 模型列表（免鉴权，供管理页面使用） ───────────────────────
 
 @app.get("/api/models")
-async def admin_models():
+async def admin_models(creds: HTTPBasicCredentials = Depends(verify_admin)):
     return {"models": list(get_models().keys())}
 
 

@@ -1,3 +1,5 @@
+> ⚠️ **使用提醒：** 目前 DeepSeek 官方检测比较严格。使用此项目时单账号并发不要超过 2，Chatbox、RikkaHub 等客户端不要点击"测试连接"，否则会面临账号被封禁 1 天。建议添加多账号轮询使用，减少单账号风险（轮询功能默认开启，添加多账号即可）。建议最少添加 3 个账号，而不是等一个账号被封禁之后再换另一个账号使用。
+
 # DeepSeek Free API Proxy
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
@@ -589,7 +591,7 @@ ds-free-api/
 
 ```json
 {
-  "token": "eyJ...",
+  "token": "***",
   "session_id": "abc-def-123...",
   "headers": {
     "content-type": "application/json",

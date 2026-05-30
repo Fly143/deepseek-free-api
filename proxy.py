@@ -314,6 +314,13 @@ a{color:#7dd3fc}
 </div>
 <button class="btn bp" onclick="saveProxy()" data-i18n="proxySaveBtn" style="margin-top:8px">保存代理设置</button>
 <div id="proxyStatus" style="margin-top:8px;font-size:12px;color:#64748b"></div>
+<hr>
+<div class="sl" style="font-weight:600;color:#e2e8f0;margin-bottom:8px" data-i18n="changePwdTitle">修改管理员密码</div>
+<div class="pw-row" style="margin-top:12px">
+  <input type="password" id="newPwd" data-i18n-ph="newPwdPlaceholder" placeholder="输入新密码" style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-size:14px">
+</div>
+<button class="btn bp" onclick="changePwd()" data-i18n="changePwdBtn" style="margin-top:8px">保存新密码</button>
+<div id="pwdStatus" style="margin-top:8px;font-size:12px;color:#64748b"></div>
 </div>
 </div>
 
@@ -350,7 +357,8 @@ pasteCurl:'粘贴 cURL ...',modelCountSuffix:' 个模型: ',unknownErr:'未知�
 curlTitle:'📋 cURL 导入',curlSteps:'导入步骤：',
 curlStep1:'1. 打开 chat.deepseek.com 并登录',curlStep2:'2. 按 F12 → Network 面板',
 curlStep3:'3. 发送任意消息，找到 completion 请求',curlStep4:'4. 右键 → Copy as cURL，粘贴到下方',
-adminLogin:'管理员登录',adminPwdPlaceholder:'请输入管理员密码',adminLoginBtn:'登录',adminPwdRequired:'请输入密码',adminLoginFail:'密码错误'},
+adminLogin:'管理员登录',adminPwdPlaceholder:'请输入管理员密码',adminLoginBtn:'登录',adminPwdRequired:'请输入密码',adminLoginFail:'密码错误',
+changePwdTitle:'修改管理员密码',newPwdPlaceholder:'输入新密码',changePwdBtn:'保存新密码',changePwdOk:'密码已更新',changePwdFail:'修改失败: ',changePwdEmpty:'密码不能为空'},
 en:{phoneLogin:'Phone Login',emailLogin:'Email Login',usage:'Usage',settings:'Settings',
 phonePlaceholder:'Phone Number',pwdPlaceholder:'Password',loginBtn:'Login',loginBtnDoing:'Logging in...',
 emailPlaceholder:'Email Address',waitingCfg:'Awaiting Config',configured:'Configured',connFail:'Connection Failed',
@@ -379,7 +387,8 @@ pasteCurl:'Paste cURL ...',modelCountSuffix:' model(s): ',unknownErr:'Unknown er
 curlTitle:'📋 cURL Import',curlSteps:'Steps:',
 curlStep1:'1. Open chat.deepseek.com and log in',curlStep2:'2. Press F12 → Network tab',
 curlStep3:'3. Send any message, find the completion request',curlStep4:'4. Right-click → Copy as cURL, paste below',
-adminLogin:'Admin Login',adminPwdPlaceholder:'Enter admin password',adminLoginBtn:'Login',adminPwdRequired:'Password required',adminLoginFail:'Wrong password'}};
+adminLogin:'Admin Login',adminPwdPlaceholder:'Enter admin password',adminLoginBtn:'Login',adminPwdRequired:'Password required',adminLoginFail:'Wrong password',
+changePwdTitle:'Change Admin Password',newPwdPlaceholder:'Enter new password',changePwdBtn:'Save New Password',changePwdOk:'Password updated',changePwdFail:'Failed: ',changePwdEmpty:'Password cannot be empty'}};
 function _(k){return (_I[_lang]||_I.zh)[k]||k}
 function toggleLang(){_lang=_lang==='zh'?'en':'zh';localStorage.setItem('ds_lang',_lang);Q('langBtn').textContent=_lang==='zh'?'🌐 EN':'🌐 中';applyI18n()}
 function applyI18n(){
@@ -561,6 +570,21 @@ if(d.ok){Q('proxyStatus').textContent=_('proxySaved');Q('proxyStatus').style.col
 else{Q('proxyStatus').textContent=_('proxySaveFail')+(d.msg||'');t(_('proxySaveFail')+(d.msg||''),1)}
 }catch(e){Q('proxyStatus').textContent=_('proxySaveFail')+e.message;t(_('proxySaveFail')+e.message,1)}
 }
+async function changePwd(){
+var newPwd=Q('newPwd').value.trim();
+if(!newPwd){Q('pwdStatus').textContent=_('changePwdEmpty');Q('pwdStatus').style.color='#fca5a5';return}
+try{
+const r=await fetch('/api/admin-password',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:newPwd})});
+const d=await r.json();
+if(d.ok){
+Q('pwdStatus').textContent=_('changePwdOk');Q('pwdStatus').style.color='#22c55e';t(_('changePwdOk'));
+// 更新 sessionStorage 中的密码
+sessionStorage.setItem('ds_admin_pwd',newPwd);
+window._adminAuth='Basic '+btoa('admin:'+newPwd);
+Q('newPwd').value='';
+}else{Q('pwdStatus').textContent=_('changePwdFail')+(d.detail||'');Q('pwdStatus').style.color='#fca5a5'}
+}catch(e){Q('pwdStatus').textContent=_('changePwdFail')+e.message;Q('pwdStatus').style.color='#fca5a5'}
+}
 // 管理员登录
 function doAdminLogin(){
 var pwd=Q('adminPwd').value;
@@ -622,12 +646,12 @@ cs()
 from starlette.responses import RedirectResponse
 
 @app.get("/")
-async def root(creds: HTTPBasicCredentials = Depends(verify_admin)):
+async def root():
     return RedirectResponse(url="/admin")
 
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin(creds: HTTPBasicCredentials = Depends(verify_admin)):
+async def admin():
     from starlette.responses import Response
     html = ADMIN
     return Response(content=html, media_type="text/html", headers={
@@ -852,6 +876,16 @@ async def set_proxy(data: dict, creds: HTTPBasicCredentials = Depends(verify_adm
     url = data.get("proxy", "").strip()
     config_manager.set_proxy(url)
     return {"ok": True, "proxy": url}
+
+
+@app.put("/api/admin-password")
+async def change_admin_password(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """修改管理员密码。传 {"password": "新密码"}"""
+    new_pwd = data.get("password", "").strip()
+    if not new_pwd:
+        raise HTTPException(400, "密码不能为空")
+    config_manager.set_admin_password(new_pwd)
+    return {"ok": True}
 
 
 # ─── 多账号管理 API ───────────────────────────────────────

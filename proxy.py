@@ -118,6 +118,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── 修复 /v1/v1/ 双前缀（Claude Code CLI 等客户端 base URL 带 /v1）──
+@app.middleware("http")
+async def _rewrite_double_v1(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if path.startswith("/v1/v1/"):
+        request.scope["path"] = path[3:]
+    elif path == "/v1/v1":
+        request.scope["path"] = "/v1"
+    return await call_next(request)
+
+
 
 @app.on_event("startup")
 async def startup_discover():

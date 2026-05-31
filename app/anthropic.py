@@ -500,6 +500,11 @@ def _make_message_stop() -> str:
     return _make_sse("message_stop", {"type": "message_stop"})
 
 
+def _make_error(state: StreamState, message: str) -> str:
+    """error SSE 事件。"""
+    return _make_sse("error", {"type": "error", "error": {"type": "api_error", "message": message}})
+
+
 async def stream_response(
     openai_stream: AsyncIterator[Any],
     model: str,
@@ -542,6 +547,16 @@ async def stream_response(
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
+
+        # 检查上游错误（如 "Content is too long"）
+        error_info = obj.get("error")
+        if error_info is not None:
+            err_msg = error_info.get("message", "") if isinstance(error_info, dict) else str(error_info)
+            if "too long" in err_msg.lower():
+                print(f"[TOO_LONG][ANTHRO_STREAM] model={model} error={err_msg[:300]}", flush=True)
+            yield _make_error(state, err_msg)
+            yield _make_message_stop()
+            return
 
         choices = obj.get("choices", [])
         if not choices:

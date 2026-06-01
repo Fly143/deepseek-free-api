@@ -400,7 +400,7 @@ loadUsage();cs();
 function Qs(s){return document.querySelectorAll(s)}
 function Q(id){return document.getElementById(id)}
 function switchTab(type){
-var ti={'phone':0,'email':1,'usage':2,'settings':3};
+var ti={'phone':0,'email':1,'usage':2,'accounts':3,'settings':4};
 document.querySelectorAll('.tab').forEach((t,i)=>{t.className='tab'+(i===ti[type]?' active':'');});
 if(Q('phonePanel'))Q('phonePanel').className='panel'+(type==='phone'?' active':'');
 if(Q('emailPanel'))Q('emailPanel').className='panel'+(type==='email'?' active':'');
@@ -504,7 +504,7 @@ var tk=a.token_masked||'***';
 var lt=a.login_time||'-';
 var l=encodeURIComponent(a.account_label);
 h+='<tr><td>'+a.account_label+'</td><td><span class="acct-st '+st+'"></span>'+stl+'</td><td>'+tk+'</td><td>'+lt+'</td>';
-h+='<td><button class="acct-btn rl" onclick="reloginAccount(\''+l+'\')">'+_('reloginBtn')+'</button><button class="acct-btn rm" onclick="removeAccount(\''+l+'\')">'+_('deleteBtn')+'</button></td></tr>';
+h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">`+_('reloginBtn')+`</button><button class="acct-btn rm" onclick="removeAccount('${l}')">`+_('deleteBtn')+`</button></td></tr>`;
 }
 h+='</table>';
 Q('acctList').innerHTML=h;

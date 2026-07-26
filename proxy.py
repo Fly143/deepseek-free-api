@@ -1438,6 +1438,13 @@ def parse_curl(curl: str) -> dict:
         tokens = shlex.split(curl)
     except ValueError:
         tokens = curl.replace("\\\n", " ").split()
+    # When cURL uses \\\n (backslash-newline) continuation (e.g. Chrome
+    # DevTools "Copy as cURL" on macOS), shlex.split preserves '\n' as
+    # the first character of the following token, producing "\n-H" or
+    # "\n--data-raw".  Strip only leading '\n' — not all whitespace —
+    # so intentional whitespace in values is preserved.
+    tokens = [t.lstrip('\n') for t in tokens]
+    tokens = [t for t in tokens if t]
     out = {"url": "", "headers": {}, "body": ""}
     i = 0
     while i < len(tokens):

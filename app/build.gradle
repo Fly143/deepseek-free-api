@@ -39,12 +39,17 @@ android {
         }
     }
 
+    // 签名：仓库不含 keystore（敏感）。存在 release.keystore 时用 release 签名；
+    // 不存在时回退 debug 签名，保证 clone 后可直接构建安装。
+    def hasReleaseKey = file('../release.keystore').exists()
     signingConfigs {
         release {
-            storeFile file('../release.keystore')
-            storePassword 'mimo2api123'
-            keyAlias 'mimo2api'
-            keyPassword 'mimo2api123'
+            if (hasReleaseKey) {
+                storeFile file('../release.keystore')
+                storePassword 'mimo2api123'
+                keyAlias 'mimo2api'
+                keyPassword 'mimo2api123'
+            }
         }
     }
 
@@ -54,7 +59,7 @@ android {
         }
         release {
             minifyEnabled false
-            signingConfig signingConfigs.release
+            signingConfig hasReleaseKey ? signingConfigs.release : signingConfigs.debug
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }

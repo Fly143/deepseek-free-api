@@ -1,11 +1,19 @@
+# Android 构建产物
+app/build/
+build/
+.gradle/
+local.properties
+*.iml
+.idea/
+
+# 敏感文件（签名密钥、真实配置）
+*.keystore
+config.json
 token.json
 usage.json
 sessions.json
 responses.json
-vision.log
-.codex/
-__pycache__/
 *.pyc
-config.json
-*.bak
-*.bak
+__pycache__/
+.ds_feature_did
+vision.log

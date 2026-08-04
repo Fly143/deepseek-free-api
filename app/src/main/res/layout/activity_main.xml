@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0F1115">
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:padding="28dp"
+        android:textColor="#E6E8EB"
+        android:textSize="15sp"
+        android:lineSpacingExtra="6dp"
+        android:text="正在启动…" />
+
+    <WebView
+        android:id="@+id/web"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <Button
+        android:id="@+id/btn_login"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="18dp"
+        android:visibility="gone"
+        android:text="登录 DeepSeek"
+        android:textSize="13sp"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#4D6BFE" />
+</FrameLayout>

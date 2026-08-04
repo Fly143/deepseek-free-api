@@ -1,0 +1,84 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'com.dsapi.app'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.dsapi.app"
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName "1.0.0"
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+
+        python {
+            version "3.11"
+            buildPython "C:/Users/Administrator/AppData/Local/Programs/Python/Python311/python.exe"
+
+            pip {
+                // curl-cffi / tiktoken 在 Chaquopy 无预编译轮子，
+                // 已用 _compat 垫片分别替换为 httpx / 纯 Python 计数
+                install "fastapi==0.115.5"
+                install "uvicorn==0.32.1"
+                install "httpx==0.27.2"
+                install "pydantic<2"
+                install "python-multipart==0.0.20"
+                install "python-dotenv==1.0.1"
+            }
+
+            pyc {
+                src false
+            }
+        }
+    }
+
+    signingConfigs {
+        release {
+            storeFile file('../release.keystore')
+            storePassword 'mimo2api123'
+            keyAlias 'mimo2api'
+            keyPassword 'mimo2api123'
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packagingOptions {
+        jniLibs {
+            // Node 二进制以 libnodebin.so 形式打入，必须不压缩才能直接执行
+            useLegacyPackaging true
+        }
+    }
+
+    // Node 运行时依赖库体积大，关闭对 assets 的压缩以便运行时直接读取
+    aaptOptions {
+        noCompress 'so', 'wasm'
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.webkit:webkit:1.11.0'
+    implementation 'com.google.android.material:material:1.12.0'
+}

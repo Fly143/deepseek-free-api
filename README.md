@@ -16,17 +16,23 @@
 |---|---|
 | Android SDK | compileSdk 35 (Android 15) |
 | JDK | 17 |
-| Gradle | 8.9（wrapper 自动下载） |
+| Gradle | 8.9（wrapper 自动下载，无需预装） |
 | Python 依赖 | 纯 Python 包，构建时由 Chaquopy 自动安装 |
 
 ## 构建
 
 ```bash
-# 1. 配置 SDK 路径（本机路径）
-#    编辑 local.properties（不存在则创建）：
-#    sdk.dir=C:\\Android\\sdk
+# 1. 克隆
+git clone -b android https://github.com/Fly143/deepseek-free-api.git
+cd deepseek-free-api
 
-# 2. 构建 release APK（无 keystore 时自动使用 debug 签名）
+# 2. 创建 local.properties（Windows 注意格式，必须用 \: 转义冒号）
+#    Windows:
+echo sdk.dir=C\:\\Android\\sdk > local.properties
+#    macOS/Linux:
+echo sdk.dir=/path/to/android/sdk > local.properties
+
+# 3. 构建 release APK（无 keystore 时自动使用 debug 签名）
 ./gradlew assembleRelease
 # 或 debug 版
 ./gradlew assembleDebug
@@ -35,9 +41,13 @@
 app/build/outputs/apk/release/app-release.apk
 ```
 
-> 如需正式签名：在工程根目录放置 `release.keystore`（别名 `mimo2api`），
-> 密码见 `app/build.gradle` 的 `signingConfigs`。没有 keystore 也能构建，
-> 会自动回退到 debug 签名（可直接安装测试）。
+> **⚠️ Windows 用户注意**：`local.properties` 中的路径必须使用 `\:` 转义冒号，
+> 例如 `sdk.dir=C\:\\Android\\sdk`。如果写成 `sdk.dir=C:\Android\sdk`（不转义）
+> 会导致 `IOException: 文件名、目录名或卷标语法不正确`。
+
+> **签名**：仓库不含 `release.keystore`（避免密钥泄露）。构建时会自动检测：
+> - 有 `release.keystore` → 使用 release 签名
+> - 无 `release.keystore` → 回退 debug 签名（可直接安装测试）
 
 ## 架构
 
@@ -55,19 +65,18 @@ app/build/outputs/apk/release/app-release.apk
 
 - 端口：**8001**（与 MiMo2API 的 8000 隔离，可同时运行）
 - 管理后台认证：`admin` / `admin`（可在 config.json 修改）
-- Python 数据目录：`/data/user/0/com.dsapi.app/files/`（APK 内只读，运行时重定向）
 
 ## 与主分支的关系
 
 本分支（`android`）为 Android 打包版。主分支（`main`）是桌面版 Python 服务。
-同步流程：主分支更新后，将 `app/`、`proxy.py` 等 Python 代码同步到
+同步流程：主分支更新后，将 `proxy.py` 等 Python 代码同步到
 `app/src/main/python/` 并重新构建 APK。
 
 ## 主要文件
 
 | 文件 | 说明 |
 |---|---|
-| `app/src/main/python/proxy.py` | DeepSeek 代理主逻辑（v2.3.9 基） |
+| `app/src/main/python/proxy.py` | DeepSeek 代理主逻辑 |
 | `app/src/main/python/android_boot.py` | Android 启动器（垫片注入、Node 解包、数据重定向） |
 | `app/src/main/python/_curl_cffi_shim.py` | curl_cffi → httpx 垫片 |
 | `app/src/main/python/_tiktoken_shim.py` | tiktoken 纯 Python 近似 |

@@ -731,6 +731,42 @@ pip install fastapi uvicorn curl-cffi python-dotenv
 - **Node.js** — PoW solver (required, install with `pkg install nodejs` or `apt install nodejs`)
 - Python 3.10+ — runtime
 
+## Batch Register Accounts (auto-login & pool)
+
+The admin panel now has a **"Batch Register"** tab: register DeepSeek accounts in bulk, auto-login after success, and write them into the multi-account pool for automatic round-robin load balancing.
+
+### Flow
+
+1. `POST /auth-api/v0/users/create_guest_challenge` — get the registration PoW challenge
+2. Solve the challenge (reuses `pow_native`, Node WASM in seconds) → put into `x-ds-guest-pow-response` header
+3. `POST /auth-api/v0/users/create_email_verification_code` — send email verification code
+4. Read the code: **mail.cx temporary mailbox** (recommended) / IMAP inbox / generic temp-mail API / manual input
+5. `POST /auth-api/v0/users/register` — registration returns token directly (iOS client fingerprint + real device ID reduces risk-control interception)
+6. Auto-login: use the registered email/password through the standard login flow to get chat token + session, written into the `config.json` account pool
+
+### Usage (mail.cx recommended)
+
+1. Open admin panel `http://localhost:8000/admin` → **Batch Register** tab
+2. Verification source: select **mail.cx temporary mailbox (recommended)**
+3. Fill in the mail.cx API Key → click **Get Domains** → choose a mailbox suffix (e.g. `ds.mail.zjb.edu.kg`) → save config
+4. Fill in the **registration count** (email prefix auto-randomized); password is random by default (unique per account), or uncheck to set a common password manually
+5. Click **Start Batch Register**; real-time logs scroll automatically
+6. After the task ends, click **Download Account List** to export CSV (`email,password,status`), or export all accounts in the pool
+
+> "Advanced: custom email list" can be expanded to specify emails manually (one local-part per line, supports `{N-M}` expansion); leave empty to randomize by count.
+
+> ⚠️ **Notes:**
+> - The registration endpoint returns `REGISTER_FROM_MAINLAND` for mainland China IPs — configure an overseas proxy in **Settings** first.
+> - DeepSeek has a send-rate limit (`EMAIL_REQUEST_TOO_FREQUENT`); the task auto-waits and retries.
+> - Registration and login both use a **random iOS client fingerprint** (UA/version/timezone/rangers-id/device_id randomized each time) to bypass the AWS WAF interception triggered by Web traffic on chat.deepseek.com.
+>
+> 💡 **Key to reducing ban probability: more accounts is better.** Using this batch-register feature can greatly reduce the impact of a single-account ban — **it is recommended to add as many accounts as possible (ideally 100)**. Combined with the existing multi-account round-robin, when one account gets banned it automatically switches to another, significantly improving overall availability.
+>
+> ⚠️ **Limits of batch registration:**
+> - **A single IP can register at most ~30 accounts in a short period**; exceeding this gets rate-limited — spread it out or change IP.
+> - **Mainland China IPs may be unable to use mail.cx batch registration** (endpoint returns `REGISTER_FROM_MAINLAND`).
+> - If registering via VPN/proxy, **watch out for DNS leaks**: if your system DNS still goes through the local ISP (rather than inside the VPN tunnel), registration may fail or be flagged as abnormal. Make sure DNS also routes through the proxy after enabling it.
+
 ## Limitations & Known Issues
 
 | Limitation | Description |
@@ -748,7 +784,7 @@ pip install fastapi uvicorn curl-cffi python-dotenv
 A: The admin panel is a single-file HTML embedded in `proxy.py`. Check for JavaScript errors (F12 Console). Make sure you access `http://localhost:8000/admin` directly.
 
 **Q: "Update to the latest version to use Expert/Vision" error?**
-A: `x-client-version` must match DeepSeek's web UI version (currently `2.0.2`). The proxy sets this automatically at startup.
+A: `x-client-version` must match DeepSeek's web UI version (currently `2.4.2`). The proxy sets this automatically at startup.
 
 **Q: PoW solving fails?**
 A: Check if Node.js is installed (`node --version`). If Node.js solving fails, the proxy automatically falls back to Python pure algorithm solving (slower but no external dependencies).

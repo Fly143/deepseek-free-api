@@ -1,6 +1,19 @@
-> ⚠️ **使用提醒：** 目前 DeepSeek 官方检测比较严格。使用此项目时单账号并发不要超过 2，Chatbox、RikkaHub 等客户端不要点击"测试连接"，否则会面临账号被封禁 1 天。建议添加多账号轮询使用，减少单账号风险（轮询功能默认开启，添加多账号即可）。建议最少添加 3 个账号，而不是等一个账号被封禁之后再换另一个账号使用。
-
 # DeepSeek Free API Proxy
+
+## 🚨🚨🚨 封号警告 · BAN WARNING 🚨🚨🚨
+
+<div align="center">
+
+# ⛔ 此项目目前封号问题严重，不建议使用 ⛔
+
+**DeepSeek 官方检测力度持续加强，封号处罚会依据违规次数逐渐升级：**
+
+# 🔴 第 1 次 → 封禁 1 天 ｜ 第 2 次 → 封禁 3 天 ｜ 第 3 次 → 封禁 8 天 → 永久封禁
+
+</div>
+
+---
+
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)

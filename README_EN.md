@@ -1,6 +1,26 @@
-> ⚠️ **Warning:** DeepSeek's official detection is currently strict. Do not exceed 2 concurrent requests per account. Do not click "Test Connection" in clients like Chatbox or RikkaHub, as this may result in a 1-day account ban. It is recommended to add multiple accounts for round-robin usage to reduce per-account risk (round-robin is enabled by default, just add multiple accounts). Add at least 3 accounts, rather than waiting for one to get banned before switching to another.
-
 # DeepSeek Free API Proxy
+
+## 🚨🚨🚨 Ban Warning 🚨🚨🚨
+
+<div align="center">
+
+# ⛔ Severe account-ban issues — this project is NOT recommended for use ⛔
+
+**DeepSeek's official detection keeps tightening. Penalties escalate with each offense:**
+
+# 🔴 1st offense → 1-day ban ｜ 2nd → 3-day ban ｜ 3rd → 8-day ban → PERMANENT ban
+
+</div>
+
+---
+
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![FastAPI](https://img.shields.io/badge/FastAPI-teal)](https://fastapi.tiangolo.com/)
+
+Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-compatible API**, with dynamic model discovery, automatic PoW solving, and token refresh.
+
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)

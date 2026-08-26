@@ -49,6 +49,10 @@ CONFIG_FILE = BASE_DIR / "config.json"
 # 多账号管理
 from app.config import config_manager, DsAccount
 from app.auth import verify_admin
+from app.registrar import (BatchRegistrar, registrar as _registrar,
+                           send_verification_code, expand_email_patterns,
+                           list_mailcx_domains, generate_local_part,
+                           random_ios_headers, new_device_id)
 VISION_LOG = BASE_DIR / "vision.log"
 _DEBUG = os.getenv("DS_DEBUG", "").lower() in ("1", "true", "yes")
 
@@ -1615,6 +1619,7 @@ a{color:#7dd3fc}
 <div class="tab" onclick="switchTab('usage')">用量统计</div>
 <div class="tab" onclick="switchTab('accounts')">账号管理</div>
 <div class="tab" onclick="switchTab('settings')" data-i18n="settings">设置</div>
+<div class="tab" onclick="switchTab('register')">批量注册</div>
 </div>
 
 <div id="phonePanel" class="panel active">
@@ -1713,6 +1718,76 @@ a{color:#7dd3fc}
 <button class="btn bp" onclick="changePwd()" data-i18n="changePwdBtn" style="margin-top:8px">保存新密码</button>
 <div id="pwdStatus" style="margin-top:8px;font-size:12px;color:#64748b"></div>
 </div>
+
+<div id="registerPanel" class="panel">
+<div class="sl" style="font-weight:600;color:#e2e8f0;margin-bottom:10px">批量注册账号（注册后自动登录并入池）</div>
+<div style="font-size:12px;color:#94a3b8;line-height:1.7;margin-bottom:10px">
+  流程：发送验证码 → mail.cx 临时邮箱收码 → 注册 → 自动登录并入账号池，之后由轮询负载均衡自动使用。<br>
+  只需填写注册数量，邮箱前缀与密码均随机生成；也可在「高级」里自定义邮箱列表。<br>
+  ⚠️ 注册接口对大陆 IP 直接返回 <code>REGISTER_FROM_MAINLAND</code>，需先在「设置」中配置海外代理。
+</div>
+<div class="pw-row" style="display:flex;gap:8px;align-items:center">
+  <input type="number" id="regCount" value="1" min="1" max="500" placeholder="注册数量" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-size:14px">
+  <span style="font-size:13px;color:#94a3b8;white-space:nowrap">个账号（邮箱前缀随机生成）</span>
+</div>
+<details style="margin-top:6px">
+  <summary style="cursor:pointer;font-size:12px;color:#64748b">高级：自定义邮箱列表（留空则按数量随机生成）</summary>
+  <div class="pw-row" style="margin-top:6px">
+    <textarea id="regEmails" placeholder="每行一个邮箱，或 user{1-5}@example.com 批量展开" style="width:100%;height:70px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-size:13px;resize:vertical"></textarea>
+  </div>
+</details>
+<div class="pw-row" style="margin-top:8px;display:flex;gap:8px;align-items:center">
+  <input type="password" id="regPassword" placeholder="注册密码（至少8位，含字母+数字）" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-size:14px">
+  <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#e2e8f0;white-space:nowrap;cursor:pointer">
+    <input type="checkbox" id="regRandomPw" checked onchange="regPwToggle()"> 随机生成密码
+  </label>
+</div>
+<div class="row" style="margin-top:8px;display:flex;align-items:center;gap:8px">
+  <span style="font-size:12px;color:#94a3b8">Region:</span>
+  <select id="regRegion" style="background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:8px;font-size:13px">
+    <option value="US">US</option><option value="JP">JP</option><option value="SG">SG</option>
+    <option value="GB">GB</option><option value="DE">DE</option><option value="AU">AU</option>
+  </select>
+  <span style="font-size:12px;color:#94a3b8">验证码来源:</span>
+  <select id="regReader" onchange="regReaderChange()" style="background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:8px;font-size:13px">
+    <option value="mailcx">mail.cx 临时邮箱（推荐）</option>
+    <option value="manual">手动输入</option>
+    <option value="imap">IMAP 收件箱</option>
+    <option value="temp_api">通用临时邮箱 API</option>
+  </select>
+</div>
+<div id="regMailcx" style="margin-top:8px">
+  <div class="pw-row" style="display:flex;gap:6px;align-items:center">
+    <input id="regMailcxKey" placeholder="mail.cx API Key (tm_live_...)" style="flex:3;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px">
+    <button class="btn" style="background:#2563eb;color:#fff;font-size:12px;padding:10px 14px" onclick="loadMailcxDomains()">获取域名</button>
+  </div>
+  <div class="pw-row" style="margin-top:6px;display:flex;gap:6px;align-items:center">
+    <select id="regMailcxDomain" style="flex:3;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px">
+      <option value="">（先获取域名）</option>
+    </select>
+    <button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:10px 14px" onclick="saveMailcxConfig()">保存配置</button>
+  </div>
+  <div style="font-size:11px;color:#64748b;margin-top:4px">mail.cx 本地部分仅允许小写字母/数字/._-，建议用 <code>user{01-10}</code> 展开（不要用 + 号）；纯本地部分会自动补全 @域名</div>
+</div>
+<div id="regImap" style="display:none;margin-top:8px">
+  <div class="row" style="display:flex;gap:6px">
+    <input class="ph" id="regImapHost" placeholder="IMAP 服务器 (imap.example.com)" style="flex:2;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px">
+    <input class="ph" id="regImapPort" placeholder="端口" value="993" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px">
+  </div>
+  <div class="pw-row" style="margin-top:6px"><input id="regImapUser" placeholder="IMAP 账号（通常为邮箱）" style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px"></div>
+  <div class="pw-row" style="margin-top:6px"><input type="password" id="regImapPass" placeholder="IMAP 密码 / 授权码" style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px"></div>
+</div>
+<div id="regTempApi" style="display:none;margin-top:8px">
+  <div class="pw-row"><input id="regTempUrl" placeholder="临时邮箱 JSON API URL（返回含 6 位验证码的 JSON）" style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px"></div>
+</div>
+<div class="row" style="margin-top:10px;display:flex;gap:8px;align-items:center">
+  <button class="btn bp" onclick="startBatch()">开始批量注册</button>
+  <button class="btn" style="background:#7f1d1d;color:#fca5a5" onclick="stopBatch()">停止任务</button>
+  <button class="btn" style="background:#334155;color:#e2e8f0" onclick="loadRegStatus()">刷新状态</button>
+  <button class="btn" style="background:#0d9488;color:#fff" onclick="exportAccounts()">下载账号列表</button>
+</div>
+<div id="regStatus" style="margin-top:12px;font-size:12px;color:#64748b"></div>
+</div>
 </div>
 
 <div id="toast" class="toast"></div>
@@ -1804,17 +1879,19 @@ function Qs(s){return document.querySelectorAll(s)}
 document.addEventListener('DOMContentLoaded',function(){Q('langBtn').textContent=_lang==='zh'?'🌐 EN':'🌐 中';applyI18n()});
 function Q(id){return document.getElementById(id)}
 function switchTab(type){
-var ti={'phone':0,'email':1,'usage':2,'accounts':3,'settings':4};
+var ti={'phone':0,'email':1,'usage':2,'accounts':3,'settings':4,'register':5};
 document.querySelectorAll('.tab').forEach((t,i)=>{t.className='tab'+(i===ti[type]?' active':'');});
 Q('phonePanel').className='panel'+(type==='phone'?' active':'');
 Q('emailPanel').className='panel'+(type==='email'?' active':'');
 if(Q('usagePanel'))Q('usagePanel').className='panel'+(type==='usage'?' active':'');
 if(Q('accountsPanel'))Q('accountsPanel').className='panel'+(type==='accounts'?' active':'');
 if(Q('settingsPanel'))Q('settingsPanel').className='panel'+(type==='settings'?' active':'');
-var as=Q('apiSection');if(as)as.style.display=(type==='usage'||type==='accounts'||type==='settings')?'none':'';
+if(Q('registerPanel'))Q('registerPanel').className='panel'+(type==='register'?' active':'');
+var as=Q('apiSection');if(as)as.style.display=(type==='usage'||type==='accounts'||type==='settings'||type==='register')?'none':'';
 if(type==='usage')loadUsage();
 if(type==='accounts')loadAccounts();
 if(type==='settings'){loadProxy();loadPassthrough();}
+if(type==='register'){loadRegStatus();regPwToggle();}
 }
 async function cs(){
 try{const r=await fetch('/api/config');const d=await r.json()
@@ -1942,6 +2019,171 @@ var d=await r.json();
 t(d.ok?d.msg:_('cleanupFail')+(d.msg||_('unknown')),d.ok?0:1)
 }catch(e){t(_('cleanupFail')+e.message,1)}
 if(btn){btn.disabled=false;btn.textContent=_('cleanupSessionsBtn')}
+}
+// === 批量注册 ===
+var _regJob='';
+function regReaderChange(){
+  var m=Q('regReader').value;
+  Q('regImap').style.display=(m==='imap')?'':'none';
+  Q('regTempApi').style.display=(m==='temp_api')?'':'none';
+  Q('regMailcx').style.display=(m==='mailcx')?'':'none';
+  if(m==='mailcx')loadMailcxConfig();
+}
+async function loadMailcxConfig(){
+  try{
+    const r=await fetch('/api/register/mailcx-config');
+    const d=await r.json();
+    if(d.api_key){Q('regMailcxKey').value=d.api_key;loadMailcxDomains();}
+    if(d.domain)Q('regMailcxDomain').value=d.domain;
+  }catch(e){}
+}
+async function loadMailcxDomains(){
+  var key=Q('regMailcxKey').value.trim();
+  if(!key){t('请先填写 mail.cx API Key',1);return}
+  try{
+    const r=await fetch('/api/register/mailcx-domains?api_key='+encodeURIComponent(key));
+    const d=await r.json();
+    if(!d.ok){t(d.error||'获取域名失败',1);return}
+    var sel=Q('regMailcxDomain');
+    sel.innerHTML='<option value="">（选择邮箱后缀）</option>'+d.domains.map(x=>'<option value="'+x+'">'+x+'</option>').join('');
+    var cur=Q('regMailcxDomain').value;
+    t('获取到 '+d.domains.length+' 个可用后缀');
+    saveMailcxConfig();
+  }catch(e){t('错误: '+e.message,1)}
+}
+async function saveMailcxConfig(){
+  var key=Q('regMailcxKey').value.trim();
+  if(!key)return;
+  try{
+    await fetch('/api/register/mailcx-config',{method:'PUT',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({api_key:key,domain:Q('regMailcxDomain').value})});
+  }catch(e){}
+}
+function regPwToggle(){
+  Q('regPassword').disabled=Q('regRandomPw').checked;
+  Q('regPassword').style.opacity=Q('regRandomPw').checked?'0.5':'1';
+}
+async function startBatch(){
+  var emails=(Q('regEmails').value||'').split(String.fromCharCode(10)).map(s=>s.trim()).filter(Boolean);
+  var count=parseInt(Q('regCount').value)||0;
+  var randomPw=Q('regRandomPw').checked;
+  var password=randomPw?'':Q('regPassword').value;
+  if(!emails.length&&!count){t('请填写注册数量',1);return}
+  if(!randomPw&&!password){t('请填写注册密码或勾选随机生成',1);return}
+  var reader={mode:Q('regReader').value};
+  var domain='';
+  if(reader.mode==='mailcx'){
+    reader.api_key=Q('regMailcxKey').value.trim();
+    domain=Q('regMailcxDomain').value;
+    if(!reader.api_key){t('请填写 mail.cx API Key',1);return}
+    if(!domain){t('请选择邮箱后缀',1);return}
+    saveMailcxConfig();
+  }else if(reader.mode==='imap'){
+    reader.host=Q('regImapHost').value.trim();
+    reader.port=parseInt(Q('regImapPort').value)||993;
+    reader.user=Q('regImapUser').value.trim();
+    reader.password=Q('regImapPass').value;
+    reader.folder='INBOX';
+    if(!reader.host||!reader.user||!reader.password){t('请填写完整 IMAP 配置',1);return}
+  }else if(reader.mode==='temp_api'){
+    reader.url=Q('regTempUrl').value.trim();
+    if(!reader.url){t('请填写临时邮箱 API URL',1);return}
+  }
+  try{
+    const r=await fetch('/api/register/start',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({emails:emails,count:count,password:password,random_password:randomPw,region:Q('regRegion').value,
+        auto_login:true,reader:reader,wait_timeout:300,domain:domain})});
+    const d=await r.json();
+    if(d.ok){_regJob=d.job_id;t('任务已启动: '+d.job_id);
+      Q('regStatus').innerHTML='<div style="color:#7dd3fc">任务 '+d.job_id+' 运行中，共 '+d.emails.length+' 个邮箱...</div>';
+      pollRegStatus();
+    }else t(d.error||d.detail||'启动失败',1);
+  }catch(e){t('错误: '+e.message,1)}
+}
+function pollRegStatus(){
+  if(!_regJob)return;
+  loadRegStatus();
+  setTimeout(pollRegStatus,2000);
+}
+async function loadRegStatus(){
+  if(!_regJob){Q('regStatus').innerHTML='';return}
+  try{
+    const r=await fetch('/api/register/status?job_id='+encodeURIComponent(_regJob));
+    const d=await r.json();
+    renderRegStatus(d);
+    if(d.status==='done'||d.status==='stopped')_regJob='';
+  }catch(e){}
+}
+function renderRegStatus(job){
+  var stColor=job.status==='done'?'#4ade80':(job.status==='failed'||job.status==='stopped'?'#f87171':'#7dd3fc');
+  var h='<div style="color:'+stColor+';margin-bottom:6px;font-weight:600">任务 '+job.id+' ['+job.status+']'+
+        ' · 密码：'+(job.password_masked||'-')+' · 完成 '+
+        Object.values(job.results).filter(function(r){return r.status==='done'}).length+'/'+job.emails.length+'</div>';
+  h+='<table class="acct-tbl"><tr><th>邮箱</th><th>状态</th><th>Token</th><th>耗时(s)</th><th>错误</th></tr>';
+  for(var email of job.emails){
+    var r=job.results[email]||{};
+    var c=r.status==='done'?'#4ade80':(r.status==='failed'?'#f87171':'#94a3b8');
+    h+='<tr><td>'+email+'</td><td style="color:'+c+'">'+r.status+'</td><td>'+(r.token_masked||'')+'</td><td>'+(r.elapsed||'')+'</td><td style="color:#f87171;font-size:11px">'+(r.error||'')+'</td></tr>';
+  }
+  h+='</table>';
+  h+='<div id="regLogBox" style="margin-top:6px;max-height:160px;overflow:auto;font-family:monospace;font-size:11px;color:#94a3b8;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px">'+job.logs.join('<br>')+'</div>';
+  if(job.status==='running'){
+    h+='<div style="margin-top:8px;display:flex;gap:6px;align-items:center">'+
+       '<input id="regCodeEmail" placeholder="邮箱" style="flex:2;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:8px;font-size:12px">'+
+       '<input id="regCode" placeholder="6位验证码" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:8px;font-size:12px">'+
+       '<button class="btn" style="background:#2563eb;color:#fff;font-size:12px;padding:8px 14px" onclick="submitBatchCode()">提交验证码</button></div>';
+  }else{
+    h+='<div style="margin-top:8px;display:flex;gap:8px">'+
+       '<button class="btn" style="background:#0d9488;color:#fff;font-size:12px;padding:8px 14px" onclick="exportAccounts()">下载账号密码列表</button>'+
+       '<button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:8px 14px" onclick="exportPool()">导出账号池全部账号</button></div>';
+  }
+  Q('regStatus').innerHTML=h;
+  var lb=Q('regLogBox');if(lb)lb.scrollTop=lb.scrollHeight;
+}
+async function exportAccounts(){
+  if(!_regJob){t('无任务，先启动批量注册');return}
+  try{
+    const r=await fetch('/api/register/export?job_id='+encodeURIComponent(_regJob));
+    if(!r.ok){let d={};try{d=await r.json()}catch(e){};t(d.detail||('导出失败 HTTP '+r.status),1);return}
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='deepseek_accounts_'+_regJob+'.csv';
+    document.body.appendChild(a);a.click();a.remove();
+    URL.revokeObjectURL(url);
+    t('已导出账号密码列表');
+  }catch(e){t('下载失败: '+e.message,1)}
+}
+async function exportPool(){
+  try{
+    const r=await fetch('/api/accounts/export');
+    if(!r.ok){t('导出失败',1);return}
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='deepseek_accounts_pool.csv';
+    document.body.appendChild(a);a.click();a.remove();
+    URL.revokeObjectURL(url);
+    t('已导出账号池');
+  }catch(e){t('下载失败: '+e.message,1)}
+}
+async function submitBatchCode(){
+  var email=Q('regCodeEmail').value.trim();
+  var code=Q('regCode').value.trim();
+  if(!email||!code){t('请填写邮箱和验证码',1);return}
+  try{
+    const r=await fetch('/api/register/code',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job_id:_regJob,email:email,code:code})});
+    const d=await r.json();
+    if(d.ok){t('验证码已提交');loadRegStatus()}else t(d.error||d.detail||'提交失败',1);
+  }catch(e){t('错误: '+e.message,1)}
+}
+async function stopBatch(){
+  if(!_regJob){t('无运行中的任务');return}
+  try{
+    await fetch('/api/register/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_id:_regJob})});
+    t('已请求停止');loadRegStatus();
+  }catch(e){t('错误: '+e.message,1)}
 }
 // === 代理配置 ===
 async function loadProxy(){
@@ -2108,7 +2350,7 @@ async def deepseek_login(data: dict):
         raise HTTPException(400, "请提供密码")
 
     # 构造登录 payload（参考 NIyueeE/ds-free-api: email 和 mobile 二选一）
-    login_payload = {"password": password, "device_id": secrets.token_hex(16), "os": "web"}
+    login_payload = {"password": password, "device_id": new_device_id(), "os": "ios"}
     account_label = ""
     email, mobile, area_code = "", "", "+86"
 
@@ -2130,42 +2372,21 @@ async def deepseek_login(data: dict):
         login_payload["email"] = ""
         account_label = f"{area_code} {mobile}"
 
-    DS_HEADERS = {
-        "content-type": "application/json",
-        "origin": "https://chat.deepseek.com",
-        "referer": "https://chat.deepseek.com/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
-        "x-client-version": "2.0.2",
-        "x-client-platform": "web",
-    }
+    DS_HEADERS = random_ios_headers()
 
     try:
-        # 0. 创建 Session + 预访问首页获取 WAF Cookie
-        session = cffi_requests.Session()
-        session.impersonate = "chrome120"
-        proxy_dict = _get_proxy_dict()
-        if proxy_dict:
-            session.proxies = proxy_dict
-        try:
-            session.get(
-                "https://chat.deepseek.com/",
-                headers={"user-agent": DS_HEADERS.get("user-agent", "")},
-                timeout=15,
-            )
-        except Exception:
-            pass  # 首页访问失败不阻塞登录
-
-        # 1. 登录（使用 session 自动携带 Cookie）
-        login_resp = session.post(
+        # 1. 登录（iOS 随机指纹绕过 WAF）
+        login_resp = cffi_requests.post(
             "https://chat.deepseek.com/api/v0/users/login",
             json=login_payload,
             headers=DS_HEADERS,
             timeout=30,
+            proxies=_get_proxy_dict(),
         )
 
         # WAF 挑战检测
         if login_resp.status_code == 202 and login_resp.headers.get("x-amzn-waf-action"):
-            return {"ok": False, "error": "登录被 AWS WAF 拦截 (HTTP 202)。您的 IP 触发了 CloudFront 人机验证，请配置代理（设置 → 代理配置）绕过 WAF。"}
+            return {"ok": False, "error": "登录被 AWS WAF 拦截 (HTTP 202)。请配置代理（设置 → 代理配置）绕过 WAF。"}
 
         raw_text = (login_resp.text or "").strip()
         if not raw_text:
@@ -2192,13 +2413,14 @@ async def deepseek_login(data: dict):
 
         print(f"[Login] Token acquired for {account_label}: {token[:20]}...{token[-8:]}")
 
-        # 2. 创建会话（也用 session 保持一致性）
+        # 2. 创建会话（iOS 随机指纹）
         auth_headers = {**DS_HEADERS, "authorization": f"Bearer {token}"}
-        session_resp = session.post(
+        session_resp = cffi_requests.post(
             "https://chat.deepseek.com/api/v0/chat_session/create",
             json={},
             headers=auth_headers,
             timeout=15,
+            proxies=_get_proxy_dict(),
         )
 
         session_id = ""
@@ -2372,6 +2594,197 @@ async def relogin_all(creds: HTTPBasicCredentials = Depends(verify_admin)):
         results.append({"label": label, "ok": bool(new_cfg), "error": None if new_cfg else "登录失败"})
 
     return {"results": results, "total": len(results), "success": sum(1 for r in results if r["ok"])}
+
+
+# ─── 批量注册 API ─────────────────────────────────────────
+# 流程：发送验证码 → 读取邮箱验证码（IMAP/临时邮箱API/手动）→ 注册 → 自动登录并入池。
+# 注册接口对大陆 IP 返回 REGISTER_FROM_MAINLAND，需在设置中配置海外代理。
+
+@app.post("/api/register/send-code")
+async def register_send_code(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """单独发送注册验证码（测试用）。body: {email, locale?}"""
+    email = (data.get("email") or "").strip()
+    if not email:
+        raise HTTPException(400, "请提供邮箱")
+    ok, info = send_verification_code(email, locale=data.get("locale", "zh_CN"), proxy=_get_proxy_dict())
+    if not ok:
+        return {"ok": False, "error": info.get("error", "发送失败")}
+    return {"ok": True, "email": email, "send_window_secs": info.get("send_window_secs", 60)}
+
+
+@app.post("/api/register/start")
+async def register_batch_start(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """启动批量注册任务。body:
+    {
+      "count": 5,                                  // 注册数量：随机生成邮箱前缀（推荐，无需 emails）
+      "emails": ["a@x.com", "b+{1-3}@x.com"],      // 可选：自定义邮箱列表，支持 {N-M} 展开
+      "password": "...",                           // 可留空；留空或 random_password=true 时随机生成独立密码
+      "random_password": false,
+      "region": "US", "locale": "zh_CN",
+      "auto_login": true,                          // 注册后自动登录并入池
+      "wait_timeout": 180, "poll_interval": 5,
+      "codes": {"a@x.com": "123456"},              // 预置验证码（可选）
+      "domain": "ds.mail.zjb.edu.kg",              // 临时邮箱后缀；纯本地部分/随机前缀会自动补全
+      "reader": {"mode": "manual"|"imap"|"temp_api"|"mailcx",
+                 "api_key": "...",                 // mailcx 模式的 API Key
+                 "host": "...", "port": 993, "user": "...", "password": "...",
+                 "folder": "INBOX", "url": "..."}
+    }
+    """
+    emails = expand_email_patterns([str(e) for e in data.get("emails", [])])
+    count = int(data.get("count") or 0)
+    # 未填邮箱列表时，按数量随机生成邮箱前缀 + 域名后缀
+    if not emails and count > 0:
+        domain = (data.get("domain") or config_manager.get_mailcx_domain() or "").strip().lstrip("@")
+        if not domain:
+            raise HTTPException(400, "随机生成邮箱需要先选择邮箱后缀")
+        seen = set()
+        generated = []
+        while len(generated) < min(count, 500):
+            local = generate_local_part()
+            email = f"{local}@{domain}"
+            if email in seen:
+                continue
+            seen.add(email)
+            generated.append(email)
+        emails = generated
+    if not emails:
+        raise HTTPException(400, "请填写注册数量或邮箱列表")
+    password = (data.get("password") or "").strip()
+    reader = data.get("reader") or {"mode": "manual"}
+    # mailcx 模式：未显式传 api_key 时，回退到已保存的配置
+    if reader.get("mode") == "mailcx" and not reader.get("api_key"):
+        reader["api_key"] = config_manager.get_mailcx_api_key()
+    try:
+        job_id = _registrar.start(emails, password, {
+            "region": data.get("region", "US"),
+            "locale": data.get("locale", "zh_CN"),
+            "auto_login": data.get("auto_login", True),
+            "random_password": data.get("random_password", False),
+            "wait_timeout": data.get("wait_timeout", 180),
+            "poll_interval": data.get("poll_interval", 5),
+            "codes": data.get("codes") or {},
+            "domain": data.get("domain") or config_manager.get_mailcx_domain(),
+            "reader": reader,
+        })
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "job_id": job_id, "emails": emails}
+
+
+@app.get("/api/register/status")
+async def register_batch_status(job_id: str = "", creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """查询批量注册任务状态。不带 job_id 时列出所有任务摘要。"""
+    if not job_id:
+        return {"jobs": _registrar.list_jobs()}
+    job = _registrar.get(job_id)
+    if not job:
+        raise HTTPException(404, f"任务 {job_id} 不存在")
+    return job
+
+
+@app.post("/api/register/code")
+async def register_submit_code(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """手动提交验证码（manual 模式）。body: {job_id, email, code}"""
+    job_id = data.get("job_id", "")
+    email = (data.get("email") or "").strip()
+    code = (data.get("code") or "").strip()
+    if not job_id or not email or not code:
+        raise HTTPException(400, "job_id / email / code 均不能为空")
+    if _registrar.submit_code(job_id, email, code):
+        return {"ok": True}
+    raise HTTPException(404, f"任务或邮箱不存在: {job_id} / {email}")
+
+
+@app.post("/api/register/stop")
+async def register_batch_stop(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """停止批量注册任务。body: {job_id}"""
+    job_id = data.get("job_id", "")
+    if not job_id:
+        raise HTTPException(400, "请提供 job_id")
+    if _registrar.stop(job_id):
+        return {"ok": True}
+    raise HTTPException(404, f"任务 {job_id} 不存在")
+
+
+@app.get("/api/register/mailcx-domains")
+async def register_mailcx_domains(api_key: str = "", creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """获取 mail.cx 可用邮箱后缀。优先用配置的 API Key，可用 ?api_key= 覆盖。"""
+    key = api_key.strip() or config_manager.get_mailcx_api_key()
+    if not key:
+        return {"ok": False, "error": "未配置 mail.cx API Key"}
+    ok, result = list_mailcx_domains(key)
+    if not ok:
+        return {"ok": False, "error": result}
+    return {"ok": True, "domains": result}
+
+
+@app.get("/api/register/mailcx-config")
+async def register_mailcx_config_get(creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """读取 mail.cx 配置（API Key / 邮箱后缀）。"""
+    return {
+        "api_key": config_manager.get_mailcx_api_key(),
+        "domain": config_manager.get_mailcx_domain(),
+    }
+
+
+@app.put("/api/register/mailcx-config")
+async def register_mailcx_config_set(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """保存 mail.cx 配置。body: {api_key, domain?}"""
+    key = (data.get("api_key") or "").strip()
+    if not key:
+        raise HTTPException(400, "API Key 不能为空")
+    config_manager.set_mailcx_api_key(key)
+    if data.get("domain"):
+        config_manager.set_mailcx_domain(data["domain"])
+    return {"ok": True}
+
+
+@app.get("/api/register/export")
+async def register_export(job_id: str = "", format: str = "csv",
+                          creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """导出批量注册任务的账号密码列表。默认 CSV，?format=txt 导出「邮箱\t密码」纯文本。"""
+    from fastapi.responses import Response
+    data = _registrar.export_data(job_id) if job_id else None
+    if not data:
+        raise HTTPException(404, f"任务 {job_id} 不存在")
+
+    fmt = "txt" if format == "txt" else "csv"
+    rows = []
+    for email in data["emails"]:
+        pw = data["passwords"].get(email, "")
+        st = data["results"].get(email, {}).get("status", "")
+        rows.append((email, pw, st))
+
+    if fmt == "txt":
+        body = "\n".join(f"{e}\t{p}" for e, p, _s in rows)
+        media = "text/plain; charset=utf-8"
+        ext = "txt"
+    else:
+        body = "\ufeff" + "email,password,status\n" + "\n".join(f"{e},{p},{s}" for e, p, s in rows)
+        media = "text/csv; charset=utf-8"
+        ext = "csv"
+    filename = f"deepseek_accounts_{job_id}.{ext}"
+    return Response(content=body, media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/accounts/export")
+async def accounts_export(creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """导出账号池中全部账号（邮箱、密码、状态、Token、登录时间）。CSV。"""
+    from fastapi.responses import Response
+    accounts = config_manager.get_all_accounts()
+    rows = ["email,password,login_type,is_valid,login_time"]
+    for a in accounts:
+        email = a.get("_email") or a.get("account_label") or ""
+        pw = a.get("_password") or ""
+        lt = a.get("login_type") or ""
+        valid = "true" if a.get("is_valid") else "false"
+        t = (a.get("login_time") or "").replace(",", " ")
+        rows.append(f"{email},{pw},{lt},{valid},{t}")
+    body = "\ufeff" + "\n".join(rows)
+    return Response(content=body, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="deepseek_accounts_pool.csv"'})
 
 
 # ─── 用量统计 API ─────────────────────────────────────────────
@@ -2579,7 +2992,7 @@ def relogin(cfg: dict) -> dict | None:
         print("[Token] 无保存密码，无法自动刷新")
         return None
 
-    login_payload = {"password": password, "device_id": secrets.token_hex(16), "os": "web"}
+    login_payload = {"password": password, "device_id": new_device_id(), "os": "ios"}
     account_label = cfg.get("account_label", "") or cfg.get("account", "")
 
     if login_type == "email":
@@ -2600,39 +3013,18 @@ def relogin(cfg: dict) -> dict | None:
     else:
         return None
 
-    DS_HEADERS = {
-        "content-type": "application/json",
-        "origin": "https://chat.deepseek.com",
-        "referer": "https://chat.deepseek.com/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
-        "x-client-version": "2.0.2",
-        "x-client-platform": "web",
-    }
+    DS_HEADERS = random_ios_headers()
 
     try:
         print(f"[Token] 自动重新登录 {account_label}...")
 
-        # 0. 创建 Session + 预访问首页获取 WAF Cookie
-        session = cffi_requests.Session()
-        session.impersonate = "chrome120"
-        proxy_dict = _get_proxy_dict()
-        if proxy_dict:
-            session.proxies = proxy_dict
-        try:
-            session.get(
-                "https://chat.deepseek.com/",
-                headers={"user-agent": DS_HEADERS.get("user-agent", "")},
-                timeout=15,
-            )
-        except Exception:
-            pass  # 首页访问失败不阻塞登录
-
-        # 1. 登录（使用 session 自动携带 Cookie）
-        login_resp = session.post(
+        # 1. 登录（iOS 随机指纹绕过 WAF）
+        login_resp = cffi_requests.post(
             "https://chat.deepseek.com/api/v0/users/login",
             json=login_payload,
             headers=DS_HEADERS,
             timeout=30,
+            proxies=_get_proxy_dict(),
         )
 
         # WAF 挑战检测
@@ -2667,13 +3059,14 @@ def relogin(cfg: dict) -> dict | None:
 
         print(f"[Token] 新 token: {token[:20]}...{token[-8:]}")
 
-        # 2. 创建新会话（也用 session 保持一致性）
+        # 2. 创建新会话（iOS 随机指纹）
         auth_headers = {**DS_HEADERS, "authorization": f"Bearer {token}"}
-        session_resp = session.post(
+        session_resp = cffi_requests.post(
             "https://chat.deepseek.com/api/v0/chat_session/create",
             json={},
             headers=auth_headers,
             timeout=15,
+            proxies=_get_proxy_dict(),
         )
         session_id = ""
         if session_resp.status_code == 200:
@@ -3172,7 +3565,7 @@ async def chat(request: Request):
 
     # Log client info for debugging
     ua = request.headers.get("user-agent", "?")[:60]
-    msg = f"[REQ] model={model} stream={stream} msgs={len(messages)} tools={bool(tools)} ua={ua}"
+    msg = f"[REQ] account={account.account_label} model={model} stream={stream} msgs={len(messages)} tools={bool(tools)} ua={ua}"
     print(msg, flush=True)
     _vlog(msg)
 

@@ -57,6 +57,9 @@ class ConfigManager:
         self._proxy_url: str = ""
         self._passthrough: bool = False
         self._admin_password: str = "admin"
+        # 批量注册：mail.cx 临时邮箱配置
+        self._mailcx_api_key: str = ""
+        self._mailcx_domain: str = ""
         self.load()
 
     def _migrate_legacy(self):
@@ -125,6 +128,8 @@ class ConfigManager:
                 self._proxy_url = data.get('proxy', '') or ''
                 self._passthrough = data.get('passthrough', False)
                 self._admin_password = data.get('admin_password', 'admin')
+                self._mailcx_api_key = data.get('mailcx_api_key', '') or ''
+                self._mailcx_domain = data.get('mailcx_domain', '') or ''
         except Exception as e:
             print(f"[Config] 加载配置失败: {e}")
             self.accounts = []
@@ -139,6 +144,8 @@ class ConfigManager:
                     "proxy": self._proxy_url or "",
                     "passthrough": self._passthrough,
                     "admin_password": self._admin_password,
+                    "mailcx_api_key": self._mailcx_api_key,
+                    "mailcx_domain": self._mailcx_domain,
                 }
                 with open(self.config_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
@@ -262,6 +269,25 @@ class ConfigManager:
     def count_valid(self) -> int:
         with self.lock:
             return sum(1 for a in self.accounts if a.is_valid)
+
+    # ── mail.cx 临时邮箱配置（批量注册用）──
+    def get_mailcx_api_key(self) -> str:
+        with self.lock:
+            return self._mailcx_api_key or ""
+
+    def set_mailcx_api_key(self, key: str):
+        with self.lock:
+            self._mailcx_api_key = (key or "").strip()
+            self.save()
+
+    def get_mailcx_domain(self) -> str:
+        with self.lock:
+            return self._mailcx_domain or ""
+
+    def set_mailcx_domain(self, domain: str):
+        with self.lock:
+            self._mailcx_domain = (domain or "").strip().lstrip("@")
+            self.save()
 
 
 # 全局配置管理器实例

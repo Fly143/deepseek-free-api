@@ -595,6 +595,49 @@ Token 有效期约 **24 小时**。当请求返回 401 时：
 
 > **注意：** cURL 导入不含密码，无法自动刷新 Token。如需自动刷新请使用账号密码登录。
 
+## 批量注册账号（自动登录并入池）
+
+管理面板新增 **「批量注册」** 标签页：批量注册 DeepSeek 账号，注册成功后自动登录并把账号写入多账号池，由轮询负载均衡自动使用。
+
+### 流程
+
+1. `POST /auth-api/v0/users/create_guest_challenge` — 获取注册 PoW challenge
+2. 求解 challenge（复用 `pow_native`，Node WASM 秒级）→ 放入 `x-ds-guest-pow-response` 头
+3. `POST /auth-api/v0/users/create_email_verification_code` — 发送邮箱验证码
+4. 读取验证码：**mail.cx 临时邮箱**（推荐）/ IMAP 收件箱 / 通用临时邮箱 API / 手动输入
+5. `POST /auth-api/v0/users/register` — 注册成功直接返回 token（iOS 客户端指纹 + 真实设备 ID 降低风控拦截）
+6. 自动登录：用注册的邮箱密码走标准登录流获取聊天 token + session，写入 `config.json` 账号池
+
+### 使用（mail.cx 推荐方式）
+
+1. 打开管理面板 `http://localhost:8000/admin` → **批量注册** 标签页
+2. 验证码来源选 **mail.cx 临时邮箱（推荐）**
+3. 填入 mail.cx API Key → 点击 **获取域名** → 选择邮箱后缀（如 `ds.mail.zjb.edu.kg`）→ 保存配置
+4. 填写**注册数量**（邮箱前缀自动随机生成）；密码默认随机生成（每账号独立），也可取消勾选手动填统一密码
+5. 点击 **开始批量注册**，实时日志自动滚动输出每个账号的状态
+6. 任务结束后点击 **下载账号列表** 导出 CSV（`email,password,status`），也可导出账号池全部账号
+
+> 「高级：自定义邮箱列表」可展开后手动指定邮箱（每行一个本地部分，支持 `{N-M}` 展开），留空则按数量随机生成。
+
+> ⚠️ **注意：**
+> - 注册接口对大陆 IP 返回 `REGISTER_FROM_MAINLAND`，需先在「设置」中配置海外代理
+> - DeepSeek 有发送频率限制（`EMAIL_REQUEST_TOO_FREQUENT`），任务会自动等待重试
+> - 注册与登录均使用**随机 iOS 客户端指纹**（UA/版本/时区/rangers-id/device_id 每次随机），可绕过 chat.deepseek.com 对 Web 流量触发的 AWS WAF 拦截
+
+### API
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| POST | `/api/register/send-code` | 单独发送验证码（`{email}`） |
+| POST | `/api/register/start` | 启动批量注册任务（`count` 随机生成邮箱，或 `emails` 自定义，返回 job_id） |
+| GET | `/api/register/status?job_id=` | 查询任务进度（不带 job_id 列出全部任务） |
+| POST | `/api/register/code` | 手动提交验证码（`{job_id, email, code}`） |
+| POST | `/api/register/stop` | 停止任务（`{job_id}`） |
+| GET | `/api/register/mailcx-domains` | 获取 mail.cx 可用邮箱后缀 |
+| GET/PUT | `/api/register/mailcx-config` | 读取/保存 mail.cx API Key 与后缀 |
+| GET | `/api/register/export?job_id=` | 导出任务的账号密码列表（CSV，`?format=txt` 为纯文本） |
+| GET | `/api/accounts/export` | 导出账号池全部账号（含密码） |
+
 ## 管理命令
 
 ```bash

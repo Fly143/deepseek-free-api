@@ -9,3 +9,6 @@ __pycache__/
 config.json
 *.bak
 *.bak
+server.log
+.e2e_*
+.anthropic_batches/

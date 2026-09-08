@@ -1,3 +1,6 @@
+import json
+import uuid
+
 from .anthropic import error_response, convert_request
 _message_store: dict[str, dict] = {}
 _MAX_STORED_MESSAGES = 1000

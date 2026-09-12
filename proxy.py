@@ -3614,6 +3614,10 @@ async def chat(request: Request):
     stream = body.get("stream", False)
     tools = body.get("tools", None)
     passthrough = body.get("passthrough", False) or config_manager.get_passthrough()
+    # 采样参数纯透传：未指定则不写入上游请求体，不猜默认值（与 MiMo2API 对齐）
+    temperature = body.get("temperature")
+    top_p = body.get("top_p")
+    max_tokens = body.get("max_tokens")
 
     # Log client info for debugging
     ua = request.headers.get("user-agent", "?")[:60]
@@ -3776,7 +3780,8 @@ async def chat(request: Request):
 
     result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
                     is_retry=False, has_tools=has_tools, tools=tools,
-                    ref_file_ids=ref_file_ids)
+                    ref_file_ids=ref_file_ids,
+                    temperature=temperature, top_p=top_p, max_tokens=max_tokens)
 
     # (Vision SSE wrapper removed — all models now stream directly via fragments format)
 
@@ -4525,9 +4530,9 @@ async def delete_response(response_id: str):
     return {"id": response_id, "object": "response", "deleted": True}
 
 
-def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None, ref_file_ids=None):
+def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None, ref_file_ids=None, temperature=None, top_p=None, max_tokens=None):
     """核心聊天逻辑，支持 token 过期后重试
-    
+
     DeepSeek SSE 流结构（thinking_enabled=True 时）：
     - data: {"v":{"response":{...}}} → 元数据，跳过
     - data: {"p":"response/thinking_content","v":"嗯"} → thinking 第一段（有p）
@@ -4555,6 +4560,13 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         "thinking_enabled": thinking_enabled,
         "search_enabled": search_enabled,
     }
+    # 采样参数：仅客户端显式传入时下传，不猜默认值；上游是否遵守由被代理端决定
+    if temperature is not None:
+        req_body["temperature"] = temperature
+    if top_p is not None:
+        req_body["top_p"] = top_p
+    if max_tokens is not None:
+        req_body["max_tokens"] = max_tokens
     if "vision" in model:
         req_body["model_type"] = "vision"
         if ref_file_ids:
@@ -4820,7 +4832,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 print("[Token] 401, trying refresh...")
                 new_cfg = relogin(cfg)
                 if new_cfg:
-                    for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids):
+                    for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens):
                         yield chunk
                     return
                 else:
@@ -5029,7 +5041,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 print("[Token] 401 in nonstream, trying refresh...")
                 new_cfg = relogin(cfg)
                 if new_cfg:
-                    return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
+                    return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
                 else:
                     al = cfg.get("account_label", "") or cfg.get("account", "")
                     if al:
@@ -5123,9 +5135,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
     return do_nonstream()
 
 
-def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, has_tools=False, tools=None, ref_file_ids=None):
+def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, has_tools=False, tools=None, ref_file_ids=None, temperature=None, top_p=None, max_tokens=None):
     """Token 刷新重试专用的流式生成器"""
-    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
+    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
     if isinstance(result, StreamingResponse):
         yield from result.body_iterator
     else:

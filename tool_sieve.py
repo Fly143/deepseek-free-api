@@ -139,12 +139,16 @@ class StreamSieve:
         if last_lt == -1:
             return text, ""
 
+        # 大小写不敏感：小写标记跨 chunk 切断时不应被当正文吐出
         tail = text[last_lt:]
+        tail_l = tail.lower()
         for tag in self._TOOL_STARTS:
-            if tag.startswith(tail) or tail == tag[:len(tail)]:
+            tag_l = tag.lower()
+            if tag_l.startswith(tail_l) or tail_l == tag_l[:len(tail_l)]:
                 return text[:last_lt], tail
         for prefix in ("<|DSML|", "|DSML|", "<tool_calls", "<tool_call", "<invoke", "|DSML|invoke"):
-            if prefix.startswith(tail) or (len(tail) <= len(prefix) and tail == prefix[:len(tail)]):
+            prefix_l = prefix.lower()
+            if prefix_l.startswith(tail_l) or (len(tail_l) <= len(prefix_l) and tail_l == prefix_l[:len(tail_l)]):
                 return text[:last_lt], tail
         return text, ""
 

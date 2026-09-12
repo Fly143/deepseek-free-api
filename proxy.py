@@ -73,7 +73,13 @@ def _vlog(msg: str):
         with open(VISION_LOG, "a") as f:
             f.write(f"[{ts}] {msg}\n")
     print(f"[Vision] {msg}", flush=True)
-PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
+PROXY_PORT = int(os.getenv("PROXY_PORT", os.getenv("PORT", "8000")))
+PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
+# 聊天上行超时（秒）。流式长回复默认放宽到 600s，与 MiMo2API 对齐。
+CHAT_TIMEOUT = float(os.getenv("DS_CLIENT_TIMEOUT", "600"))
+RETRY_MAX_ATTEMPTS = int(os.getenv("DS_RETRY_MAX_ATTEMPTS", "3"))
+RETRY_BASE_DELAY = float(os.getenv("DS_RETRY_BASE_DELAY", "1.0"))
+RETRY_MAX_DELAY = float(os.getenv("DS_RETRY_MAX_DELAY", "10.0"))
 
 
 def _gen_response_id() -> str:
@@ -1495,7 +1501,7 @@ app = FastAPI(title="DeepSeek Proxy")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1711,6 +1717,19 @@ a{color:#7dd3fc}
 </div>
 <div id="passthroughStatus" style="margin-top:4px;font-size:12px;color:#64748b"></div>
 <hr>
+<div class="sl" style="font-weight:600;color:#e2e8f0;margin-bottom:8px" data-i18n="compressionTitle">上下文压缩模式</div>
+<div class="cr">
+  <span style="color:#94a3b8;font-size:13px" data-i18n="compressionHint">超长对话自动处理：compress=LLM 摘要，truncation=滑动窗口裁剪</span>
+</div>
+<div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+  <select id="compressionMode" style="background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:8px 10px;font-size:13px">
+    <option value="compress">compress（LLM 摘要）</option>
+    <option value="truncation">truncation（裁剪）</option>
+  </select>
+  <button class="btn bp" onclick="saveCompression()" data-i18n="compressionSaveBtn" style="font-size:12px;padding:6px 14px;width:auto">保存</button>
+</div>
+<div id="compressionStatus" style="margin-top:4px;font-size:12px;color:#64748b"></div>
+<hr>
 <div class="sl" style="font-weight:600;color:#e2e8f0;margin-bottom:8px" data-i18n="changePwdTitle">修改管理员密码</div>
 <div class="pw-row" style="margin-top:12px">
   <input type="password" id="newPwd" data-i18n-ph="newPwdPlaceholder" placeholder="输入新密码" style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-size:14px">
@@ -1828,6 +1847,7 @@ curlStep3:'3. 发送任意消息，找到 completion 请求',curlStep4:'4. 右�
 cleanupBtnDoing:'清理中...',unknown:'未知',
 proxyTitle:'代理配置',proxyHint:'绕过 AWS WAF 拦截。格式：http://127.0.0.1:7890 或 socks5://127.0.0.1:7891',proxySaveBtn:'保存代理设置',proxySaved:'已保存',proxySaveFail:'保存失败: ',proxyLoadFail:'加载失败: ',
 passthroughTitle:'工具透传模式',passthroughHint:'跳过 DSML 格式说明书，直接嵌入原始工具定义（适合 Roo Code / Cline）',passthroughToggle:'关闭',passthroughSaveBtn:'保存',passthroughSaved:'已保存',passthroughSaveFail:'保存失败: ',passthroughLoadFail:'加载失败: ',
+compressionTitle:'上下文压缩模式',compressionHint:'超长对话自动处理：compress=LLM 摘要，truncation=滑动窗口裁剪',compressionSaveBtn:'保存',compressionSaved:'已保存',
 changePwdTitle:'修改管理员密码',newPwdPlaceholder:'输入新密码',changePwdBtn:'保存新密码',changePwdOk:'密码已更新',changePwdFail:'修改失败: ',changePwdEmpty:'密码不能为空'},
 en:{phoneLogin:'Phone Login',emailLogin:'Email Login',usage:'Usage',accounts:'Accounts',
 phonePlaceholder:'Phone Number',pwdPlaceholder:'Password',loginBtn:'Login',loginBtnDoing:'Logging in...',
@@ -1862,6 +1882,7 @@ curlStep3:'3. Send any message, find the completion request',curlStep4:'4. Right
 cleanupBtnDoing:'Cleaning...',unknown:'Unknown',
 proxyTitle:'Proxy Config',proxyHint:'Bypass AWS WAF. Format: http://127.0.0.1:7890 or socks5://127.0.0.1:7891',proxySaveBtn:'Save Proxy',proxySaved:'Saved',proxySaveFail:'Save Failed: ',proxyLoadFail:'Load Failed: ',
 passthroughTitle:'Tool Passthrough Mode',passthroughHint:'Skip DSML format spec, embed raw tool definitions (suitable for Roo Code / Cline)',passthroughToggle:'Off',passthroughSaveBtn:'Save',passthroughSaved:'Saved',passthroughSaveFail:'Save Failed: ',passthroughLoadFail:'Load Failed: ',
+compressionTitle:'Context Compression',compressionHint:'Auto-handle long chats: compress=LLM summary, truncation=sliding window',compressionSaveBtn:'Save',compressionSaved:'Saved',
 changePwdTitle:'Change Admin Password',newPwdPlaceholder:'Enter new password',changePwdBtn:'Save New Password',changePwdOk:'Password updated',changePwdFail:'Failed: ',changePwdEmpty:'Password cannot be empty'}};
 function _(k){return (_I[_lang]||_I.zh)[k]||k}
 function toggleLang(){_lang=_lang==='zh'?'en':'zh';localStorage.setItem('ds_lang',_lang);Q('langBtn').textContent=_lang==='zh'?'🌐 EN':'🌐 中';applyI18n()}
@@ -1890,7 +1911,7 @@ if(Q('registerPanel'))Q('registerPanel').className='panel'+(type==='register'?' 
 var as=Q('apiSection');if(as)as.style.display=(type==='usage'||type==='accounts'||type==='settings'||type==='register')?'none':'';
 if(type==='usage')loadUsage();
 if(type==='accounts')loadAccounts();
-if(type==='settings'){loadProxy();loadPassthrough();}
+if(type==='settings'){loadProxy();loadPassthrough();loadCompression();}
 if(type==='register'){loadRegStatus();regPwToggle();}
 }
 async function cs(){
@@ -2236,6 +2257,22 @@ else{Q('passthroughStatus').textContent=_('passthroughSaveFail')+d.msg;t(_('pass
 function updatePassthroughLabel(){
 Q('passthroughLabel').textContent=Q('passthroughToggle').checked?'ON':'OFF';
 Q('passthroughLabel').style.color=Q('passthroughToggle').checked?'#22c55e':'#e2e8f0';
+}
+// === 上下文压缩 ===
+async function loadCompression(){
+try{
+const r=await fetch('/api/compression');const d=await r.json();
+if(Q('compressionMode'))Q('compressionMode').value=d.compression_mode||'compress';
+}catch(e){if(Q('compressionStatus'))Q('compressionStatus').textContent=(e.message||e)}
+}
+async function saveCompression(){
+var mode=Q('compressionMode').value;
+try{
+const r=await fetch('/api/compression',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({compression_mode:mode})});
+const d=await r.json();
+if(d.ok){Q('compressionStatus').textContent=_('compressionSaved')||('Saved: '+d.compression_mode);Q('compressionStatus').style.color='#22c55e';t(_('compressionSaved')||'Saved')}
+else{Q('compressionStatus').textContent='FAIL';t('FAIL',1)}
+}catch(e){Q('compressionStatus').textContent=e.message||e;t(e.message||e,1)}
 }
 // === 用量统计 ===
 var _up='total';
@@ -2851,6 +2888,20 @@ async def set_passthrough(data: dict, creds: HTTPBasicCredentials = Depends(veri
     return {"ok": True, "passthrough": enabled}
 
 
+@app.get("/api/compression")
+async def get_compression(creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """获取上下文压缩模式。"""
+    return {"compression_mode": config_manager.get_compression_mode()}
+
+
+@app.put("/api/compression")
+async def set_compression(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
+    """设置压缩模式。传 {"compression_mode": "compress"|"truncation"}"""
+    mode = data.get("compression_mode", "compress")
+    config_manager.set_compression_mode(mode)
+    return {"ok": True, "compression_mode": config_manager.get_compression_mode()}
+
+
 @app.put("/api/admin-password")
 async def change_admin_password(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
     """修改管理员密码。传 {"password": "新密码"}"""
@@ -3103,14 +3154,15 @@ def relogin(cfg: dict) -> dict | None:
 
 
 def load_config_with_refresh() -> dict:
-    """加载配置，如果 token 失效则自动刷新（多账号模式：返回第一个有效账号）"""
-    accounts = config_manager.get_all_accounts()
-    if not accounts:
-        return {}
-    first = accounts[0]
+    """加载配置（返回第一个有效账号；无则第一个账号）"""
+    with config_manager.lock:
+        accounts = config_manager.accounts
+        if not accounts:
+            return {}
+        account = next((a for a in accounts if a.is_valid), accounts[0])
     return {
-        "token": first.get("token", ""),
-        "session_id": first.get("session_id", ""),
+        "token": account.token,
+        "session_id": account.session_id,
         "configured": True,
     }
 
@@ -3651,6 +3703,42 @@ async def chat(request: Request):
                         _vlog(f"vision fresh session: {new_sid}")
         except Exception as e:
             _vlog(f"fresh session failed: {e}")
+
+    # 构建 prompt：先做上下文压缩/裁剪，再转 DeepSeek 格式
+    try:
+        from context_manager import enforce_context_limit
+        from context_compressor import (
+            should_compress,
+            compress_messages as _compress_messages,
+            truncate_messages as _truncate_messages,
+            DEFAULT_COMPRESSION_MODE as _COMPRESS_DEFAULT,
+        )
+
+        messages, _tok, _pruned, _desc = enforce_context_limit(messages, tools=tools)
+        if _pruned:
+            _vlog(f"enforce_context_limit: {_desc}")
+
+        mode = config_manager.get_compression_mode() or _COMPRESS_DEFAULT
+        if should_compress(messages):
+            if mode == "compress":
+                async def _llm_summary(prompt_text, _m):
+                    # 用非流式内部调用做摘要（同账号，避免再轮询）
+                    summary_model = model if "reasoner" in str(model) else "deepseek-default"
+                    result = _do_chat(
+                        cfg, prompt_text, summary_model, False, False,
+                        False, is_retry=True, has_tools=False, tools=None,
+                        ref_file_ids=None,
+                    )
+                    if isinstance(result, JSONResponse):
+                        body = json.loads(result.body)
+                        msg = body.get("choices", [{}])[0].get("message", {})
+                        return msg.get("content") or ""
+                    return ""
+                _, messages = await _compress_messages(messages, model, _llm_summary)
+            else:
+                messages = _truncate_messages(messages)
+    except Exception as e:
+        _vlog(f"context compress skipped: {e}")
 
     # 构建 prompt：使用 convert_messages_for_deepseek 处理完整多轮对话
     prompt = convert_messages_for_deepseek(messages, tools, passthrough=passthrough)
@@ -4698,15 +4786,32 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
     def do_stream():
         """SSE streaming for OpenAI-compatible clients."""
         try:
-            resp = cffi_requests.post(
-                "https://chat.deepseek.com/api/v0/chat/completion",
-                headers=req_headers,
-                json=req_body,
-                impersonate="chrome120",
-                stream=True,
-                timeout=120,
-                proxies=_get_proxy_dict(),
-            )
+            resp = None
+            last_err = None
+            for attempt in range(max(1, RETRY_MAX_ATTEMPTS)):
+                try:
+                    resp = cffi_requests.post(
+                        "https://chat.deepseek.com/api/v0/chat/completion",
+                        headers=req_headers,
+                        json=req_body,
+                        impersonate="chrome120",
+                        stream=True,
+                        timeout=CHAT_TIMEOUT,
+                        proxies=_get_proxy_dict(),
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    # 401 走 relogin，不在此重试
+                    if attempt < RETRY_MAX_ATTEMPTS - 1:
+                        delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                        print(f"[Retry] chat stream attempt {attempt+1}/{RETRY_MAX_ATTEMPTS} failed ({e}), retry in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        raise
+            if resp is None:
+                raise last_err or RuntimeError("chat stream request failed")
 
             if ref_file_ids or thinking_enabled:
                 _vlog(f"chat stream response: status={resp.status_code} ct={resp.headers.get('content-type','?')} model={model} thinking={thinking_enabled}")
@@ -4756,14 +4861,31 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                              "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
 
-                # 流式筛分 + 并行缓冲：筛分实时播正文，同时攒完整内容做 fallback
+                # 流式筛分 + 并行缓冲：正文先缓冲，命中工具调用则丢弃，否则收尾补发
+                # （与非流式一致：同一条消息不同时含 content + tool_calls）
                 def _parse_fn(text):
                     return extract_tool_call(text, get_tool_names(tools) if tools else [])
 
                 sieve = StreamSieve(parse_fn=_parse_fn)
                 _role_sent = False
-                _full_buf = ""  # 并行缓冲完整内容，flush 时 fallback 解析
-                content_buffer = []  # 缓冲 text content 用于 fallback 解析
+                _full_buf = ""
+                content_buffer = []
+                _had_tool_calls = False
+
+                def _flush_content_buffer():
+                    nonlocal _role_sent
+                    if not content_buffer:
+                        return
+                    if not _role_sent:
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                        _role_sent = True
+                    for chunk in content_buffer:
+                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                             "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]}
+                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    content_buffer.clear()
 
                 for etype, val in _parse_sse(resp):
                     if etype == "content":
@@ -4772,16 +4894,14 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                             if evt.type == "text":
                                 if isinstance(evt.data, str) and evt.data:
                                     chunk = clean_tool_text(sanitize_leaked_output(evt.data))
-                                    content_buffer.append(chunk)
-                                    # 边流式边缓冲：RikkaHub 需要实时收到 content delta
-                                    if not _role_sent:
-                                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
-                                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                                        _role_sent = True
-                                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                         "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]}
-                                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                                    if chunk:
+                                        content_buffer.append(chunk)
+                            elif evt.type == "tool_calls":
+                                # 提前命中工具：丢弃已缓冲正文，只发 tool_calls
+                                content_buffer.clear()
+                                _had_tool_calls = True
+                                for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
+                                    yield chunk
                     elif etype == "thinking":
                         r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                              "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
@@ -4794,52 +4914,42 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                         break
 
                 # Flush + fallback：筛分没抓到就用全量解析
-                _had_tool_calls = False
-                for evt in sieve.flush():
-                    if evt.type == "text":
-                        if isinstance(evt.data, str) and evt.data:
-                            chunk = clean_tool_text(sanitize_leaked_output(evt.data))
-                            content_buffer.append(chunk)
-                            # 边流式边缓冲
-                            if not _role_sent:
-                                r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
-                                yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                                _role_sent = True
-                            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                 "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]}
-                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    elif evt.type == "tool_calls":
-                        _had_tool_calls = True
-                        for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
-                            yield chunk
+                if not _had_tool_calls:
+                    for evt in sieve.flush():
+                        if evt.type == "text":
+                            if isinstance(evt.data, str) and evt.data:
+                                chunk = clean_tool_text(sanitize_leaked_output(evt.data))
+                                if chunk:
+                                    content_buffer.append(chunk)
+                        elif evt.type == "tool_calls":
+                            _had_tool_calls = True
+                            content_buffer.clear()
+                            for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
+                                yield chunk
 
-                # Fallback: 筛分没抓到，用全量缓冲重试
                 if not _had_tool_calls and _full_buf:
                     tc_result, _ = extract_tool_call(_full_buf, get_tool_names(tools) if tools else [])
                     if tc_result:
                         _had_tool_calls = True
+                        content_buffer.clear()
                         for chunk in _emit_tool_calls(tc_result, chat_id, created, model):
                             yield chunk
 
                 if _had_tool_calls:
-                    # 有工具调用 → content 已在流中发出（如有），直接 DONE
                     if not _role_sent:
                         r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                              "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                     yield "data: [DONE]\n\n"
                     return
-                elif content_buffer:
-                    # 无工具调用，content 已在流中发出，只需发 stop + DONE
+                else:
+                    # 无工具调用：收尾补发缓冲正文
+                    for chunk in _flush_content_buffer():
+                        yield chunk
                     if not _role_sent:
                         r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                              "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                elif not _had_tool_calls:
                     r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                          "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
                     yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
@@ -4886,15 +4996,31 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         full_thinking = ""
 
         try:
-            resp = cffi_requests.post(
-                "https://chat.deepseek.com/api/v0/chat/completion",
-                headers=req_headers,
-                json=req_body,
-                impersonate="chrome120",
-                stream=True,  # Always stream — curl_cffi stream=False truncates SSE
-                timeout=120,
-                proxies=_get_proxy_dict(),
-            )
+            resp = None
+            last_err = None
+            for attempt in range(max(1, RETRY_MAX_ATTEMPTS)):
+                try:
+                    resp = cffi_requests.post(
+                        "https://chat.deepseek.com/api/v0/chat/completion",
+                        headers=req_headers,
+                        json=req_body,
+                        impersonate="chrome120",
+                        stream=True,  # Always stream — curl_cffi stream=False truncates SSE
+                        timeout=CHAT_TIMEOUT,
+                        proxies=_get_proxy_dict(),
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < RETRY_MAX_ATTEMPTS - 1:
+                        delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                        print(f"[Retry] chat nonstream attempt {attempt+1}/{RETRY_MAX_ATTEMPTS} failed ({e}), retry in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        raise
+            if resp is None:
+                raise last_err or RuntimeError("chat request failed")
 
             if ref_file_ids or thinking_enabled:
                 _vlog(f"chat nonstream(stream-internal) response: status={resp.status_code} ct={resp.headers.get('content-type','?')}")
@@ -5014,4 +5140,4 @@ if __name__ == "__main__":
     anthropic_init_batch_storage(_anthropic_os.path.join(_anthropic_os.path.dirname(_anthropic_os.path.abspath(__file__)), ".anthropic_batches"))
     print(f" Anthropic: /v1/messages, /v1/messages/count_tokens, /v1/messages/batches, /v1/messages/{{id}}")
     print(f"DeepSeek Proxy\n Admin: http://localhost:{PROXY_PORT}/admin\n API: http://localhost:{PROXY_PORT}/v1")
-    uvicorn.run(app, host="0.0.0.0", port=PROXY_PORT, log_level="info")
+    uvicorn.run(app, host=PROXY_HOST, port=PROXY_PORT, log_level="info")

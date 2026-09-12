@@ -7,6 +7,8 @@ vision.log
 __pycache__/
 *.pyc
 config.json
+.secret_key
+.venv/
 *.bak
 *.bak
 server.log

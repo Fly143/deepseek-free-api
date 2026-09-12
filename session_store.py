@@ -98,9 +98,11 @@ def on_new_session(account_id: str, session_id: str, model: str) -> None:
 
 
 def add_tokens(account_id: str, session_id: str, prompt_tokens: int) -> None:
-    """累加 prompt_tokens。
+    """记录会话的上下文 token 峰值。
 
-    如果该 account 尚无 session 记录，自动初始化（首次使用）。
+    传入的 prompt_tokens 是「本次请求的完整上下文长度」（已含历史），并非增量；
+    累加会随轮次线性放大，导致真实上下文远未达上限就触碰 TOKEN_THRESHOLD
+    而提前续期。这里取峰值。
     """
     if not prompt_tokens:
         return
@@ -108,8 +110,7 @@ def add_tokens(account_id: str, session_id: str, prompt_tokens: int) -> None:
     key = f"ds_{account_id}"
     s = db.get(key, {})
     if s.get("session_id") == session_id:
-        # 正常续接：累加 token
-        s["prompt_tokens"] = s.get("prompt_tokens", 0) + prompt_tokens
+        s["prompt_tokens"] = max(s.get("prompt_tokens", 0), prompt_tokens)
         s["last_used"] = time.time()
     else:
         # 新 session 或首次使用：初始化

@@ -5,7 +5,7 @@ Anthropic Messages API 路由处理。
 """
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-import json, uuid, asyncio
+import json, uuid, asyncio, re
 from .anthropic import (
     convert_request as _anthropic_convert_request,
     convert_response as _anthropic_convert_response,
@@ -33,12 +33,19 @@ router = APIRouter()
 # Claude Code CLI 等工具期望 Anthropic 风格的模型名（如 claude-sonnet-4-6），
 # 无法直接使用 deepseek-* 原生名。此映射表在请求时自动转换。
 ANTHROPIC_MODEL_ALIASES = {
-    # Claude 4.x 当前
+    # Claude 4.7
+    "claude-opus-4-7": "deepseek-expert-reasoner",
+    "claude-sonnet-4-7": "deepseek-reasoner",
+    "claude-haiku-4-7": "deepseek-default",
+    # Claude 4.6
     "claude-opus-4-6": "deepseek-expert-reasoner",
     "claude-sonnet-4-6": "deepseek-reasoner",
+    "claude-haiku-4-6": "deepseek-default",
+    # Claude 4.5
+    "claude-opus-4-5": "deepseek-expert-reasoner",
+    "claude-sonnet-4-5": "deepseek-reasoner",
     "claude-haiku-4-5": "deepseek-default",
     # Claude 4.x 历史
-    "claude-sonnet-4-5": "deepseek-reasoner",
     "claude-opus-4-1": "deepseek-expert-reasoner",
     "claude-opus-4-0": "deepseek-expert-reasoner",
     "claude-sonnet-4-0": "deepseek-reasoner",
@@ -49,24 +56,54 @@ ANTHROPIC_MODEL_ALIASES = {
     "claude-3-sonnet": "deepseek-default",
     "claude-3-haiku": "deepseek-default",
     # Search 变体
+    "claude-opus-4-7-search": "deepseek-expert-reasoner-search",
     "claude-opus-4-6-search": "deepseek-expert-reasoner-search",
+    "claude-sonnet-4-7-search": "deepseek-reasoner-search",
     "claude-sonnet-4-6-search": "deepseek-reasoner-search",
     # No-thinking 变体
+    "claude-sonnet-4-7-nothinking": "deepseek-default",
     "claude-sonnet-4-6-nothinking": "deepseek-default",
     "claude-haiku-4-5-nothinking": "deepseek-default",
+    # Thinking 变体
+    "claude-sonnet-4-7-thinking": "deepseek-reasoner",
+    "claude-opus-4-7-thinking": "deepseek-expert-reasoner",
 }
 
 
 def _resolve_anthropic_model(model: str) -> str:
     """将 Anthropic 风格模型名映射为 DeepSeek 内部模型名。
-    
-    如果模型名已经是 DeepSeek 原生名（deepseek-*），直接返回。
-    如果在映射表中，返回对应的 DeepSeek 名。
-    否则返回原值（后续 fallback 到 deepseek-default）。
+
+    - 已是 deepseek-* → 原样返回
+    - 表内精确匹配 → 对应型号
+    - 带日期后缀（claude-sonnet-4-6-20250929）→ 去掉日期再匹配
+    - 去掉 -latest / @latest
+    - 未知 claude-* 启发式：含 opus → expert-reasoner，其余 → reasoner
     """
-    if not model or model.startswith("deepseek-"):
+    if not model:
         return model
-    return ANTHROPIC_MODEL_ALIASES.get(model.lower(), model)
+    m = model.lower().strip()
+    if m.startswith("deepseek-"):
+        return m
+
+    if m in ANTHROPIC_MODEL_ALIASES:
+        return ANTHROPIC_MODEL_ALIASES[m]
+
+    # 去掉 -YYYYMMDD / -YYYY-MM-DD 日期后缀
+    base = re.sub(r"-\d{8}$", "", m)
+    base = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", base)
+    if base in ANTHROPIC_MODEL_ALIASES:
+        return ANTHROPIC_MODEL_ALIASES[base]
+
+    # 去掉 -latest / @latest
+    base = re.sub(r"[-@]latest$", "", base)
+    if base in ANTHROPIC_MODEL_ALIASES:
+        return ANTHROPIC_MODEL_ALIASES[base]
+
+    # 未知 Claude 名：启发式
+    if m.startswith("claude-"):
+        return "deepseek-expert-reasoner" if "opus" in m else "deepseek-reasoner"
+
+    return model
 
 
 @router.post("/v1/messages")

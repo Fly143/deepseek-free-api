@@ -486,12 +486,22 @@ def _make_tool_use_stop(state: StreamState, call_id: str) -> str:
     })
 
 
-def _make_message_delta(state: StreamState, stop_reason: str = "end_turn", output_tokens: int = 0) -> str:
-    """发送 message_delta。"""
+def _make_message_delta(
+    state: StreamState,
+    stop_reason: str = "end_turn",
+    output_tokens: int = 0,
+    input_tokens: Optional[int] = None,
+) -> str:
+    """发送 message_delta（同时带 input/output tokens）。"""
+    if input_tokens is None:
+        input_tokens = state.input_tokens or 0
     return _make_sse("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason},
-        "usage": {"output_tokens": output_tokens},
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        },
     })
 
 
@@ -638,9 +648,10 @@ async def stream_response(
 
             # Usage
             usage = obj.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0) or state.input_tokens or 0
             output_tokens = usage.get("completion_tokens", 0) or usage.get("total_tokens", 0) - (usage.get("prompt_tokens", 0) or 0) or 0
 
-            yield _make_message_delta(state, stop_reason, output_tokens)
+            yield _make_message_delta(state, stop_reason, output_tokens, input_tokens=prompt_tokens)
             yield _make_message_stop()
             state.finished = True
             return
@@ -651,7 +662,15 @@ async def stream_response(
             yield _make_thinking_stop(state)
         if state.text_active:
             yield _make_text_stop(state)
-        yield _make_message_delta(state, "end_turn", 0)
+        # 异常收尾同样要下发已攒好的 tool_use，否则工具调用被静默丢弃
+        if tool_call_slots:
+            for idx in sorted(tool_call_slots.keys()):
+                slot = tool_call_slots[idx]
+                yield _make_tool_use_start(state, slot["name"], slot["id"])
+                if slot["arguments"]:
+                    yield _make_tool_input_delta(state, slot["arguments"], slot["id"])
+                yield _make_tool_use_stop(state, slot["id"])
+        yield _make_message_delta(state, "tool_use" if tool_call_slots else "end_turn", 0)
         yield _make_message_stop()
 
 

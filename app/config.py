@@ -1,20 +1,80 @@
-"""配置管理模块 — DeepSeek 多账号管理 + 轮询负载均衡"""
+"""配置管理模块 — DeepSeek 多账号管理 + 轮询负载均衡
+
+敏感字段（token / password / cookie / headers / admin_password / mailcx_api_key）
+落盘时用 Fernet 加密，前缀 enc:v1:。密钥在同目录 .secret_key（已 gitignore）。
+旧明文配置可直接加载，下次 save 自动升级为密文。
+"""
 
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Optional, List
 from dataclasses import dataclass, asdict, field
+
+from cryptography.fernet import Fernet, InvalidToken
 
 
 BASE_DIR = Path(__file__).parent.parent
 CONFIG_FILE = BASE_DIR / "config.json"
 LEGACY_FILE = BASE_DIR / "token.json"
 
+ENC_PREFIX = "enc:v1:"
+_SENSITIVE_ACCOUNT_FIELDS = ("token", "_password", "cookie", "headers")
+DEFAULT_COMPRESSION_MODE = "compress"
+
+
+class SecretBox:
+    """本地密钥 + Fernet 加解密。密钥文件与 config.json 同目录。"""
+
+    def __init__(self, config_path: Path):
+        self.key_path = config_path.parent / ".secret_key"
+        self._fernet: Optional[Fernet] = None
+        self._lock = threading.RLock()
+
+    def _load_or_create(self) -> Fernet:
+        with self._lock:
+            if self._fernet is not None:
+                return self._fernet
+            if self.key_path.exists():
+                raw = self.key_path.read_bytes().strip()
+                self._fernet = Fernet(raw)
+                return self._fernet
+            key = Fernet.generate_key()
+            self.key_path.write_bytes(key)
+            try:
+                os.chmod(self.key_path, 0o600)
+            except OSError:
+                pass  # Windows
+            self._fernet = Fernet(key)
+            return self._fernet
+
+    def encrypt(self, plaintext: str) -> str:
+        if plaintext is None or plaintext == "":
+            return ""
+        if isinstance(plaintext, str) and plaintext.startswith(ENC_PREFIX):
+            return plaintext
+        token = self._load_or_create().encrypt(
+            plaintext.encode("utf-8") if isinstance(plaintext, str) else str(plaintext).encode("utf-8")
+        ).decode("ascii")
+        return ENC_PREFIX + token
+
+    def decrypt(self, value: str) -> str:
+        if value is None or value == "":
+            return ""
+        if not isinstance(value, str) or not value.startswith(ENC_PREFIX):
+            return value
+        blob = value[len(ENC_PREFIX):].encode("ascii")
+        try:
+            return self._load_or_create().decrypt(blob).decode("utf-8")
+        except (InvalidToken, Exception) as e:
+            print(f"[Config] decrypt failed ({e}); check .secret_key")
+            return ""
+
 
 @dataclass
 class DsAccount:
-    """DeepSeek 账号配置"""
+    """DeepSeek 账号配置（内存明文）"""
     account_label: str       # 手机号 或 "user@example.com"
     login_type: str          # "phone" 或 "email"
     _password: str = ""
@@ -34,16 +94,45 @@ class DsAccount:
 
     def to_dict(self):
         d = asdict(self)
-        # 不暴露完整 token （只在前端展示掩码版本）
         if self.token and len(self.token) > 28:
             d["token_masked"] = self.token[:20] + "..." + self.token[-8:]
         else:
             d["token_masked"] = "***"
+        d.pop("token", None)
+        d.pop("_password", None)
+        d.pop("cookie", None)
+        d.pop("headers", None)
         return d
 
-    def to_save_dict(self):
-        """保存到文件时保留完整字段"""
-        return asdict(self)
+    def to_save_dict(self, box: Optional[SecretBox] = None):
+        """落盘：敏感字段加密。"""
+        d = asdict(self)
+        if box is not None:
+            d["token"] = box.encrypt(self.token or "")
+            d["_password"] = box.encrypt(self._password or "")
+            d["cookie"] = box.encrypt(self.cookie or "")
+            if self.headers:
+                # headers 整体序列化后加密，避免泄露 authorization
+                d["headers"] = box.encrypt(json.dumps(self.headers, ensure_ascii=False))
+            else:
+                d["headers"] = {}
+        return d
+
+    @classmethod
+    def from_storage_dict(cls, data: dict, box: Optional[SecretBox] = None) -> "DsAccount":
+        fields = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+        if box is not None:
+            fields["token"] = box.decrypt(fields.get("token", "") or "")
+            fields["_password"] = box.decrypt(fields.get("_password", "") or "")
+            fields["cookie"] = box.decrypt(fields.get("cookie", "") or "")
+            headers = fields.get("headers", {})
+            if isinstance(headers, str) and headers:
+                decrypted = box.decrypt(headers)
+                try:
+                    fields["headers"] = json.loads(decrypted) if decrypted else {}
+                except (json.JSONDecodeError, TypeError):
+                    fields["headers"] = {}
+        return cls(**fields)
 
 
 class ConfigManager:
@@ -51,12 +140,14 @@ class ConfigManager:
 
     def __init__(self):
         self.config_file = CONFIG_FILE
+        self.box = SecretBox(CONFIG_FILE)
         self.lock = threading.RLock()
         self.account_idx = 0
         self.accounts: List[DsAccount] = []
         self._proxy_url: str = ""
         self._passthrough: bool = False
         self._admin_password: str = "admin"
+        self._compression_mode: str = DEFAULT_COMPRESSION_MODE
         # 批量注册：mail.cx 临时邮箱配置
         self._mailcx_api_key: str = ""
         self._mailcx_domain: str = ""
@@ -72,7 +163,6 @@ class ConfigManager:
                 return False
             account_label = old.get("account", "")
             if not account_label:
-                # 从凭证推断
                 if old.get("_email"):
                     account_label = old["_email"]
                 elif old.get("_mobile"):
@@ -80,7 +170,6 @@ class ConfigManager:
                 else:
                     account_label = "legacy_account"
 
-            # 检查是否已迁移过
             for acc in self.accounts:
                 if acc.account_label == account_label:
                     print(f"[Config] 账号 {account_label} 已存在，跳过迁移")
@@ -102,7 +191,6 @@ class ConfigManager:
             )
             self.accounts.append(account)
             self.save()
-            # 重命名旧文件避免重复迁移
             LEGACY_FILE.rename(LEGACY_FILE.with_suffix(".json.bak"))
             print(f"[Config] 已从 token.json 迁移账号: {account_label}")
             return True
@@ -113,7 +201,6 @@ class ConfigManager:
     def load(self):
         """加载配置"""
         if not self.config_file.exists():
-            # 尝试迁移旧文件
             if not self._migrate_legacy():
                 self.save()
             return
@@ -121,14 +208,14 @@ class ConfigManager:
             with open(self.config_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 self.accounts = [
-                    DsAccount(**{k: v for k, v in acc.items()
-                                 if k in DsAccount.__dataclass_fields__})
+                    DsAccount.from_storage_dict(acc, self.box)
                     for acc in data.get('accounts', [])
                 ]
                 self._proxy_url = data.get('proxy', '') or ''
                 self._passthrough = data.get('passthrough', False)
-                self._admin_password = data.get('admin_password', 'admin')
-                self._mailcx_api_key = data.get('mailcx_api_key', '') or ''
+                self._compression_mode = data.get('compression_mode', DEFAULT_COMPRESSION_MODE)
+                self._admin_password = self.box.decrypt(data.get('admin_password', '') or '') or 'admin'
+                self._mailcx_api_key = self.box.decrypt(data.get('mailcx_api_key', '') or '')
                 self._mailcx_domain = data.get('mailcx_domain', '') or ''
         except Exception as e:
             print(f"[Config] 加载配置失败: {e}")
@@ -140,12 +227,13 @@ class ConfigManager:
         with self.lock:
             try:
                 data = {
-                    "accounts": [acc.to_save_dict() for acc in self.accounts],
+                    "accounts": [acc.to_save_dict(self.box) for acc in self.accounts],
                     "proxy": self._proxy_url or "",
                     "passthrough": self._passthrough,
-                    "admin_password": self._admin_password,
-                    "mailcx_api_key": self._mailcx_api_key,
-                    "mailcx_domain": self._mailcx_domain,
+                    "compression_mode": self._compression_mode,
+                    "admin_password": self.box.encrypt(self._admin_password or "admin"),
+                    "mailcx_api_key": self.box.encrypt(self._mailcx_api_key or ""),
+                    "mailcx_domain": self._mailcx_domain or "",
                 }
                 with open(self.config_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
@@ -153,20 +241,17 @@ class ConfigManager:
                 print(f"[Config] 保存配置失败: {e}")
 
     def get_next_account(self) -> Optional[DsAccount]:
-        """获取下一个可用账号（轮询 + 自动跳过无效账号）"""
         with self.lock:
             if not self.accounts:
                 return None
             valid_accounts = [a for a in self.accounts if a.is_valid]
             if not valid_accounts:
                 return None
-            # 只在有效账号中轮询
             account = valid_accounts[self.account_idx % len(valid_accounts)]
             self.account_idx += 1
             return account
 
     def get_account_by_label(self, label: str) -> Optional[DsAccount]:
-        """按标签查找账号"""
         with self.lock:
             for acc in self.accounts:
                 if acc.account_label == label:
@@ -174,16 +259,23 @@ class ConfigManager:
             return None
 
     def add_account(self, account: DsAccount) -> bool:
-        """添加账号。返回 True 表示新增，False 表示已存在"""
         with self.lock:
             for acc in self.accounts:
                 if acc.account_label == account.account_label:
-                    # 更新已有账号（如密码变更）
                     acc._password = account._password or acc._password
                     acc._mobile = account._mobile or acc._mobile
                     acc._area_code = account._area_code or acc._area_code
                     acc._email = account._email or acc._email
                     acc.login_type = account.login_type or acc.login_type
+                    if account.token:
+                        acc.token = account.token
+                    if account.session_id:
+                        acc.session_id = account.session_id
+                    if account.headers:
+                        acc.headers = account.headers
+                    if account.cookie:
+                        acc.cookie = account.cookie
+                    acc.is_valid = account.is_valid or acc.is_valid
                     self.save()
                     return False
             self.accounts.append(account)
@@ -191,7 +283,6 @@ class ConfigManager:
             return True
 
     def remove_account(self, label: str) -> bool:
-        """删除账号"""
         with self.lock:
             before = len(self.accounts)
             self.accounts = [a for a in self.accounts if a.account_label != label]
@@ -201,7 +292,6 @@ class ConfigManager:
             return False
 
     def update_account(self, label: str, **kwargs):
-        """更新账号字段（如 token/session_id/headers 刷新）"""
         with self.lock:
             for acc in self.accounts:
                 if acc.account_label == label:
@@ -213,49 +303,49 @@ class ConfigManager:
             return False
 
     def mark_invalid(self, label: str):
-        """标记账号无效"""
         self.update_account(label, is_valid=False)
 
     def get_all_accounts(self) -> List[dict]:
-        """获取所有账号的摘要信息（无敏感字段）"""
         with self.lock:
             return [acc.to_dict() for acc in self.accounts]
 
     def get_proxy(self) -> str:
-        """获取代理地址。返回空字符串表示未配置代理。"""
         with self.lock:
             return self._proxy_url or ""
 
     def set_proxy(self, url: str):
-        """设置代理地址。传空字符串清除代理。"""
         with self.lock:
             self._proxy_url = (url or "").strip()
             self.save()
 
     def get_passthrough(self) -> bool:
-        """获取全局透传模式开关。"""
         with self.lock:
             return self._passthrough
 
     def set_passthrough(self, enabled: bool):
-        """设置全局透传模式。"""
         with self.lock:
             self._passthrough = bool(enabled)
             self.save()
 
+    def get_compression_mode(self) -> str:
+        with self.lock:
+            return self._compression_mode or DEFAULT_COMPRESSION_MODE
+
+    def set_compression_mode(self, mode: str):
+        with self.lock:
+            self._compression_mode = "truncation" if mode == "truncation" else DEFAULT_COMPRESSION_MODE
+            self.save()
+
     def get_admin_password(self) -> str:
-        """获取管理员密码。"""
         with self.lock:
             return self._admin_password
 
     def set_admin_password(self, password: str):
-        """设置管理员密码。"""
         with self.lock:
             self._admin_password = password or "admin"
             self.save()
 
     def get_token(self, label: str) -> str:
-        """获取指定账号的 token。"""
         with self.lock:
             for acc in self.accounts:
                 if acc.account_label == label:
@@ -270,7 +360,6 @@ class ConfigManager:
         with self.lock:
             return sum(1 for a in self.accounts if a.is_valid)
 
-    # ── mail.cx 临时邮箱配置（批量注册用）──
     def get_mailcx_api_key(self) -> str:
         with self.lock:
             return self._mailcx_api_key or ""
@@ -286,9 +375,8 @@ class ConfigManager:
 
     def set_mailcx_domain(self, domain: str):
         with self.lock:
-            self._mailcx_domain = (domain or "").strip().lstrip("@")
+            self._mailcx_domain = (domain or "").strip()
             self.save()
 
 
-# 全局配置管理器实例
 config_manager = ConfigManager()

@@ -1,3 +1,22 @@
+## [v2.4.0] — 2026-09-12
+
+从 MiMo2API v2.5.1→v2.6.6 移植可共用能力，并修复若干工具/会话缺陷。
+
+### 修复
+- **session token 记录改为峰值** — `prompt_tokens` 是完整上下文而非增量，累加会过早触发续期（对齐 MiMo session_store 峰值策略）
+- **Anthropic 流式异常收尾丢失 tool_use** — 无 `finish_reason` 时先下发已攒好的 `tool_use` blocks，再定 `stop_reason`
+- **Anthropic message_delta 补 input_tokens** — 客户端可显示输入/输出 token
+- **带 tools 流式 content+tool_calls 一致性** — 正文缓冲；命中工具调用则丢弃正文，否则收尾补发（与非流式一致）
+- **StreamSieve 标记前缀大小写不敏感** — 小写 DSML 标记跨 chunk 切断时不再被当正文吐出
+- **CORS `allow_credentials=false`** — 与 `*` origin 组合更安全
+
+### 新增
+- **上下文压缩** — `compress`（LLM 摘要）/ `truncation`（滑动窗口）+ 80% 阈值；管理面板可切换；默认接入 `context_manager.enforce_context_limit`
+- **Anthropic 模型别名增强** — Claude 4.7 / 日期后缀 / `-latest` / 未知 claude-* 启发式
+- **凭证 Fernet 加密落盘** — token / password / cookie / headers / admin_password / mailcx_api_key，密钥 `.secret_key`；旧明文自动迁移
+- **HTTP 超时 600s + 指数退避重试** — `DS_CLIENT_TIMEOUT` / `DS_RETRY_*` 环境变量
+- **HOST 环境变量** — `PROXY_HOST`（默认 `0.0.0.0`），端口兼容 `PORT`/`PROXY_PORT`
+
 ## [v2.3.7] — 2026-05-30
 
 ### 新增

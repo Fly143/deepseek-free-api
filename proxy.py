@@ -75,8 +75,14 @@ def _vlog(msg: str):
     print(f"[Vision] {msg}", flush=True)
 PROXY_PORT = int(os.getenv("PROXY_PORT", os.getenv("PORT", "8000")))
 PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
-# 聊天上行超时（秒）。流式长回复默认放宽到 600s，与 MiMo2API 对齐。
-CHAT_TIMEOUT = float(os.getenv("DS_CLIENT_TIMEOUT", "600"))
+# 聊天上游 HTTP 超时（秒）。默认 0/空 = 不限，思考+输出整条流纯透传，不设代理侧时限。
+# 需要保护时用 DS_CLIENT_TIMEOUT=600 之类显式设置。
+_raw_to = (os.getenv("DS_CLIENT_TIMEOUT", "0") or "0").strip()
+try:
+    _to_f = float(_raw_to)
+except ValueError:
+    _to_f = 0.0
+CHAT_TIMEOUT = None if _to_f <= 0 else _to_f
 RETRY_MAX_ATTEMPTS = int(os.getenv("DS_RETRY_MAX_ATTEMPTS", "3"))
 RETRY_BASE_DELAY = float(os.getenv("DS_RETRY_BASE_DELAY", "1.0"))
 RETRY_MAX_DELAY = float(os.getenv("DS_RETRY_MAX_DELAY", "10.0"))

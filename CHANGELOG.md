@@ -3,6 +3,7 @@
 ### 变更
 - **移除代理层 `max_tokens=4096` 兜底** — Anthropic 转换层未指定时不再写入，纯透传（对齐 MiMo2API）
 - **temperature / top_p / max_tokens 纯透传** — 客户端显式传入才下传 DeepSeek；不猜默认值，由被代理端处理
+- **思考+输出取消默认 HTTP 时限** — `DS_CLIENT_TIMEOUT` 默认 `0`（不限）；整条流（thinking + content）纯透传，不再被 600s 掐断。需要保护时显式设秒数
 - **上下文压缩默认仍为 `compress`** — 管理面板可切 `truncation`；不改则走 LLM 摘要
 
 ## [v2.4.0] — 2026-09-12

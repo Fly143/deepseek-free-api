@@ -17,12 +17,13 @@
 - **带 tools 流式 content+tool_calls 一致性** — 正文缓冲；命中工具调用则丢弃正文，否则收尾补发（与非流式一致）
 - **StreamSieve 标记前缀大小写不敏感** — 小写 DSML 标记跨 chunk 切断时不再被当正文吐出
 - **CORS `allow_credentials=false`** — 与 `*` origin 组合更安全
+- **batch 缺失 import 修复**（PR #30）— `json` / `uuid` 补齐，Batch API 可创建/落盘
 
 ### 新增
 - **上下文压缩** — `compress`（LLM 摘要）/ `truncation`（滑动窗口）+ 80% 阈值；管理面板可切换；默认接入 `context_manager.enforce_context_limit`
 - **Anthropic 模型别名增强** — Claude 4.7 / 日期后缀 / `-latest` / 未知 claude-* 启发式
 - **凭证 Fernet 加密落盘** — token / password / cookie / headers / admin_password / mailcx_api_key，密钥 `.secret_key`；旧明文自动迁移
-- **HTTP 超时 600s + 指数退避重试** — `DS_CLIENT_TIMEOUT` / `DS_RETRY_*` 环境变量
+- **指数退避重试** — 聊天 5xx/网络失败自动重试（`DS_RETRY_*`）
 - **HOST 环境变量** — `PROXY_HOST`（默认 `0.0.0.0`），端口兼容 `PORT`/`PROXY_PORT`
 
 ## [v2.3.7] — 2026-05-30

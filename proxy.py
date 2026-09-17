@@ -3024,6 +3024,104 @@ def _discover_models() -> dict:
     return None
 
 
+
+
+def _raise_if_account_restricted_from_bytes(raw: bytes, status_code: int = 200):
+    """If DeepSeek returned JSON biz restriction (muted/banned), raise HTTP 403."""
+    try:
+        if not raw:
+            return
+        body_txt = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        if not body_txt.lstrip().startswith("{"):
+            return
+        import json as _json
+        from datetime import datetime, timezone, timedelta
+        payload = _json.loads(body_txt)
+        data = payload.get("data") or {}
+        if not isinstance(data, dict):
+            return
+        biz_msg = str(data.get("biz_msg") or "")
+        biz_code = data.get("biz_code")
+        biz = data.get("biz_data") or {}
+        low = body_txt.lower()
+        muted = (biz_code == 5) or ("muted" in biz_msg.lower()) or (isinstance(biz, dict) and biz.get("is_muted"))
+        banned = ("ban" in biz_msg.lower()) or ("user_is_banned" in low)
+        if not (muted or banned):
+            return
+        detail_msg = f"DeepSeek account restricted: {biz_msg or "restricted"} (biz_code={biz_code})"
+        mute_until = biz.get("mute_until") if isinstance(biz, dict) else None
+        if mute_until:
+            try:
+                kst = datetime.fromtimestamp(float(mute_until), tz=timezone(timedelta(hours=9)))
+                detail_msg += f"; mute_until={kst.strftime("%Y-%m-%d %H:%M KST")}"
+            except Exception:
+                detail_msg += f"; mute_until_unix={mute_until}"
+        print(f"[MUTE-DETECT] {detail_msg}")
+        raise HTTPException(
+            status_code=403,
+            detail={"error": {"message": detail_msg, "type": "account_muted", "code": biz_code or "muted"}},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[MUTE-DETECT] skip: {e}")
+
+def normalize_model_id(model: str | None, body: dict | None = None) -> str:
+    """Map client model ids to bridge variants.
+
+    Policy: web search ON by default; only reasoning on/off for end users.
+    Official DeepSeek docs use deepseek-chat / deepseek-reasoner (and newer
+    deepseek-flash with thinking toggle). This free bridge encodes
+    think/search in the model id, so we normalize here.
+    """
+    m = (model or "deepseek-chat").strip()
+    body = body or {}
+
+    thinking = None
+    th = body.get("thinking")
+    if isinstance(th, dict):
+        t = th.get("type")
+        if t == "enabled":
+            thinking = True
+        elif t == "disabled":
+            thinking = False
+    reff = body.get("reasoning_effort")
+    if thinking is None and isinstance(reff, str):
+        low = reff.lower()
+        if low in ("none", "off", "disabled"):
+            thinking = False
+        elif low in ("on", "enabled", "minimal", "low", "medium", "high", "max", "xhigh", "ultra"):
+            thinking = True
+
+    # TEMP TEST: do NOT force web-search. Map official names to non-search bridge ids.
+    # thinking toggle still switches chat <-> reasoner.
+    aliases = {
+        "deepseek-chat": "deepseek-chat",
+        "deepseek-flash": "deepseek-chat",
+        "deepseek-v4-flash": "deepseek-chat",
+        "deepseek-default": "deepseek-chat",
+        "deepseek-reasoner": "deepseek-reasoner",
+        "deepseek-v4-pro": "deepseek-reasoner",
+        "deepseek-pro": "deepseek-reasoner",
+        # keep explicit search ids if client asks for them
+        "deepseek-search": "deepseek-search",
+        "deepseek-reasoner-search": "deepseek-reasoner-search",
+    }
+    if m in aliases:
+        m = aliases[m]
+
+    if thinking is True and m in ("deepseek-chat", "deepseek-search"):
+        m = "deepseek-reasoner" if m == "deepseek-chat" else "deepseek-reasoner-search"
+    elif thinking is False and m in ("deepseek-reasoner", "deepseek-reasoner-search"):
+        m = "deepseek-chat" if m == "deepseek-reasoner" else "deepseek-search"
+
+    # discovered model map uses deepseek-default as non-search? check get_models keys
+    if m == "deepseek-chat":
+        # bridge native non-search id is often deepseek-default or deepseek-chat absent
+        m = "deepseek-default"
+    return m
+
+
 def get_models() -> dict:
     """获取模型映射（缓存优先，过期自动刷新。发现失败返回 {}）。"""
     global _models_cache, _models_cache_time
@@ -3635,7 +3733,8 @@ async def chat(request: Request):
     models = get_models()
     if not models:
         raise HTTPException(503, detail="Model list is empty — DeepSeek model discovery failed")
-    model_info = models.get(model, models.get("deepseek-default"))
+    model = normalize_model_id(model, body)
+    model_info = models.get(model, models.get("deepseek-search") or models.get("deepseek-default"))
     if model_info is None:
         raise HTTPException(404, detail=f"Unknown model '{model}' and no fallback available")
     thinking_enabled, search_enabled, _, _ = model_info
@@ -5068,7 +5167,39 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     }
                 })
 
-            # Buffer all events from stream using _parse_sse
+            
+            # Buffer upstream body once (DeepSeek may return JSON mute/ban with HTTP 200)
+            try:
+                _chunks = []
+                for _chunk in resp.iter_content(chunk_size=4096):
+                    if _chunk:
+                        _chunks.append(_chunk)
+                _raw = b"".join(_chunks)
+                # Quiet unless small JSON error body (mute/ban)
+                _txt = _raw.decode("utf-8", "replace") if _raw else ""
+                if _txt.lstrip().startswith("{") and len(_raw) < 800:
+                    print(f"[RAW-UPSTREAM] status={resp.status_code} ct={resp.headers.get("content-type","?")} bytes={len(_raw)}")
+                    print("[RAW-UPSTREAM-BODY]", _txt)
+                _raise_if_account_restricted_from_bytes(_raw, resp.status_code)
+                class _RespReplay:
+                    def __init__(self, raw, status_code, headers):
+                        self._raw = raw
+                        self.status_code = status_code
+                        self.headers = headers
+                        self.text = raw.decode("utf-8", "replace")
+                    def iter_lines(self, decode_unicode=False):
+                        for line in self._raw.splitlines(True):
+                            yield line
+                    def iter_content(self, chunk_size=1024):
+                        for i in range(0, len(self._raw), chunk_size):
+                            yield self._raw[i:i+chunk_size]
+                resp = _RespReplay(_raw, resp.status_code, resp.headers)
+            except HTTPException:
+                raise
+            except Exception as _e:
+                print(f"[RAW-UPSTREAM] buffer failed: {_e}")
+
+# Buffer all events from stream using _parse_sse
             for etype, val in _parse_sse(resp):
                 if etype == "content":
                     full_content += val

@@ -14,3 +14,12 @@ config.json
 server.log
 .e2e_*
 .anthropic_batches/
+
+# local runtime / ops
+bridge8000.*
+autostart.log
+BRIDGE-STATUS.md
+_*.py
+proxy.py.bak*
+*.out.log
+*.err.log

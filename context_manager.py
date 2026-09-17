@@ -47,7 +47,7 @@ _ASST_TRAILER = 1     # 末尾 <｜Assistant｜>
 _OUTPUT_RESERVE_RATIO = 0.2
 _MIN_OUTPUT_RESERVE = 1024
 _MAX_OUTPUT_RESERVE = 65536
-_DEFAULT_MAX_INPUT = 65536
+_DEFAULT_MAX_INPUT = 1048576  # align with DeepSeek 1M context; old 64k nuked agent histories
 
 
 # ── Token 估算 ─────────────────────────────────────────────

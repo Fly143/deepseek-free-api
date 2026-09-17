@@ -91,6 +91,11 @@ class DsAccount:
     # 状态
     login_time: str = ""
     is_valid: bool = False
+    # Lock-avoidance (persisted)
+    muted_until: float = 0.0          # unix ts; skip account until then
+    cooldown_until: float = 0.0       # short cooldown after errors
+    consecutive_errors: int = 0
+    last_used_at: float = 0.0
 
     def to_dict(self):
         d = asdict(self)
@@ -241,15 +246,78 @@ class ConfigManager:
                 print(f"[Config] 保存配置失败: {e}")
 
     def get_next_account(self) -> Optional[DsAccount]:
+        """Pick a usable account: not muted, not in cooldown, prefer LRU."""
+        import time as _time
+        now = _time.time()
         with self.lock:
             if not self.accounts:
                 return None
-            valid_accounts = [a for a in self.accounts if a.is_valid]
-            if not valid_accounts:
+            usable = []
+            for a in self.accounts:
+                if not a.is_valid:
+                    continue
+                muted_until = float(getattr(a, "muted_until", 0) or 0)
+                if muted_until and muted_until > now:
+                    continue
+                # Auto-clear expired mute
+                if muted_until and muted_until <= now:
+                    a.muted_until = 0.0
+                cd = float(getattr(a, "cooldown_until", 0) or 0)
+                if cd and cd > now:
+                    continue
+                usable.append(a)
+            if not usable:
                 return None
-            account = valid_accounts[self.account_idx % len(valid_accounts)]
-            self.account_idx += 1
+            # Prefer least-recently-used to spread load across accounts
+            usable.sort(key=lambda a: float(getattr(a, "last_used_at", 0) or 0))
+            account = usable[0]
+            account.last_used_at = now
+            self.account_idx = (self.account_idx + 1) % max(1, len(self.accounts))
+            self.save()
             return account
+
+    def mark_account_muted(self, label: str, mute_until: float = 0.0, banned: bool = False):
+        """Persist mute/ban so the account is skipped until mute_until (or forever if banned)."""
+        import time as _time
+        with self.lock:
+            for acc in self.accounts:
+                if acc.account_label != label:
+                    continue
+                if banned:
+                    acc.is_valid = False
+                    acc.muted_until = 0.0
+                else:
+                    # Keep credentials but skip until mute expires
+                    acc.muted_until = float(mute_until or 0) or (_time.time() + 86400)
+                    acc.is_valid = True
+                acc.consecutive_errors = int(getattr(acc, "consecutive_errors", 0) or 0) + 1
+                self.save()
+                print(f"[LockGuard] marked {label} muted_until={acc.muted_until} banned={banned}")
+                return True
+            return False
+
+    def mark_account_cooldown(self, label: str, seconds: float = 60.0):
+        import time as _time
+        with self.lock:
+            for acc in self.accounts:
+                if acc.account_label != label:
+                    continue
+                acc.cooldown_until = _time.time() + float(seconds)
+                acc.consecutive_errors = int(getattr(acc, "consecutive_errors", 0) or 0) + 1
+                self.save()
+                return True
+            return False
+
+    def mark_account_ok(self, label: str):
+        with self.lock:
+            for acc in self.accounts:
+                if acc.account_label != label:
+                    continue
+                acc.consecutive_errors = 0
+                acc.cooldown_until = 0.0
+                self.save()
+                return True
+            return False
 
     def get_account_by_label(self, label: str) -> Optional[DsAccount]:
         with self.lock:

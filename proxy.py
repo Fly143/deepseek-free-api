@@ -48,6 +48,7 @@ CONFIG_FILE = BASE_DIR / "config.json"
 
 # 多账号管理
 from app.config import config_manager, DsAccount
+from app.lock_guard import upstream_slot, ERROR_COOLDOWN_SEC
 from app.auth import verify_admin
 from app.registrar import (BatchRegistrar, registrar as _registrar,
                            send_verification_code, expand_email_patterns,
@@ -3057,6 +3058,15 @@ def _raise_if_account_restricted_from_bytes(raw: bytes, status_code: int = 200):
             except Exception:
                 detail_msg += f"; mute_until_unix={mute_until}"
         print(f"[MUTE-DETECT] {detail_msg}")
+        # Persist so get_next_account skips this account until unmute
+        try:
+            al = None
+            # optional account_label kw via closure attribute
+            al = getattr(_raise_if_account_restricted_from_bytes, "_account_label", None)
+            if al:
+                config_manager.mark_account_muted(al, mute_until=float(mute_until or 0), banned=bool(banned))
+        except Exception as _me:
+            print(f"[MUTE-DETECT] mark account failed: {_me}")
         raise HTTPException(
             status_code=403,
             detail={"error": {"message": detail_msg, "type": "account_muted", "code": biz_code or "muted"}},
@@ -3833,11 +3843,12 @@ async def chat(request: Request):
                 async def _llm_summary(prompt_text, _m):
                     # 用非流式内部调用做摘要（同账号，避免再轮询）
                     summary_model = model if "reasoner" in str(model) else "deepseek-default"
-                    result = _do_chat(
-                        cfg, prompt_text, summary_model, False, False,
-                        False, is_retry=True, has_tools=False, tools=None,
-                        ref_file_ids=None,
-                    )
+                    with upstream_slot():
+                        result = _do_chat(
+                            cfg, prompt_text, summary_model, False, False,
+                            False, is_retry=True, has_tools=False, tools=None,
+                            ref_file_ids=None,
+                        )
                     if isinstance(result, JSONResponse):
                         body = json.loads(result.body)
                         msg = body.get("choices", [{}])[0].get("message", {})
@@ -3883,10 +3894,32 @@ async def chat(request: Request):
     # Old issue: vision stream put everything in thinking_content, but the new
     # fragments format (THINK/RESPONSE) should handle this correctly now.
 
-    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
-                    is_retry=False, has_tools=has_tools, tools=tools,
-                    ref_file_ids=ref_file_ids,
-                    temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+    # Lock-avoidance: never enable web-search unless the resolved model id asks for it.
+    # Search mode correlates with higher risk / empty muted responses in the wild.
+    if "search" not in str(model).lower():
+        search_enabled = False
+
+    _raise_if_account_restricted_from_bytes._account_label = account_label
+    try:
+        with upstream_slot():
+            result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
+                            is_retry=False, has_tools=has_tools, tools=tools,
+                            ref_file_ids=ref_file_ids,
+                            temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+        try:
+            config_manager.mark_account_ok(account_label)
+        except Exception:
+            pass
+    except HTTPException as he:
+        detail = he.detail if isinstance(he.detail, dict) else {}
+        err = (detail.get("error") or {}) if isinstance(detail, dict) else {}
+        if err.get("type") == "account_muted" or err.get("code") == "account_muted":
+            raise
+        try:
+            config_manager.mark_account_cooldown(account_label, ERROR_COOLDOWN_SEC)
+        except Exception:
+            pass
+        raise
 
     # (Vision SSE wrapper removed — all models now stream directly via fragments format)
 
@@ -4766,13 +4799,32 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 })
                 return
 
-            # DeepSeek non-SSE error JSON
+            # DeepSeek non-SSE error JSON (incl. HTTP 200 wrappers with biz_code)
             if line.startswith("{"):
                 try:
                     obj = json.loads(line)
-                    if isinstance(obj, dict) and "code" in obj and obj.get("code", 0) >= 40000:
-                        yield ("error", {"message": obj.get("msg", "unknown"), "code": obj.get("code")})
-                        return
+                    if isinstance(obj, dict):
+                        data = obj.get("data") or {}
+                        if isinstance(data, dict):
+                            biz_code = data.get("biz_code")
+                            biz_msg = str(data.get("biz_msg") or "")
+                            biz = data.get("biz_data") or {}
+                            muted = (biz_code == 5) or ("muted" in biz_msg.lower()) or (isinstance(biz, dict) and biz.get("is_muted"))
+                            banned = ("ban" in biz_msg.lower()) or ("user_is_banned" in biz_msg.lower())
+                            if muted or banned:
+                                mute_until = biz.get("mute_until") if isinstance(biz, dict) else None
+                                msg = f"DeepSeek account restricted: {biz_msg or "restricted"} (biz_code={biz_code})"
+                                try:
+                                    al = cfg.get("account_label") or cfg.get("account")
+                                    if al:
+                                        config_manager.mark_account_muted(al, mute_until=float(mute_until or 0), banned=bool(banned))
+                                except Exception as _me:
+                                    print(f"[MUTE-DETECT] mark from SSE failed: {_me}")
+                                yield ("error", {"message": msg, "code": "account_muted", "mute_until": mute_until})
+                                return
+                        if "code" in obj and obj.get("code", 0) >= 40000:
+                            yield ("error", {"message": obj.get("msg", "unknown"), "code": obj.get("code")})
+                            return
                 except json.JSONDecodeError:
                     pass
                 continue

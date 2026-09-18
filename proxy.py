@@ -3027,7 +3027,73 @@ def _discover_models() -> dict:
 
 
 
-def _raise_if_account_restricted_from_bytes(raw: bytes, status_code: int = 200):
+def _result_looks_successful(result) -> bool:
+    """True when _do_chat returned something that is not an obvious error payload."""
+    if isinstance(result, JSONResponse):
+        try:
+            body = json.loads(result.body)
+        except Exception:
+            return False
+        if not isinstance(body, dict) or body.get("error"):
+            return False
+        choices = body.get("choices") or []
+        if not choices:
+            return False
+        msg = choices[0].get("message") or {}
+        return bool(msg.get("content") or msg.get("reasoning_content") or msg.get("tool_calls"))
+    # StreamingResponse / other non-exception returns: treat as provisional OK
+    return True
+
+
+_BIZ_CODE_MUTED = 5
+
+
+def _parse_account_restriction(payload):
+    """Parse DeepSeek biz mute/ban payload.
+
+    Returns (muted, banned, biz_msg, biz_code, mute_until) or None.
+    """
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = payload
+    biz_msg = str(data.get("biz_msg") or payload.get("biz_msg") or "")
+    biz_code = data.get("biz_code", payload.get("biz_code"))
+    biz = data.get("biz_data") or {}
+    if not isinstance(biz, dict):
+        biz = {}
+    low = (biz_msg + " " + str(payload)).lower()
+    muted = (
+        biz_code == _BIZ_CODE_MUTED
+        or "muted" in biz_msg.lower()
+        or bool(biz.get("is_muted"))
+        or "user is muted" in low
+    )
+    banned = (
+        "user_is_banned" in low
+        or "banned" in biz_msg.lower()
+        or "account is banned" in low
+    )
+    if not (muted or banned):
+        return None
+    return muted, banned, biz_msg, biz_code, biz.get("mute_until")
+
+
+def _mark_account_restricted(account_label, mute_until=None, banned=False):
+    if not account_label:
+        return
+    try:
+        config_manager.mark_account_muted(
+            account_label,
+            mute_until=float(mute_until or 0),
+            banned=bool(banned),
+        )
+    except Exception as _me:
+        print(f"[MUTE-DETECT] mark account failed: {_me}")
+
+
+def _raise_if_account_restricted_from_bytes(raw, status_code=200, account_label=None):
     """If DeepSeek returned JSON biz restriction (muted/banned), raise HTTP 403."""
     try:
         if not raw:
@@ -3038,51 +3104,44 @@ def _raise_if_account_restricted_from_bytes(raw: bytes, status_code: int = 200):
         import json as _json
         from datetime import datetime, timezone, timedelta
         payload = _json.loads(body_txt)
-        data = payload.get("data") or {}
-        if not isinstance(data, dict):
+        parsed = _parse_account_restriction(payload)
+        if not parsed:
             return
-        biz_msg = str(data.get("biz_msg") or "")
-        biz_code = data.get("biz_code")
-        biz = data.get("biz_data") or {}
-        low = body_txt.lower()
-        muted = (biz_code == 5) or ("muted" in biz_msg.lower()) or (isinstance(biz, dict) and biz.get("is_muted"))
-        banned = ("ban" in biz_msg.lower()) or ("user_is_banned" in low)
-        if not (muted or banned):
-            return
-        detail_msg = f"DeepSeek account restricted: {biz_msg or "restricted"} (biz_code={biz_code})"
-        mute_until = biz.get("mute_until") if isinstance(biz, dict) else None
+        muted, banned, biz_msg, biz_code, mute_until = parsed
+        fallback = "restricted"
+        detail_msg = "DeepSeek account restricted: {} (biz_code={})".format(
+            biz_msg or fallback, biz_code
+        )
         if mute_until:
             try:
                 kst = datetime.fromtimestamp(float(mute_until), tz=timezone(timedelta(hours=9)))
-                detail_msg += f"; mute_until={kst.strftime("%Y-%m-%d %H:%M KST")}"
+                ts = kst.strftime("%Y-%m-%d %H:%M KST")
+                detail_msg += "; mute_until={}".format(ts)
             except Exception:
-                detail_msg += f"; mute_until_unix={mute_until}"
-        print(f"[MUTE-DETECT] {detail_msg}")
-        # Persist so get_next_account skips this account until unmute
-        try:
-            al = None
-            # optional account_label kw via closure attribute
-            al = getattr(_raise_if_account_restricted_from_bytes, "_account_label", None)
-            if al:
-                config_manager.mark_account_muted(al, mute_until=float(mute_until or 0), banned=bool(banned))
-        except Exception as _me:
-            print(f"[MUTE-DETECT] mark account failed: {_me}")
+                detail_msg += "; mute_until_unix={}".format(mute_until)
+        print("[MUTE-DETECT] {}".format(detail_msg))
+        _mark_account_restricted(account_label, mute_until=mute_until, banned=banned)
         raise HTTPException(
             status_code=403,
-            detail={"error": {"message": detail_msg, "type": "account_muted", "code": biz_code or "muted"}},
+            detail={"error": {
+                "message": detail_msg,
+                "type": "account_muted",
+                "code": biz_code if biz_code is not None else "muted",
+            }},
         )
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[MUTE-DETECT] skip: {e}")
+        print("[MUTE-DETECT] skip: {}".format(e))
+
 
 def normalize_model_id(model: str | None, body: dict | None = None) -> str:
-    """Map client model ids to bridge variants.
+    """Map client model ids to bridge non-search variants.
 
-    Policy: web search ON by default; only reasoning on/off for end users.
-    Official DeepSeek docs use deepseek-chat / deepseek-reasoner (and newer
-    deepseek-flash with thinking toggle). This free bridge encodes
-    think/search in the model id, so we normalize here.
+    Search is OFF unless the client explicitly asks for a *-search id.
+    thinking / reasoning_effort toggles chat <-> reasoner.
+    Official names (deepseek-chat / reasoner / flash) are normalized to
+    the ids produced by _discover_models (deepseek-default / deepseek-reasoner).
     """
     m = (model or "deepseek-chat").strip()
     body = body or {}
@@ -3103,8 +3162,8 @@ def normalize_model_id(model: str | None, body: dict | None = None) -> str:
         elif low in ("on", "enabled", "minimal", "low", "medium", "high", "max", "xhigh", "ultra"):
             thinking = True
 
-    # TEMP TEST: do NOT force web-search. Map official names to non-search bridge ids.
-    # thinking toggle still switches chat <-> reasoner.
+    # Official/OpenAI-compatible names -> bridge chat/reasoner/search ids.
+    # Keep explicit search ids; do not invent search for non-search names.
     aliases = {
         "deepseek-chat": "deepseek-chat",
         "deepseek-flash": "deepseek-chat",
@@ -3113,7 +3172,6 @@ def normalize_model_id(model: str | None, body: dict | None = None) -> str:
         "deepseek-reasoner": "deepseek-reasoner",
         "deepseek-v4-pro": "deepseek-reasoner",
         "deepseek-pro": "deepseek-reasoner",
-        # keep explicit search ids if client asks for them
         "deepseek-search": "deepseek-search",
         "deepseek-reasoner-search": "deepseek-reasoner-search",
     }
@@ -3125,9 +3183,8 @@ def normalize_model_id(model: str | None, body: dict | None = None) -> str:
     elif thinking is False and m in ("deepseek-reasoner", "deepseek-reasoner-search"):
         m = "deepseek-chat" if m == "deepseek-reasoner" else "deepseek-search"
 
-    # discovered model map uses deepseek-default as non-search? check get_models keys
+    # _discover_models uses deepseek-default as the non-search base id
     if m == "deepseek-chat":
-        # bridge native non-search id is often deepseek-default or deepseek-chat absent
         m = "deepseek-default"
     return m
 
@@ -3744,10 +3801,11 @@ async def chat(request: Request):
     if not models:
         raise HTTPException(503, detail="Model list is empty — DeepSeek model discovery failed")
     model = normalize_model_id(model, body)
-    model_info = models.get(model, models.get("deepseek-search") or models.get("deepseek-default"))
+    # Prefer non-search default; never fall back to search model by accident.
+    model_info = models.get(model) or models.get("deepseek-default")
     if model_info is None:
         raise HTTPException(404, detail=f"Unknown model '{model}' and no fallback available")
-    thinking_enabled, search_enabled, _, _ = model_info
+    thinking_enabled, search_enabled, model_max_in, model_max_out = model_info
 
     cfg = {
         "token": account.token,
@@ -3833,7 +3891,10 @@ async def chat(request: Request):
             DEFAULT_COMPRESSION_MODE as _COMPRESS_DEFAULT,
         )
 
-        messages, _tok, _pruned, _desc = enforce_context_limit(messages, tools=tools)
+        messages, _tok, _pruned, _desc = enforce_context_limit(
+            messages, tools=tools,
+            max_input_tokens=model_max_in if model_max_in else None,
+        )
         if _pruned:
             _vlog(f"enforce_context_limit: {_desc}")
 
@@ -3899,17 +3960,17 @@ async def chat(request: Request):
     if "search" not in str(model).lower():
         search_enabled = False
 
-    _raise_if_account_restricted_from_bytes._account_label = account_label
     try:
         with upstream_slot():
             result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
                             is_retry=False, has_tools=has_tools, tools=tools,
                             ref_file_ids=ref_file_ids,
                             temperature=temperature, top_p=top_p, max_tokens=max_tokens)
-        try:
-            config_manager.mark_account_ok(account_label)
-        except Exception:
-            pass
+        if _result_looks_successful(result):
+            try:
+                config_manager.mark_account_ok(account_label)
+            except Exception:
+                pass
     except HTTPException as he:
         detail = he.detail if isinstance(he.detail, dict) else {}
         err = (detail.get("error") or {}) if isinstance(detail, dict) else {}
@@ -4804,24 +4865,23 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 try:
                     obj = json.loads(line)
                     if isinstance(obj, dict):
-                        data = obj.get("data") or {}
-                        if isinstance(data, dict):
-                            biz_code = data.get("biz_code")
-                            biz_msg = str(data.get("biz_msg") or "")
-                            biz = data.get("biz_data") or {}
-                            muted = (biz_code == 5) or ("muted" in biz_msg.lower()) or (isinstance(biz, dict) and biz.get("is_muted"))
-                            banned = ("ban" in biz_msg.lower()) or ("user_is_banned" in biz_msg.lower())
-                            if muted or banned:
-                                mute_until = biz.get("mute_until") if isinstance(biz, dict) else None
-                                msg = f"DeepSeek account restricted: {biz_msg or "restricted"} (biz_code={biz_code})"
-                                try:
-                                    al = cfg.get("account_label") or cfg.get("account")
-                                    if al:
-                                        config_manager.mark_account_muted(al, mute_until=float(mute_until or 0), banned=bool(banned))
-                                except Exception as _me:
-                                    print(f"[MUTE-DETECT] mark from SSE failed: {_me}")
-                                yield ("error", {"message": msg, "code": "account_muted", "mute_until": mute_until})
-                                return
+                        parsed = _parse_account_restriction(obj)
+                        if parsed:
+                            _muted, banned, biz_msg, biz_code, mute_until = parsed
+                            msg = "DeepSeek account restricted: {} (biz_code={})".format(
+                                biz_msg or "restricted", biz_code
+                            )
+                            _mark_account_restricted(
+                                cfg.get("account_label") or cfg.get("account"),
+                                mute_until=mute_until,
+                                banned=banned,
+                            )
+                            yield ("error", {
+                                "message": msg,
+                                "code": "account_muted",
+                                "mute_until": mute_until,
+                            })
+                            return
                         if "code" in obj and obj.get("code", 0) >= 40000:
                             yield ("error", {"message": obj.get("msg", "unknown"), "code": obj.get("code")})
                             return
@@ -4845,6 +4905,25 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 obj = json.loads(ds)
                 if not isinstance(obj, dict):
                     continue
+
+                # Mute/ban may also arrive as an SSE data: JSON wrapper
+                parsed = _parse_account_restriction(obj)
+                if parsed:
+                    _muted, banned, biz_msg, biz_code, mute_until = parsed
+                    msg = "DeepSeek account restricted: {} (biz_code={})".format(
+                        biz_msg or "restricted", biz_code
+                    )
+                    _mark_account_restricted(
+                        cfg.get("account_label") or cfg.get("account"),
+                        mute_until=mute_until,
+                        banned=banned,
+                    )
+                    yield ("error", {
+                        "message": msg,
+                        "code": "account_muted",
+                        "mute_until": mute_until,
+                    })
+                    return
 
                 # Error object: {"type": "error", "content": "...", "finish_reason": "..."}
                 obj_type = obj.get("type", "")
@@ -5230,28 +5309,38 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 # Quiet unless small JSON error body (mute/ban)
                 _txt = _raw.decode("utf-8", "replace") if _raw else ""
                 if _txt.lstrip().startswith("{") and len(_raw) < 800:
-                    print(f"[RAW-UPSTREAM] status={resp.status_code} ct={resp.headers.get("content-type","?")} bytes={len(_raw)}")
+                    _ct = resp.headers.get("content-type", "?")
+                    print("[RAW-UPSTREAM] status={} ct={} bytes={}".format(
+                        resp.status_code, _ct, len(_raw)))
                     print("[RAW-UPSTREAM-BODY]", _txt)
-                _raise_if_account_restricted_from_bytes(_raw, resp.status_code)
+                _raise_if_account_restricted_from_bytes(
+                    _raw,
+                    resp.status_code,
+                    account_label=cfg.get("account_label") or cfg.get("account"),
+                )
+
                 class _RespReplay:
                     def __init__(self, raw, status_code, headers):
                         self._raw = raw
                         self.status_code = status_code
                         self.headers = headers
                         self.text = raw.decode("utf-8", "replace")
+
                     def iter_lines(self, decode_unicode=False):
                         for line in self._raw.splitlines(True):
                             yield line
+
                     def iter_content(self, chunk_size=1024):
                         for i in range(0, len(self._raw), chunk_size):
-                            yield self._raw[i:i+chunk_size]
+                            yield self._raw[i:i + chunk_size]
+
                 resp = _RespReplay(_raw, resp.status_code, resp.headers)
             except HTTPException:
                 raise
             except Exception as _e:
-                print(f"[RAW-UPSTREAM] buffer failed: {_e}")
+                print("[RAW-UPSTREAM] buffer failed: {}".format(_e))
 
-# Buffer all events from stream using _parse_sse
+            # Buffer all events from stream using _parse_sse
             for etype, val in _parse_sse(resp):
                 if etype == "content":
                     full_content += val

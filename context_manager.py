@@ -242,6 +242,8 @@ def enforce_context_limit(
 
     返回 (消息, token数, 是否裁剪了, 描述)。
     """
+    if not max_input_tokens or max_input_tokens <= 0:
+        max_input_tokens = _DEFAULT_MAX_INPUT
     tool_overhead = estimate_tool_tokens(tools)
     total = sum(estimate_message_tokens(m) for m in messages) + tool_overhead
 

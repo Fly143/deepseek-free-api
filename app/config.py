@@ -253,6 +253,7 @@ class ConfigManager:
             if not self.accounts:
                 return None
             usable = []
+            state_dirty = False
             for a in self.accounts:
                 if not a.is_valid:
                     continue
@@ -262,6 +263,7 @@ class ConfigManager:
                 # Auto-clear expired mute
                 if muted_until and muted_until <= now:
                     a.muted_until = 0.0
+                    state_dirty = True
                 cd = float(getattr(a, "cooldown_until", 0) or 0)
                 if cd and cd > now:
                     continue
@@ -273,7 +275,9 @@ class ConfigManager:
             account = usable[0]
             account.last_used_at = now
             self.account_idx = (self.account_idx + 1) % max(1, len(self.accounts))
-            self.save()
+            # Persist only when mute/cooldown state changed — not on every chat request.
+            if state_dirty:
+                self.save()
             return account
 
     def mark_account_muted(self, label: str, mute_until: float = 0.0, banned: bool = False):

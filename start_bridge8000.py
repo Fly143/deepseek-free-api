@@ -49,7 +49,11 @@ def alive(pid: int) -> bool:
 
 
 def relogin() -> None:
-    auth = base64.b64encode(os.environ.get("DEEPSEEK_BRIDGE_ADMIN", "admin:admin").encode()).decode()
+    admin = os.environ.get("DEEPSEEK_BRIDGE_ADMIN")
+    if not admin:
+        print("relogin_skip: set DEEPSEEK_BRIDGE_ADMIN=user:pass (do not rely on admin:admin)")
+        return
+    auth = base64.b64encode(admin.encode()).decode()
     req = urllib.request.Request(
         f"http://127.0.0.1:{PORT}/api/accounts/relogin-all",
         data=b"{}",

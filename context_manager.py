@@ -47,7 +47,7 @@ _ASST_TRAILER = 1     # 末尾 <｜Assistant｜>
 _OUTPUT_RESERVE_RATIO = 0.2
 _MIN_OUTPUT_RESERVE = 1024
 _MAX_OUTPUT_RESERVE = 65536
-_DEFAULT_MAX_INPUT = 65536
+_DEFAULT_MAX_INPUT = 1048576  # align with DeepSeek 1M context; old 64k nuked agent histories
 
 
 # ── Token 估算 ─────────────────────────────────────────────
@@ -242,6 +242,8 @@ def enforce_context_limit(
 
     返回 (消息, token数, 是否裁剪了, 描述)。
     """
+    if not max_input_tokens or max_input_tokens <= 0:
+        max_input_tokens = _DEFAULT_MAX_INPUT
     tool_overhead = estimate_tool_tokens(tools)
     total = sum(estimate_message_tokens(m) for m in messages) + tool_overhead
 

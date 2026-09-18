@@ -48,6 +48,7 @@ CONFIG_FILE = BASE_DIR / "config.json"
 
 # 多账号管理
 from app.config import config_manager, DsAccount
+from app.lock_guard import upstream_slot, ERROR_COOLDOWN_SEC
 from app.auth import verify_admin
 from app.registrar import (BatchRegistrar, registrar as _registrar,
                            send_verification_code, expand_email_patterns,
@@ -3024,6 +3025,170 @@ def _discover_models() -> dict:
     return None
 
 
+
+
+def _result_looks_successful(result) -> bool:
+    """True when _do_chat returned something that is not an obvious error payload."""
+    if isinstance(result, JSONResponse):
+        try:
+            body = json.loads(result.body)
+        except Exception:
+            return False
+        if not isinstance(body, dict) or body.get("error"):
+            return False
+        choices = body.get("choices") or []
+        if not choices:
+            return False
+        msg = choices[0].get("message") or {}
+        return bool(msg.get("content") or msg.get("reasoning_content") or msg.get("tool_calls"))
+    # StreamingResponse / other non-exception returns: treat as provisional OK
+    return True
+
+
+_BIZ_CODE_MUTED = 5
+
+
+def _parse_account_restriction(payload):
+    """Parse DeepSeek biz mute/ban payload.
+
+    Returns (muted, banned, biz_msg, biz_code, mute_until) or None.
+    """
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = payload
+    biz_msg = str(data.get("biz_msg") or payload.get("biz_msg") or "")
+    biz_code = data.get("biz_code", payload.get("biz_code"))
+    biz = data.get("biz_data") or {}
+    if not isinstance(biz, dict):
+        biz = {}
+    low = (biz_msg + " " + str(payload)).lower()
+    muted = (
+        biz_code == _BIZ_CODE_MUTED
+        or "muted" in biz_msg.lower()
+        or bool(biz.get("is_muted"))
+        or "user is muted" in low
+    )
+    banned = (
+        "user_is_banned" in low
+        or "banned" in biz_msg.lower()
+        or "account is banned" in low
+    )
+    if not (muted or banned):
+        return None
+    return muted, banned, biz_msg, biz_code, biz.get("mute_until")
+
+
+def _mark_account_restricted(account_label, mute_until=None, banned=False):
+    if not account_label:
+        return
+    try:
+        config_manager.mark_account_muted(
+            account_label,
+            mute_until=float(mute_until or 0),
+            banned=bool(banned),
+        )
+    except Exception as _me:
+        print(f"[MUTE-DETECT] mark account failed: {_me}")
+
+
+def _raise_if_account_restricted_from_bytes(raw, status_code=200, account_label=None):
+    """If DeepSeek returned JSON biz restriction (muted/banned), raise HTTP 403."""
+    try:
+        if not raw:
+            return
+        body_txt = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        if not body_txt.lstrip().startswith("{"):
+            return
+        import json as _json
+        from datetime import datetime, timezone, timedelta
+        payload = _json.loads(body_txt)
+        parsed = _parse_account_restriction(payload)
+        if not parsed:
+            return
+        muted, banned, biz_msg, biz_code, mute_until = parsed
+        fallback = "restricted"
+        detail_msg = "DeepSeek account restricted: {} (biz_code={})".format(
+            biz_msg or fallback, biz_code
+        )
+        if mute_until:
+            try:
+                kst = datetime.fromtimestamp(float(mute_until), tz=timezone(timedelta(hours=9)))
+                ts = kst.strftime("%Y-%m-%d %H:%M KST")
+                detail_msg += "; mute_until={}".format(ts)
+            except Exception:
+                detail_msg += "; mute_until_unix={}".format(mute_until)
+        print("[MUTE-DETECT] {}".format(detail_msg))
+        _mark_account_restricted(account_label, mute_until=mute_until, banned=banned)
+        raise HTTPException(
+            status_code=403,
+            detail={"error": {
+                "message": detail_msg,
+                "type": "account_muted",
+                "code": biz_code if biz_code is not None else "muted",
+            }},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("[MUTE-DETECT] skip: {}".format(e))
+
+
+def normalize_model_id(model: str | None, body: dict | None = None) -> str:
+    """Map client model ids to bridge non-search variants.
+
+    Search is OFF unless the client explicitly asks for a *-search id.
+    thinking / reasoning_effort toggles chat <-> reasoner.
+    Official names (deepseek-chat / reasoner / flash) are normalized to
+    the ids produced by _discover_models (deepseek-default / deepseek-reasoner).
+    """
+    m = (model or "deepseek-chat").strip()
+    body = body or {}
+
+    thinking = None
+    th = body.get("thinking")
+    if isinstance(th, dict):
+        t = th.get("type")
+        if t == "enabled":
+            thinking = True
+        elif t == "disabled":
+            thinking = False
+    reff = body.get("reasoning_effort")
+    if thinking is None and isinstance(reff, str):
+        low = reff.lower()
+        if low in ("none", "off", "disabled"):
+            thinking = False
+        elif low in ("on", "enabled", "minimal", "low", "medium", "high", "max", "xhigh", "ultra"):
+            thinking = True
+
+    # Official/OpenAI-compatible names -> bridge chat/reasoner/search ids.
+    # Keep explicit search ids; do not invent search for non-search names.
+    aliases = {
+        "deepseek-chat": "deepseek-chat",
+        "deepseek-flash": "deepseek-chat",
+        "deepseek-v4-flash": "deepseek-chat",
+        "deepseek-default": "deepseek-chat",
+        "deepseek-reasoner": "deepseek-reasoner",
+        "deepseek-v4-pro": "deepseek-reasoner",
+        "deepseek-pro": "deepseek-reasoner",
+        "deepseek-search": "deepseek-search",
+        "deepseek-reasoner-search": "deepseek-reasoner-search",
+    }
+    if m in aliases:
+        m = aliases[m]
+
+    if thinking is True and m in ("deepseek-chat", "deepseek-search"):
+        m = "deepseek-reasoner" if m == "deepseek-chat" else "deepseek-reasoner-search"
+    elif thinking is False and m in ("deepseek-reasoner", "deepseek-reasoner-search"):
+        m = "deepseek-chat" if m == "deepseek-reasoner" else "deepseek-search"
+
+    # _discover_models uses deepseek-default as the non-search base id
+    if m == "deepseek-chat":
+        m = "deepseek-default"
+    return m
+
+
 def get_models() -> dict:
     """获取模型映射（缓存优先，过期自动刷新。发现失败返回 {}）。"""
     global _models_cache, _models_cache_time
@@ -3635,10 +3800,12 @@ async def chat(request: Request):
     models = get_models()
     if not models:
         raise HTTPException(503, detail="Model list is empty — DeepSeek model discovery failed")
-    model_info = models.get(model, models.get("deepseek-default"))
+    model = normalize_model_id(model, body)
+    # Prefer non-search default; never fall back to search model by accident.
+    model_info = models.get(model) or models.get("deepseek-default")
     if model_info is None:
         raise HTTPException(404, detail=f"Unknown model '{model}' and no fallback available")
-    thinking_enabled, search_enabled, _, _ = model_info
+    thinking_enabled, search_enabled, model_max_in, model_max_out = model_info
 
     cfg = {
         "token": account.token,
@@ -3724,7 +3891,10 @@ async def chat(request: Request):
             DEFAULT_COMPRESSION_MODE as _COMPRESS_DEFAULT,
         )
 
-        messages, _tok, _pruned, _desc = enforce_context_limit(messages, tools=tools)
+        messages, _tok, _pruned, _desc = enforce_context_limit(
+            messages, tools=tools,
+            max_input_tokens=model_max_in if model_max_in else None,
+        )
         if _pruned:
             _vlog(f"enforce_context_limit: {_desc}")
 
@@ -3734,11 +3904,12 @@ async def chat(request: Request):
                 async def _llm_summary(prompt_text, _m):
                     # 用非流式内部调用做摘要（同账号，避免再轮询）
                     summary_model = model if "reasoner" in str(model) else "deepseek-default"
-                    result = _do_chat(
-                        cfg, prompt_text, summary_model, False, False,
-                        False, is_retry=True, has_tools=False, tools=None,
-                        ref_file_ids=None,
-                    )
+                    with upstream_slot():
+                        result = _do_chat(
+                            cfg, prompt_text, summary_model, False, False,
+                            False, is_retry=True, has_tools=False, tools=None,
+                            ref_file_ids=None,
+                        )
                     if isinstance(result, JSONResponse):
                         body = json.loads(result.body)
                         msg = body.get("choices", [{}])[0].get("message", {})
@@ -3784,10 +3955,32 @@ async def chat(request: Request):
     # Old issue: vision stream put everything in thinking_content, but the new
     # fragments format (THINK/RESPONSE) should handle this correctly now.
 
-    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
-                    is_retry=False, has_tools=has_tools, tools=tools,
-                    ref_file_ids=ref_file_ids,
-                    temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+    # Lock-avoidance: never enable web-search unless the resolved model id asks for it.
+    # Search mode correlates with higher risk / empty muted responses in the wild.
+    if "search" not in str(model).lower():
+        search_enabled = False
+
+    try:
+        with upstream_slot():
+            result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
+                            is_retry=False, has_tools=has_tools, tools=tools,
+                            ref_file_ids=ref_file_ids,
+                            temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+        if _result_looks_successful(result):
+            try:
+                config_manager.mark_account_ok(account_label)
+            except Exception:
+                pass
+    except HTTPException as he:
+        detail = he.detail if isinstance(he.detail, dict) else {}
+        err = (detail.get("error") or {}) if isinstance(detail, dict) else {}
+        if err.get("type") == "account_muted" or err.get("code") == "account_muted":
+            raise
+        try:
+            config_manager.mark_account_cooldown(account_label, ERROR_COOLDOWN_SEC)
+        except Exception:
+            pass
+        raise
 
     # (Vision SSE wrapper removed — all models now stream directly via fragments format)
 
@@ -4667,13 +4860,31 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 })
                 return
 
-            # DeepSeek non-SSE error JSON
+            # DeepSeek non-SSE error JSON (incl. HTTP 200 wrappers with biz_code)
             if line.startswith("{"):
                 try:
                     obj = json.loads(line)
-                    if isinstance(obj, dict) and "code" in obj and obj.get("code", 0) >= 40000:
-                        yield ("error", {"message": obj.get("msg", "unknown"), "code": obj.get("code")})
-                        return
+                    if isinstance(obj, dict):
+                        parsed = _parse_account_restriction(obj)
+                        if parsed:
+                            _muted, banned, biz_msg, biz_code, mute_until = parsed
+                            msg = "DeepSeek account restricted: {} (biz_code={})".format(
+                                biz_msg or "restricted", biz_code
+                            )
+                            _mark_account_restricted(
+                                cfg.get("account_label") or cfg.get("account"),
+                                mute_until=mute_until,
+                                banned=banned,
+                            )
+                            yield ("error", {
+                                "message": msg,
+                                "code": "account_muted",
+                                "mute_until": mute_until,
+                            })
+                            return
+                        if "code" in obj and obj.get("code", 0) >= 40000:
+                            yield ("error", {"message": obj.get("msg", "unknown"), "code": obj.get("code")})
+                            return
                 except json.JSONDecodeError:
                     pass
                 continue
@@ -4694,6 +4905,25 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 obj = json.loads(ds)
                 if not isinstance(obj, dict):
                     continue
+
+                # Mute/ban may also arrive as an SSE data: JSON wrapper
+                parsed = _parse_account_restriction(obj)
+                if parsed:
+                    _muted, banned, biz_msg, biz_code, mute_until = parsed
+                    msg = "DeepSeek account restricted: {} (biz_code={})".format(
+                        biz_msg or "restricted", biz_code
+                    )
+                    _mark_account_restricted(
+                        cfg.get("account_label") or cfg.get("account"),
+                        mute_until=mute_until,
+                        banned=banned,
+                    )
+                    yield ("error", {
+                        "message": msg,
+                        "code": "account_muted",
+                        "mute_until": mute_until,
+                    })
+                    return
 
                 # Error object: {"type": "error", "content": "...", "finish_reason": "..."}
                 obj_type = obj.get("type", "")
@@ -5067,6 +5297,48 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                         "code": resp.status_code
                     }
                 })
+
+            
+            # Buffer upstream body once (DeepSeek may return JSON mute/ban with HTTP 200)
+            try:
+                _chunks = []
+                for _chunk in resp.iter_content(chunk_size=4096):
+                    if _chunk:
+                        _chunks.append(_chunk)
+                _raw = b"".join(_chunks)
+                # Quiet unless small JSON error body (mute/ban)
+                _txt = _raw.decode("utf-8", "replace") if _raw else ""
+                if _txt.lstrip().startswith("{") and len(_raw) < 800:
+                    _ct = resp.headers.get("content-type", "?")
+                    print("[RAW-UPSTREAM] status={} ct={} bytes={}".format(
+                        resp.status_code, _ct, len(_raw)))
+                    print("[RAW-UPSTREAM-BODY]", _txt)
+                _raise_if_account_restricted_from_bytes(
+                    _raw,
+                    resp.status_code,
+                    account_label=cfg.get("account_label") or cfg.get("account"),
+                )
+
+                class _RespReplay:
+                    def __init__(self, raw, status_code, headers):
+                        self._raw = raw
+                        self.status_code = status_code
+                        self.headers = headers
+                        self.text = raw.decode("utf-8", "replace")
+
+                    def iter_lines(self, decode_unicode=False):
+                        for line in self._raw.splitlines(True):
+                            yield line
+
+                    def iter_content(self, chunk_size=1024):
+                        for i in range(0, len(self._raw), chunk_size):
+                            yield self._raw[i:i + chunk_size]
+
+                resp = _RespReplay(_raw, resp.status_code, resp.headers)
+            except HTTPException:
+                raise
+            except Exception as _e:
+                print("[RAW-UPSTREAM] buffer failed: {}".format(_e))
 
             # Buffer all events from stream using _parse_sse
             for etype, val in _parse_sse(resp):

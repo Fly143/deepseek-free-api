@@ -464,5 +464,52 @@ DEVICE_IDS: List[str] = [
     "BHw5NoKt/Y423T1kGiHr1vKIaH4nsv+WhnhUBssATUsZrtZt83WojuELX2sSOepaK3uEH2yJWVObiriawuZW2Ng==",]
 
 
-def get_device_id() -> str:
-    return random.choice(DEVICE_IDS)
+_burned: set[str] = set()
+
+
+def mark_device_burned(device_id: str | None) -> None:
+    """Remember a device_id that upstream risk-control rejected (issue #31)."""
+    if not device_id:
+        return
+    _burned.add(device_id)
+
+
+def clear_burned() -> None:
+    _burned.clear()
+
+
+def burned_count() -> int:
+    return len(_burned)
+
+
+def get_device_id(exclude: set[str] | None = None) -> str:
+    """Pick a device_id from the local pool, skipping burned/excluded ids.
+
+    Falls back to a random 32-byte base64 id when the public pool is exhausted
+    (public pool may be fully flagged — see issue #31).
+    """
+    skip = set(_burned)
+    if exclude:
+        skip |= set(exclude)
+    candidates = [d for d in DEVICE_IDS if d not in skip]
+    if candidates:
+        return random.choice(candidates)
+    import base64
+    import os
+    return base64.b64encode(os.urandom(32)).decode()
+
+
+def load_extra_device_ids(path: str) -> int:
+    """Append private device ids from a local file (one id per line). Empty lines skipped."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            added = 0
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or s in DEVICE_IDS:
+                    continue
+                DEVICE_IDS.append(s)
+                added += 1
+            return added
+    except OSError:
+        return 0

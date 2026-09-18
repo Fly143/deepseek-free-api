@@ -1,3 +1,31 @@
+## [v2.4.2] — 2026-09-18
+
+覆盖 PR #32/#33（@khs0927 + maintainer review）与 PR #34（Issue #31）。
+
+### 修复
+- **账号禁言不再空 completion** — DeepSeek 上游 HTTP 200 + JSON mute/ban（`biz_code=5` 等）时，chat 返回 **403 `account_muted`**（含 `mute_until`）；覆盖 nonstream 缓冲体、裸 JSON 行、SSE `data:` JSON 包装
+- **注册 `RISK_DEVICE_DETECTED` 可诊断**（Issue #31 / PR #34）— 解析 `data.biz_code`；`11`/`6` 明确报错，不再误报「注册响应中无 token」
+- **发码与注册指纹统一** — 验证码接口默认与 register 同一 iOS 指纹族，消除 web→ios 平台跳变
+- **模型 fallback 不再优先 search** — 未知模型落到 `deepseek-default`
+- **Python 3.10 兼容** — 去掉嵌套同引号 f-string（PEP 701 为 3.12+）
+
+### 变更
+- **上游聊天 pacing（全局）** — `app/lock_guard.upstream_slot()`：默认 `DEEPSEEK_MIN_INTERVAL_SEC=2.5`、`DEEPSEEK_MAX_CONCURRENT=1`、`DEEPSEEK_ERROR_COOLDOWN_SEC=60`；多账号共用闸门，优先降低 mute 风险
+- **默认 search 关闭** — 仅当 model id 含 `search` 时开启；官方名 normalize 到 non-search bridge id
+- **上下文预算** — `_DEFAULT_MAX_INPUT` 64k→1M；chat 路径传入模型发现的 `max_in`
+- **`get_next_account` 热路径不再每次写盘** — 仅 mute/cooldown 状态变化时 save
+
+### 新增
+- **账号池 mute/cooldown** — `mark_account_muted` / `mark_account_cooldown` / `mark_account_ok`；跳过不可用账号，健康号 LRU
+- **注册 device_id 拉黑重试** — 风控拒后 burn 该 ID、换指纹、重发码、重试一次；日志含 `proxy=on|OFF`
+- **`DEEPSEEK_DEVICE_IDS_FILE`** — 私有 device_id 池（一行一个）
+- **`docs/OPS-RUNBOOK.md`** — pacing / 注册风控运维说明
+- **离线测试** — `tests/test_pr32_mute_guard.py`、`tests/test_register_risk_device.py`
+
+### 致谢
+- PR #32 by [@khs0927](https://github.com/khs0927)
+- PR #30 作者 [@Anai-Guo](https://github.com/Anai-Guo)（已在 v2.4.0 摘要提及）
+
 ## [v2.4.1] — 2026-09-12
 
 ### 变更

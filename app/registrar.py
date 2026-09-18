@@ -46,7 +46,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from curl_cffi import requests as cffi_requests
 
 from app.config import config_manager, DsAccount
-from app.device_ids import get_device_id as _ds_real_device_id
+from app.device_ids import (
+    get_device_id as _ds_real_device_id,
+    mark_device_burned as _mark_device_burned,
+)
 from pow_native import DeepSeekPOW
 
 AUTH_BASE = "https://platform.deepseek.com/auth-api/v0/users"
@@ -95,17 +98,67 @@ def random_ios_headers(locale: str = "zh_CN") -> Dict[str, str]:
 
 # ── 基础工具 ────────────────────────────────────────────────
 
+_extra_device_ids_loaded = False
+
+
+def _ensure_extra_device_ids() -> None:
+    global _extra_device_ids_loaded
+    if _extra_device_ids_loaded:
+        return
+    extra = os.environ.get("DEEPSEEK_DEVICE_IDS_FILE")
+    if extra:
+        try:
+            from app.device_ids import load_extra_device_ids
+            n = load_extra_device_ids(extra)
+            if n:
+                print(f"[Registrar] loaded {n} extra device_ids from {extra}")
+        except Exception as e:
+            print(f"[Registrar] load extra device_ids failed: {e}")
+    _extra_device_ids_loaded = True
+
+
 def new_device_id() -> str:
     """生成 device_id。
 
-    优先从真实 iOS 设备指纹库随机选取（aiodeepseek 收集的已知设备 ID，
-    可显著降低 DeepSeek 风控 RISK_DEVICE_DETECTED 拦截概率），
-    库不可用时回退为 32 字节随机数 base64。
+    优先从本地设备指纹库随机选取（跳过已被 RISK_DEVICE_DETECTED 拉黑的 ID）。
+    公开池可能已被上游风控标记（issue #31）；库耗尽时回退随机 base64。
+    可通过 DEEPSEEK_DEVICE_IDS_FILE 追加私有指纹。
     """
+    _ensure_extra_device_ids()
     try:
         return _ds_real_device_id()
     except Exception:
         return base64.b64encode(os.urandom(32)).decode()
+
+
+# DeepSeek auth-api biz_code (register path)
+BIZ_CODE_OK = 0
+BIZ_CODE_REGISTER_MAINLAND = 6
+BIZ_CODE_RISK_DEVICE = 11
+_RISK_BIZ_CODES = {BIZ_CODE_RISK_DEVICE}
+_RISK_MSG_HINTS = ("RISK_DEVICE", "risk device", "设备风险")
+
+
+def _parse_auth_biz(data: dict) -> Tuple[Any, str, Any]:
+    """Extract (biz_code, biz_msg, biz_data) from auth-api envelope."""
+    inner = data.get("data") or {}
+    if not isinstance(inner, dict):
+        inner = {}
+    return (
+        inner.get("biz_code"),
+        str(inner.get("biz_msg") or ""),
+        inner.get("biz_data"),
+    )
+
+
+def _is_risk_device_error(info: dict) -> bool:
+    if not isinstance(info, dict):
+        return False
+    code = info.get("biz_code")
+    if code in _RISK_BIZ_CODES:
+        return True
+    msg = str(info.get("error") or info.get("biz_msg") or "").upper()
+    return any(h.upper() in msg for h in _RISK_MSG_HINTS)
 
 
 def generate_password(length: int = 14) -> str:
@@ -174,15 +227,20 @@ def _post(path: str, body: dict, extra_headers: Optional[dict] = None,
 
 def _biz_error(data: dict, fallback: str) -> str:
     """从 auth-api 响应中提取可读错误。"""
-    inner = data.get("data") or {}
-    return inner.get("biz_msg") or data.get("msg") or fallback
+    _code, biz_msg, _bd = _parse_auth_biz(data) if isinstance(data, dict) else (None, "", None)
+    return biz_msg or (data.get("msg") if isinstance(data, dict) else None) or fallback
 
 
 # ── 注册流程 API ────────────────────────────────────────────
 
 def send_verification_code(email: str, device_id: Optional[str] = None,
-                           locale: str = "zh_CN", proxy: Optional[dict] = None) -> Tuple[bool, Dict]:
-    """发送注册验证码。返回 (ok, {send_window_secs} 或 {error})。"""
+                           locale: str = "zh_CN", proxy: Optional[dict] = None,
+                           ios: bool = True) -> Tuple[bool, Dict]:
+    """发送注册验证码。返回 (ok, {send_window_secs} 或 {error})。
+
+    ios=True（默认）：与 register_account 同一 iOS 指纹族，避免 web→ios
+    平台跳变触发 RISK_DEVICE_DETECTED（issue #31）。
+    """
     payload = {
         "email": email,
         "turnstile_token": "",
@@ -191,14 +249,19 @@ def send_verification_code(email: str, device_id: Optional[str] = None,
         "scenario": "register",
     }
     try:
-        resp = _post("/create_email_verification_code", payload, proxy=proxy)
+        resp = _post("/create_email_verification_code", payload, proxy=proxy, ios=ios)
         data = resp.json()
     except Exception as e:
         return False, {"error": f"请求失败: {e}"}
     if resp.status_code != 200 or data.get("code") != 0:
-        return False, {"error": _biz_error(data, f"HTTP {resp.status_code}")}
+        biz_code, biz_msg, _ = _parse_auth_biz(data)
+        return False, {
+            "error": _biz_error(data, f"HTTP {resp.status_code}"),
+            "biz_code": biz_code,
+            "biz_msg": biz_msg,
+        }
     inner = data.get("data") or {}
-    return True, {"send_window_secs": (inner.get("biz_data") or {}).get("send_window_secs", 60)}
+    return True, {"send_window_secs": ((inner.get("biz_data") or {}) or {}).get("send_window_secs", 60)}
 
 
 def fetch_guest_challenge(target_path: str = REGISTER_TARGET,
@@ -250,11 +313,36 @@ def register_account(email: str, password: str, code: str,
     except Exception as e:
         return False, {"error": f"请求失败: {e}"}
     if resp.status_code != 200 or data.get("code") != 0:
-        return False, {"error": _biz_error(data, f"HTTP {resp.status_code}")}
-    user = ((data.get("data") or {}).get("biz_data") or {}).get("user") or {}
+        biz_code, biz_msg, _ = _parse_auth_biz(data)
+        return False, {
+            "error": _biz_error(data, f"HTTP {resp.status_code}"),
+            "biz_code": biz_code,
+            "biz_msg": biz_msg,
+        }
+    biz_code, biz_msg, biz_data = _parse_auth_biz(data)
+    # Upstream can return HTTP 200 + code=0 but biz_code!=0 (e.g. 11 RISK_DEVICE_DETECTED)
+    if biz_code not in (None, BIZ_CODE_OK):
+        detail = biz_msg or "unknown"
+        err = "注册被拒 biz_code={}: {}".format(biz_code, detail)
+        if biz_code == BIZ_CODE_REGISTER_MAINLAND:
+            err += "（大陆 IP，请在管理面板配置海外代理）"
+        elif biz_code == BIZ_CODE_RISK_DEVICE:
+            err += "（设备风控 RISK_DEVICE_DETECTED：检查代理质量；公开 device_id 池可能已失效）"
+        return False, {
+            "error": err,
+            "biz_code": biz_code,
+            "biz_msg": biz_msg,
+        }
+    if not isinstance(biz_data, dict):
+        biz_data = {}
+    user = biz_data.get("user") or {}
     token = user.get("token", "")
     if not token:
-        return False, {"error": f"注册响应中无 token: {json.dumps(data, ensure_ascii=False)[:300]}"}
+        return False, {
+            "error": "注册响应中无 token: {}".format(json.dumps(data, ensure_ascii=False)[:300]),
+            "biz_code": biz_code,
+            "biz_msg": biz_msg,
+        }
     return True, {"token": token, "user": user}
 
 
@@ -707,8 +795,13 @@ class BatchRegistrar:
                      reader: dict, reader_mode: str, wait_timeout: int,
                      poll_interval: float, proxy: Optional[dict]) -> None:
         start_ts = time.time()
-        self._log(job, f"[{idx}/{total}] 开始处理 {email}")
         device_id = new_device_id()
+        proxy_note = "on" if proxy else "OFF"
+        self._log(
+            job,
+            f"[{idx}/{total}] 开始处理 {email} proxy={proxy_note} "
+            f"device_id={device_id[:16]}…"
+        )
 
         # 0. mail.cx 模式：清空该邮箱旧邮件，保证验证码是全新的
         if reader_mode == "mailcx":
@@ -716,39 +809,13 @@ class BatchRegistrar:
             if mailcx_key:
                 clear_mailcx_inbox(mailcx_key, email)
 
-        # 1. 发送验证码（遇到限流 EMAIL_REQUEST_TOO_FREQUENT 等待后重试一次）
-        self._set(job, email, status="sending_code")
-        ok, info = send_verification_code(email, device_id=device_id,
-                                          locale=opts.get("locale", "zh_CN"), proxy=proxy)
-        if not ok and "TOO_FREQUENT" in str(info.get("error", "")):
-            self._log(job, f"{email} 发送太频繁，等待 65s 后重试...")
-            time.sleep(65)
-            ok, info = send_verification_code(email, device_id=device_id,
-                                              locale=opts.get("locale", "zh_CN"), proxy=proxy)
-        if not ok:
-            self._set(job, email, status="failed", error=info.get("error", "发送验证码失败"),
-                      elapsed=round(time.time() - start_ts, 1))
-            self._log(job, f"{email} 发送验证码失败: {info.get('error')}")
+        code = self._send_and_wait_code(job, email, device_id, opts, reader,
+                                        reader_mode, wait_timeout, poll_interval, proxy)
+        if not code:
             return
-        self._log(job, f"{email} 验证码已发送（间隔 {info.get('send_window_secs', 60)}s）")
-
-        # 2. 获取验证码
-        code = job["codes"].get(email) or ""
-        if not code and reader_mode == "manual":
-            self._set(job, email, status="waiting_code")
-            code = self._wait_manual_code(job, email, wait_timeout)
-        elif not code:
-            self._set(job, email, status="waiting_code")
-            code = self._read_code_loop(job, email, reader_mode, reader, wait_timeout, poll_interval)
         if job["stop_flag"]:
             job["status"] = "stopped"
             return
-        if not code:
-            self._set(job, email, status="failed", error="未获取到验证码（超时）",
-                      elapsed=round(time.time() - start_ts, 1))
-            self._log(job, f"{email} 验证码获取超时")
-            return
-        self._log(job, f"{email} 已获取验证码")
 
         # 3. 注册（注册成功即返回 token）
         self._set(job, email, status="registering")
@@ -758,10 +825,37 @@ class BatchRegistrar:
                                     region=opts.get("region", "US"),
                                     locale=opts.get("locale", "zh_CN"),
                                     proxy=proxy)
+        # RISK_DEVICE_DETECTED：拉黑该 device_id，换指纹重发验证码并重试一次
+        if not ok and _is_risk_device_error(info):
+            _mark_device_burned(device_id)
+            from app.device_ids import burned_count
+            self._log(
+                job,
+                f"{email} 触发设备风控 biz_code={info.get('biz_code')} "
+                f"已拉黑 device_id={device_id[:16]}…（累计 {burned_count()}），"
+                f"更换指纹后重试一次"
+            )
+            job["codes"].pop(email, None)
+            device_id = new_device_id()
+            self._log(job, f"{email} 重试 device_id={device_id[:16]}… proxy={proxy_note}")
+            code = self._send_and_wait_code(job, email, device_id, opts, reader,
+                                            reader_mode, wait_timeout, poll_interval, proxy)
+            if not code:
+                return
+            self._set(job, email, status="registering")
+            ok, info = register_account(email, pw, code,
+                                        device_id=device_id,
+                                        region=opts.get("region", "US"),
+                                        locale=opts.get("locale", "zh_CN"),
+                                        proxy=proxy)
         if not ok:
-            self._set(job, email, status="failed", error=info.get("error", "注册失败"),
+            err = info.get("error", "注册失败")
+            if not proxy and (_is_risk_device_error(info)
+                              or info.get("biz_code") == BIZ_CODE_REGISTER_MAINLAND):
+                err += "；未配置海外代理（管理面板 → 设置 → 代理配置）"
+            self._set(job, email, status="failed", error=err,
                       elapsed=round(time.time() - start_ts, 1))
-            self._log(job, f"{email} 注册失败: {info.get('error')}")
+            self._log(job, f"{email} 注册失败: {err}")
             return
         token = info["token"]
 
@@ -790,6 +884,47 @@ class BatchRegistrar:
         # 账号间隔，避免限流
         if idx < total:
             time.sleep(2)
+
+    def _send_and_wait_code(self, job: dict, email: str, device_id: str, opts: dict,
+                            reader: dict, reader_mode: str, wait_timeout: int,
+                            poll_interval: float, proxy: Optional[dict]) -> Optional[str]:
+        """发验证码并等待 code；失败返回 None。"""
+        start_ts = time.time()
+        self._set(job, email, status="sending_code")
+        ok, info = send_verification_code(email, device_id=device_id,
+                                          locale=opts.get("locale", "zh_CN"),
+                                          proxy=proxy)
+        if not ok and "TOO_FREQUENT" in str(info.get("error", "")):
+            self._log(job, f"{email} 发送太频繁，等待 65s 后重试...")
+            time.sleep(65)
+            ok, info = send_verification_code(email, device_id=device_id,
+                                              locale=opts.get("locale", "zh_CN"),
+                                              proxy=proxy)
+        if not ok:
+            err = info.get("error", "发送验证码失败")
+            self._set(job, email, status="failed", error=err,
+                      elapsed=round(time.time() - start_ts, 1))
+            self._log(job, f"{email} 发送验证码失败: {err}")
+            return None
+        self._log(job, f"{email} 验证码已发送（间隔 {info.get('send_window_secs', 60)}s）")
+
+        code = job["codes"].get(email) or ""
+        if not code and reader_mode == "manual":
+            self._set(job, email, status="waiting_code")
+            code = self._wait_manual_code(job, email, wait_timeout)
+        elif not code:
+            self._set(job, email, status="waiting_code")
+            code = self._read_code_loop(job, email, reader_mode, reader, wait_timeout, poll_interval)
+        if job["stop_flag"]:
+            job["status"] = "stopped"
+            return None
+        if not code:
+            self._set(job, email, status="failed", error="未获取到验证码（超时）",
+                      elapsed=round(time.time() - start_ts, 1))
+            self._log(job, f"{email} 验证码获取超时")
+            return None
+        self._log(job, f"{email} 已获取验证码")
+        return code
 
     def _wait_manual_code(self, job: dict, email: str, timeout: int) -> Optional[str]:
         """manual 模式：轮询等待用户在 UI 提交验证码。"""

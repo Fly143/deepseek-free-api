@@ -1,3 +1,15 @@
+## [Unreleased]
+
+### 修复
+- **会话被风控登出后自动重登（Issue #35）** — DeepSeek「检测到高风险账号，已自动登出」等会话失效信号（SSE 错误事件 / HTTP 200 内嵌 JSON / 401/403）触发自动 `relogin`：用保存的邮箱/手机号 + 密码重新登录并创建新会话，然后重试一次。此前自动刷新在请求路径是**死代码**：`chat()` / anthropic 路由构造的 cfg 未携带 `_password` / `_email` / `_mobile`，`relogin()` 永远拿不到凭证；且触发条件只认 HTTP 401，登出类错误完全不触发，账号随即被标记失效 → 503「没有可用账号」。
+- **重登失败进入冷却而非永久失联** — 重登失败或重试仍失败时，账号标记 `cooldown_until`（默认 300s，`DEEPSEEK_SESSION_INVALID_COOLDOWN_SEC` 可调）并保持 `is_valid`，冷却结束后自动恢复（自愈），不再需要人工去 /admin 点重登。
+- **流式重试修复** — `_do_chat_stream_only` 改为迭代原始同步生成器（Starlette 会把同步生成器包装成异步生成器，`yield from body_iterator` 报 `'async_generator' object is not iterable`）；此前流式 401 重试从未真正生效。
+
+### 新增
+- `_session_invalid_error()` — 识别登出类错误文案（中/英：高风险 / 自动登出 / 登录已过期 / unauthorized / token expired …）
+- `DEEPSEEK_SESSION_INVALID_COOLDOWN_SEC`（默认 300）
+- `tests/test_issue35_auto_relogin.py` — 3 项离线测试（非流式重试 / 流式重试 / 重登失败冷却）
+
 ## [v2.4.2] — 2026-09-18
 
 覆盖 PR #32/#33（@khs0927 + maintainer review）与 PR #34（Issue #31）。

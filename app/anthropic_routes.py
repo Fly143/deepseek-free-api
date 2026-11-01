@@ -143,6 +143,12 @@ async def anthropic_messages(request: Request):
         "headers": dict(account.headers),
         "cookie": account.cookie,
         "account_label": account.account_label,
+        # 凭证必须带入请求路径：会话被风控登出时自动重登（relogin）依赖这些字段
+        "login_type": account.login_type,
+        "_password": account._password,
+        "_email": account._email,
+        "_mobile": account._mobile,
+        "_area_code": account._area_code,
     }
     account_label = account.account_label
     ref_file_ids = []
@@ -217,6 +223,15 @@ async def anthropic_messages(request: Request):
     if stream:
         result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=False, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
 
+        # 重登重试后 cfg 里的 session_id 可能已过期——以账号池中的最新会话为准
+        final_sid = cfg.get("session_id", "")
+        try:
+            _acc_now = config_manager.get_account_by_label(account_label)
+            if _acc_now and _acc_now.session_id:
+                final_sid = _acc_now.session_id
+        except Exception:
+            pass
+
         async def _wrap():
             orig_iter = result.body_iterator
             async def _gen():
@@ -225,14 +240,23 @@ async def anthropic_messages(request: Request):
             async for event in _anthropic_stream_response(_gen(), model, msg_id):
                 yield event
             add_usage(model, prompt_tokens, 0)
-            add_tokens(account_label, cfg.get("session_id", ""), prompt_tokens)
+            add_tokens(account_label, final_sid, prompt_tokens)
 
         return StreamingResponse(_wrap(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
     else:
         result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=False, is_retry=False, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids)
 
+        # 重登重试后 cfg 里的 session_id 可能已过期——以账号池中的最新会话为准
+        final_sid = cfg.get("session_id", "")
+        try:
+            _acc_now = config_manager.get_account_by_label(account_label)
+            if _acc_now and _acc_now.session_id:
+                final_sid = _acc_now.session_id
+        except Exception:
+            pass
+
         add_usage(model, prompt_tokens, 0)
-        add_tokens(account_label, cfg.get("session_id", ""), prompt_tokens)
+        add_tokens(account_label, final_sid, prompt_tokens)
 
         if isinstance(result, JSONResponse):
             openai_body_resp = json.loads(result.body)

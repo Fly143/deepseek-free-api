@@ -11,6 +11,10 @@ from contextlib import contextmanager
 MIN_INTERVAL_SEC = float(os.environ.get("DEEPSEEK_MIN_INTERVAL_SEC", "2.5"))
 MAX_CONCURRENT = max(1, int(os.environ.get("DEEPSEEK_MAX_CONCURRENT", "1")))
 ERROR_COOLDOWN_SEC = float(os.environ.get("DEEPSEEK_ERROR_COOLDOWN_SEC", "60"))
+# Cooldown after a failed auto-relogin (session invalidated / auto-logout).
+# Longer than ERROR_COOLDOWN_SEC so risk flags can cool down before the next
+# attempt; keeps the account "alive" so it self-heals instead of going invalid.
+SESSION_INVALID_COOLDOWN_SEC = float(os.environ.get("DEEPSEEK_SESSION_INVALID_COOLDOWN_SEC", "300"))
 
 _lock = threading.RLock()
 _slots = threading.Semaphore(MAX_CONCURRENT)

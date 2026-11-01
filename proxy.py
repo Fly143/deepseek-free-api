@@ -48,7 +48,7 @@ CONFIG_FILE = BASE_DIR / "config.json"
 
 # 多账号管理
 from app.config import config_manager, DsAccount
-from app.lock_guard import upstream_slot, ERROR_COOLDOWN_SEC
+from app.lock_guard import upstream_slot, ERROR_COOLDOWN_SEC, SESSION_INVALID_COOLDOWN_SEC
 from app.auth import verify_admin
 from app.registrar import (BatchRegistrar, registrar as _registrar,
                            send_verification_code, expand_email_patterns,
@@ -3048,6 +3048,29 @@ def _result_looks_successful(result) -> bool:
 _BIZ_CODE_MUTED = 5
 
 
+def _session_invalid_error(message: str) -> bool:
+    """True when an upstream error message indicates the session was
+    invalidated (auto-logout / risk logout / expired login), i.e. a fresh
+    relogin may fix it."""
+    if not message:
+        return False
+    low = str(message).lower()
+    return any(h in low for h in _SESSION_INVALID_HINTS)
+
+
+_SESSION_INVALID_HINTS = (
+    # 中文
+    "高风险", "自动登出", "登出", "重新登录", "请先登录", "登录已过期",
+    "登录过期", "登录失效", "登录状态", "未登录", "会话失效", "会话过期",
+    "会话已失效", "会话已过期", "账号已登出", "登陆已过期",
+    # English
+    "unauthorized", "token expired", "token invalid", "invalid token",
+    "session invalid", "session expired", "please login", "please re-login",
+    "re-login", "login required", "login expired", "logged out", "logout",
+    "authentication failed", "auth failed", "not logged in",
+)
+
+
 def _parse_account_restriction(payload):
     """Parse DeepSeek biz mute/ban payload.
 
@@ -3298,6 +3321,13 @@ def relogin(cfg: dict) -> dict | None:
             print(f"[Token] 新 session: {session_id}")
         else:
             print(f"[Token] Session 创建失败: {session_resp.status_code}")
+
+        # 新会话 → 重置 session_store 的 token 计数（旧会话归档）
+        if session_id:
+            try:
+                on_new_session(account_label, session_id, "")
+            except Exception as _se:
+                print(f"[Token] session_store 更新跳过: {_se}")
 
         new_cfg = {
             "token": token,
@@ -3813,6 +3843,12 @@ async def chat(request: Request):
         "headers": dict(account.headers),
         "cookie": account.cookie,
         "account_label": account.account_label,
+        # 凭证必须带入请求路径：会话被风控登出时自动重登（relogin）依赖这些字段
+        "login_type": account.login_type,
+        "_password": account._password,
+        "_email": account._email,
+        "_mobile": account._mobile,
+        "_area_code": account._area_code,
     }
     account_label = account.account_label
     ref_file_ids = []
@@ -3984,6 +4020,15 @@ async def chat(request: Request):
 
     # (Vision SSE wrapper removed — all models now stream directly via fragments format)
 
+    # 重登重试后 cfg 里的 session_id 可能已过期——以账号池中的最新会话为准
+    final_sid = cfg.get("session_id", "")
+    try:
+        _acc_now = config_manager.get_account_by_label(account_label)
+        if _acc_now and _acc_now.session_id:
+            final_sid = _acc_now.session_id
+    except Exception:
+        pass
+
     # 用量统计：非流式直接计数，流式包装生成器
     if stream and hasattr(result, 'body_iterator'):
         orig_iter = result.body_iterator
@@ -4001,11 +4046,11 @@ async def chat(request: Request):
                     except: pass
                 yield chunk
             add_usage(model, prompt_tokens, _count_tokens(completion_text))
-            add_tokens(account_label, cfg.get("session_id", ""), prompt_tokens)
+            add_tokens(account_label, final_sid, prompt_tokens)
         result.body_iterator = _counted_stream()
     else:
         add_usage(model, prompt_tokens, 0)
-        add_tokens(account_label, cfg.get("session_id", ""), prompt_tokens)
+        add_tokens(account_label, final_sid, prompt_tokens)
     return result
 
 
@@ -4885,6 +4930,20 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                         if "code" in obj and obj.get("code", 0) >= 40000:
                             yield ("error", {"message": obj.get("msg", "unknown"), "code": obj.get("code")})
                             return
+                        # 会话失效类错误（高风险自动登出等）：转成 error 事件，
+                        # 交给上层触发自动重登（relogin）
+                        _err_msg = ""
+                        for _k in ("msg", "message"):
+                            if obj.get(_k):
+                                _err_msg = str(obj[_k])
+                                break
+                        if not _err_msg:
+                            _d = obj.get("data")
+                            if isinstance(_d, dict):
+                                _err_msg = str(_d.get("biz_msg") or _d.get("msg") or "")
+                        if _session_invalid_error(_err_msg):
+                            yield ("error", {"message": _err_msg, "code": obj.get("code", "session_invalid")})
+                            return
                 except json.JSONDecodeError:
                     pass
                 continue
@@ -5064,20 +5123,28 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             if ref_file_ids or thinking_enabled:
                 _vlog(f"chat stream response: status={resp.status_code} ct={resp.headers.get('content-type','?')} model={model} thinking={thinking_enabled}")
 
-            if resp.status_code == 401 and not is_retry:
-                print("[Token] 401, trying refresh...")
-                new_cfg = relogin(cfg)
-                if new_cfg:
-                    for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens):
-                        yield chunk
-                    return
-                else:
-                    al = cfg.get("account_label", "") or cfg.get("account", "")
-                    if al:
-                        config_manager.update_account(al, is_valid=False)
-                yield f'data: {json.dumps({"error": {"message": "Token expired", "type": "auth_error", "code": 401}})}\n\n'
-                yield "data: [DONE]\n\n"
-                return
+            if not is_retry and resp.status_code != 200:
+                _err_text = ""
+                try:
+                    _err_text = (resp.text or "")[:500] if hasattr(resp, "text") else ""
+                except Exception:
+                    _err_text = ""
+                # 会话失效（401/403/带登出提示的非 200）：自动重新登录并重试一次
+                if resp.status_code in (401, 403) or _session_invalid_error(_err_text):
+                    print(f"[Token] HTTP {resp.status_code} session-invalid signal, trying refresh...")
+                    new_cfg = relogin(cfg)
+                    if new_cfg:
+                        for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens):
+                            yield chunk
+                        return
+                    else:
+                        al = cfg.get("account_label", "") or cfg.get("account", "")
+                        if al:
+                            config_manager.mark_account_cooldown(al, SESSION_INVALID_COOLDOWN_SEC)
+                        if resp.status_code == 401:
+                            yield f'data: {json.dumps({"error": {"message": "Token expired", "type": "auth_error", "code": 401}})}\n\n'
+                            yield "data: [DONE]\n\n"
+                            return
 
             if resp.status_code != 200:
                 error_msg = f"DeepSeek returned {resp.status_code}: {resp.text[:300]}"
@@ -5155,6 +5222,17 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                              "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                     elif etype == "error":
+                        if not is_retry and _session_invalid_error(val.get("message", "")):
+                            print("[Token] SSE session-invalid error, trying refresh...")
+                            new_cfg = relogin(cfg)
+                            if new_cfg:
+                                for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens):
+                                    yield chunk
+                                return
+                            else:
+                                al = cfg.get("account_label", "") or cfg.get("account", "")
+                                if al:
+                                    config_manager.mark_account_cooldown(al, SESSION_INVALID_COOLDOWN_SEC)
                         yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
                         yield "data: [DONE]\n\n"
                         return
@@ -5223,6 +5301,17 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                          "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
                     yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                 elif etype == "error":
+                    if not is_retry and _session_invalid_error(val.get("message", "")):
+                        print("[Token] SSE session-invalid error, trying refresh...")
+                        new_cfg = relogin(cfg)
+                        if new_cfg:
+                            for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens):
+                                yield chunk
+                            return
+                        else:
+                            al = cfg.get("account_label", "") or cfg.get("account", "")
+                            if al:
+                                config_manager.mark_account_cooldown(al, SESSION_INVALID_COOLDOWN_SEC)
                     yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
                     yield "data: [DONE]\n\n"
                     return
@@ -5273,15 +5362,22 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             if ref_file_ids or thinking_enabled:
                 _vlog(f"chat nonstream(stream-internal) response: status={resp.status_code} ct={resp.headers.get('content-type','?')}")
 
-            if resp.status_code == 401 and not is_retry:
-                print("[Token] 401 in nonstream, trying refresh...")
-                new_cfg = relogin(cfg)
-                if new_cfg:
-                    return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
-                else:
-                    al = cfg.get("account_label", "") or cfg.get("account", "")
-                    if al:
-                        config_manager.update_account(al, is_valid=False)
+            if not is_retry and resp.status_code != 200:
+                _err_text = ""
+                try:
+                    _err_text = (resp.text or "")[:500] if hasattr(resp, "text") else ""
+                except Exception:
+                    _err_text = ""
+                # 会话失效（401/403/带登出提示的非 200）：自动重新登录并重试一次
+                if resp.status_code in (401, 403) or _session_invalid_error(_err_text):
+                    print(f"[Token] HTTP {resp.status_code} session-invalid signal (nonstream), trying refresh...")
+                    new_cfg = relogin(cfg)
+                    if new_cfg:
+                        return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+                    else:
+                        al = cfg.get("account_label", "") or cfg.get("account", "")
+                        if al:
+                            config_manager.mark_account_cooldown(al, SESSION_INVALID_COOLDOWN_SEC)
 
             if resp.status_code != 200:
                 body_sample = ""
@@ -5347,6 +5443,15 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 elif etype == "thinking":
                     full_thinking += val
                 elif etype == "error":
+                    if not is_retry and _session_invalid_error(val.get("message", "")):
+                        print("[Token] SSE session-invalid error (nonstream), trying refresh...")
+                        new_cfg = relogin(cfg)
+                        if new_cfg:
+                            return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+                        else:
+                            al = cfg.get("account_label", "") or cfg.get("account", "")
+                            if al:
+                                config_manager.mark_account_cooldown(al, SESSION_INVALID_COOLDOWN_SEC)
                     raise HTTPException(502, detail={"error": {
                         "message": val["message"],
                         "type": "server_error",
@@ -5408,8 +5513,14 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         return JSONResponse(response_body)
 
     if stream:
-        return StreamingResponse(do_stream(), media_type="text/event-stream",
+        # 保留原始同步生成器引用：_do_chat_stream_only 重试时直接迭代它
+        # （Starlette 的 StreamingResponse 会把同步生成器包装成异步生成器，
+        #   导致 yield from body_iterator 报 'async_generator' object is not iterable）
+        _raw_gen = do_stream()
+        _sr = StreamingResponse(_raw_gen, media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        _sr._raw_stream_gen = _raw_gen
+        return _sr
     return do_nonstream()
 
 
@@ -5417,7 +5528,24 @@ def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, h
     """Token 刷新重试专用的流式生成器"""
     result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
     if isinstance(result, StreamingResponse):
-        yield from result.body_iterator
+        # 优先迭代原始同步生成器（避免 Starlette 异步包装导致 yield from 失败）
+        _raw = getattr(result, "_raw_stream_gen", None)
+        if _raw is not None:
+            yield from _raw
+        else:
+            it = result.body_iterator
+            if hasattr(it, "__aiter__"):
+                # 兜底：异步生成器 → 同步收集（当前生成器运行在线程池线程中，无活动事件循环）
+                import asyncio
+                _collected = []
+                async def _drain():
+                    async for _c in it:
+                        _collected.append(_c)
+                asyncio.run(_drain())
+                for _c in _collected:
+                    yield _c
+            else:
+                yield from it
     else:
         yield f"data: {json.dumps({'error': {'message': 'Retry returned non-stream', 'type': 'server_error'}})}\n\n"
         yield "data: [DONE]\n\n"

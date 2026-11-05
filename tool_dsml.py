@@ -300,34 +300,30 @@ def format_tool_calls_for_prompt(tool_calls_raw: Any) -> str:
             tool_calls_raw = json.loads(tool_calls_raw)
         except (json.JSONDecodeError, ValueError):
             return ""
-    if not isinstance(tool_calls_raw, list) or not tool_calls_raw:
+    if not isinstance(tool_calls_raw, list):
         return ""
-
     blocks = []
     for tc in tool_calls_raw:
         if not isinstance(tc, dict):
             continue
-        fn = tc.get("function", {})
+        fn = tc.get("function") or {}
         name = tc.get("name") or fn.get("name", "")
         if not name:
             continue
-        args = tc.get("arguments") or tc.get("input") or fn.get("arguments") or "{}"
+        args = tc.get("arguments", tc.get("input", fn.get("arguments", {})))
         if isinstance(args, str):
             try:
                 args = json.loads(args)
             except (json.JSONDecodeError, ValueError):
-                pass
-        params = _format_params_dsml(args)
-        block = f'  <|DSML|invoke name="{_escape_xml_attr(name)}">'
-        if params.strip():
-            block += "\n" + params + "\n  </|DSML|invoke>"
-        else:
-            block += "</|DSML|invoke>"
-        blocks.append(block)
-
-    if not blocks:
-        return ""
-    return "<|DSML|tool_calls>\n" + "\n".join(blocks) + "\n</|DSML|tool_calls>"
+                continue
+        if not isinstance(args, dict):
+            continue
+        try:
+            payload = json.dumps({"name": name, "arguments": args}, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            continue
+        blocks.append("do: " + payload)
+    return "\n".join(blocks)
 
 
 def _format_params_dsml(args: Any, indent: str = "    ") -> str:
@@ -391,67 +387,34 @@ def _escape_xml_attr(text: str) -> str:
 def build_dsml_tool_prompt(tools: List[Dict[str, Any]], passthrough: bool = False) -> str:
     if not tools:
         return ""
-
+    execution_rules = (
+        "Tools are executed by the client, not by writing a command in your answer. "
+        "To perform an action, request the appropriate tool and wait for its result. "
+        "Do not claim an action was performed or succeeded unless a tool result confirms it. "
+        "If a tool fails or no result is available, say what is known and do not invent an outcome."
+    )
     if passthrough:
-        # 透传模式：跳过 DSML 格式说明书，直接嵌入原始工具定义
-        import json
         tools_json = json.dumps(tools, indent=2, ensure_ascii=False)
         return (
             "You have the following tools available. "
             "Use your native tool-calling format when you need to invoke one.\n\n"
             f"<tools>\n{tools_json}\n</tools>\n\n"
             "When you use a tool, use whatever tool call format you normally use "
-            "(<|DSML|tool_calls>, TOOL_CALL:, or the standard format you prefer)."
+            "(<|DSML|tool_calls>, TOOL_CALL:, or the standard format you prefer).\n\n"
+            + execution_rules
         )
-
-    prompt = """TOOL CALL FORMAT — FOLLOW EXACTLY:
-
-<|DSML|tool_calls>
-  <|DSML|invoke name="TOOL_NAME_HERE">
-    <|DSML|parameter name="PARAMETER_NAME"><![CDATA[PARAMETER_VALUE]]></|DSML|parameter>
-  </|DSML|invoke>
-</|DSML|tool_calls>
-
-RULES:
-1) Use the <|DSML|tool_calls> wrapper format.
-2) Put one or more <|DSML|invoke> entries under a single <|DSML|tool_calls> root.
-3) Put the tool name in the invoke name attribute: <|DSML|invoke name="TOOL_NAME">.
-4) All string values must use <![CDATA[...]]>, even short ones.
-5) Every top-level argument must be a <|DSML|parameter name="ARG_NAME">...</|DSML|parameter> node.
-6) Objects use nested XML elements. Arrays may repeat <item> children.
-7) Numbers, booleans, and null stay plain text.
-8) Use only the parameter names in the tool schema. Do not invent fields.
-9) Do NOT wrap XML in markdown fences. Do NOT output explanations or role markers.
-10) If you call a tool, the first non-whitespace characters must be exactly <|DSML|tool_calls>.
-11) Never omit the opening <|DSML|tool_calls> tag.
-
-【WRONG — Do NOT do these】:
-
-Wrong 1 — mixed text after XML:
-  <|DSML|tool_calls>...</|DSML|tool_calls> I hope this helps.
-
-Wrong 2 — Markdown code fences:
-  ```xml
-  <|DSML|tool_calls>...</|DSML|tool_calls>
-  ```
-
-Wrong 3 — missing opening wrapper:
-  <|DSML|invoke name="TOOL_NAME">...</|DSML|invoke>
-  </|DSML|tool_calls>
-
-Remember: The ONLY valid way to use tools is the <|DSML|tool_calls>...</|DSML|tool_calls> block.
-
-"""
-
-    prompt += "Available tools:\n"
-    for tool in tools:
-        fn = tool.get("function", {})
-        name = fn.get("name") or tool.get("name", "")
-        desc = (fn.get("description") or tool.get("description", "")).split("\n")[0].strip()
-        if name:
-            prompt += f"  - {name}: {desc}\n" if desc else f"  - {name}\n"
-
-    return prompt
+    definitions = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+    return (
+        "Available tools and their schemas: " + definitions + "\n\n"
+        "To call a tool, output only a line beginning with do: followed by one JSON object "
+        'with exactly the fields "name" and "arguments". The name must be an available tool name, '
+        'and arguments must be an object matching its schema. Example: '
+        'do: {"name":"tool_name","arguments":{"query":"example"}}. '
+        "For multiple calls, output one do: JSON object per line. "
+        "Do not use markdown fences or include explanatory text in a tool call response. "
+        "If no tool is needed, respond normally.\n\n"
+        + execution_rules
+    )
 
 
 # ─── 泄漏输出清理 ────────────────────────────────────────

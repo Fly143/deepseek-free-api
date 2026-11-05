@@ -27,6 +27,7 @@ from response_store import save_response_record, get_response_record, delete_res
 
 # ── 工具调用处理模块 ─────────────────────────────────
 from tool_call import (
+    ToolFormatError,
     extract_tool_call,
     get_tool_names,
     convert_messages_for_deepseek,
@@ -50,10 +51,8 @@ CONFIG_FILE = BASE_DIR / "config.json"
 from app.config import config_manager, DsAccount
 from app.lock_guard import upstream_slot, ERROR_COOLDOWN_SEC, SESSION_INVALID_COOLDOWN_SEC
 from app.auth import verify_admin
-from app.registrar import (BatchRegistrar, registrar as _registrar,
-                           send_verification_code, expand_email_patterns,
-                           list_mailcx_domains, generate_local_part,
-                           random_ios_headers, new_device_id)
+from app.identity import random_ios_headers, new_device_id
+from app.tool_choice import select_tools
 VISION_LOG = BASE_DIR / "vision.log"
 _DEBUG = os.getenv("DS_DEBUG", "").lower() in ("1", "true", "yes")
 
@@ -999,7 +998,7 @@ def _response_output_from_chat_message(msg: dict) -> list[dict]:
     content = msg.get("content", "")
     if isinstance(content, str) and content:
         # 安全防护：剥除 content 中残留的 <think> 标签（SSE 解析可能遗漏）
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
         if content:
             output.append(_response_text_item(content))
     tool_calls = msg.get("tool_calls") or []
@@ -1513,6 +1512,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def _authenticate_api(request: Request, call_next):
+    path = request.scope.get("path", "")
+    key = os.getenv("DEEPSEEK_PROXY_API_KEY", "")
+    preflight = request.method == "OPTIONS" and request.headers.get("origin") and request.headers.get("access-control-request-method")
+    if key and not preflight and (path == "/v1" or path.startswith("/v1/")):
+        authorization = request.headers.get("authorization", "")
+        scheme, _, bearer = authorization.partition(" ")
+        supplied = [request.headers.get("x-api-key", "")]
+        if scheme.lower() == "bearer":
+            supplied.append(bearer.strip())
+        expected = key.encode("utf-8")
+        if not any(secrets.compare_digest(value.encode("utf-8"), expected) for value in supplied):
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"message": "API 密钥无效或未提供", "type": "authentication_error"}},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await call_next(request)
+
 # ── 修复 /v1/v1/ 双前缀（Claude Code CLI 等客户端 base URL 带 /v1）──
 @app.middleware("http")
 async def _rewrite_double_v1(request: Request, call_next):
@@ -1632,7 +1651,6 @@ a{color:#7dd3fc}
 <div class="tab" onclick="switchTab('usage')">用量统计</div>
 <div class="tab" onclick="switchTab('accounts')">账号管理</div>
 <div class="tab" onclick="switchTab('settings')" data-i18n="settings">设置</div>
-<div class="tab" onclick="switchTab('register')">批量注册</div>
 </div>
 
 <div id="phonePanel" class="panel active">
@@ -1668,8 +1686,8 @@ a{color:#7dd3fc}
 <div class="step">
 <div class="sl" style="font-weight:600;color:#e2e8f0;" data-i18n="apiConfig">API 配置</div>
 <div class="cfg">
-<div class="cr"><span data-i18n="apiAddr">API 地址</span><code onclick="cp(this)">http://localhost:""" + str(PROXY_PORT) + """/v1</code></div>
-<div class="cr"><span data-i18n="apiKey">API Key</span><code onclick="cp(this)" data-i18n="apiKeyVal">任意填写</code></div>
+<div class="cr"><span data-i18n="apiAddr">API 地址</span><code id="apiAddress" onclick="cp(this)"></code><script>document.getElementById('apiAddress').textContent=window.location.origin+'/v1'</script></div>
+<div class="cr"><span data-i18n="apiKey">API Key</span><code data-i18n="apiKeyVal">使用已配置的接口密钥</code></div>
 
 </div>
 </div>
@@ -1745,75 +1763,7 @@ a{color:#7dd3fc}
 <div id="pwdStatus" style="margin-top:8px;font-size:12px;color:#64748b"></div>
 </div>
 
-<div id="registerPanel" class="panel">
-<div class="sl" style="font-weight:600;color:#e2e8f0;margin-bottom:10px">批量注册账号（注册后自动登录并入池）</div>
-<div style="font-size:12px;color:#94a3b8;line-height:1.7;margin-bottom:10px">
-  流程：发送验证码 → mail.cx 临时邮箱收码 → 注册 → 自动登录并入账号池，之后由轮询负载均衡自动使用。<br>
-  只需填写注册数量，邮箱前缀与密码均随机生成；也可在「高级」里自定义邮箱列表。<br>
-  ⚠️ 注册接口对大陆 IP 直接返回 <code>REGISTER_FROM_MAINLAND</code>，需先在「设置」中配置海外代理。
-</div>
-<div class="pw-row" style="display:flex;gap:8px;align-items:center">
-  <input type="number" id="regCount" value="1" min="1" max="500" placeholder="注册数量" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-size:14px">
-  <span style="font-size:13px;color:#94a3b8;white-space:nowrap">个账号（邮箱前缀随机生成）</span>
-</div>
-<details style="margin-top:6px">
-  <summary style="cursor:pointer;font-size:12px;color:#64748b">高级：自定义邮箱列表（留空则按数量随机生成）</summary>
-  <div class="pw-row" style="margin-top:6px">
-    <textarea id="regEmails" placeholder="每行一个邮箱，或 user{1-5}@example.com 批量展开" style="width:100%;height:70px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-size:13px;resize:vertical"></textarea>
-  </div>
-</details>
-<div class="pw-row" style="margin-top:8px;display:flex;gap:8px;align-items:center">
-  <input type="password" id="regPassword" placeholder="注册密码（至少8位，含字母+数字）" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:12px;font-size:14px">
-  <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#e2e8f0;white-space:nowrap;cursor:pointer">
-    <input type="checkbox" id="regRandomPw" checked onchange="regPwToggle()"> 随机生成密码
-  </label>
-</div>
-<div class="row" style="margin-top:8px;display:flex;align-items:center;gap:8px">
-  <span style="font-size:12px;color:#94a3b8">Region:</span>
-  <select id="regRegion" style="background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:8px;font-size:13px">
-    <option value="US">US</option><option value="JP">JP</option><option value="SG">SG</option>
-    <option value="GB">GB</option><option value="DE">DE</option><option value="AU">AU</option>
-  </select>
-  <span style="font-size:12px;color:#94a3b8">验证码来源:</span>
-  <select id="regReader" onchange="regReaderChange()" style="background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:8px;font-size:13px">
-    <option value="mailcx">mail.cx 临时邮箱（推荐）</option>
-    <option value="manual">手动输入</option>
-    <option value="imap">IMAP 收件箱</option>
-    <option value="temp_api">通用临时邮箱 API</option>
-  </select>
-</div>
-<div id="regMailcx" style="margin-top:8px">
-  <div class="pw-row" style="display:flex;gap:6px;align-items:center">
-    <input id="regMailcxKey" placeholder="mail.cx API Key (tm_live_...)" style="flex:3;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px">
-    <button class="btn" style="background:#2563eb;color:#fff;font-size:12px;padding:10px 14px" onclick="loadMailcxDomains()">获取域名</button>
-  </div>
-  <div class="pw-row" style="margin-top:6px;display:flex;gap:6px;align-items:center">
-    <select id="regMailcxDomain" style="flex:3;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px">
-      <option value="">（先获取域名）</option>
-    </select>
-    <button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:10px 14px" onclick="saveMailcxConfig()">保存配置</button>
-  </div>
-  <div style="font-size:11px;color:#64748b;margin-top:4px">mail.cx 本地部分仅允许小写字母/数字/._-，建议用 <code>user{01-10}</code> 展开（不要用 + 号）；纯本地部分会自动补全 @域名</div>
-</div>
-<div id="regImap" style="display:none;margin-top:8px">
-  <div class="row" style="display:flex;gap:6px">
-    <input class="ph" id="regImapHost" placeholder="IMAP 服务器 (imap.example.com)" style="flex:2;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px">
-    <input class="ph" id="regImapPort" placeholder="端口" value="993" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px">
-  </div>
-  <div class="pw-row" style="margin-top:6px"><input id="regImapUser" placeholder="IMAP 账号（通常为邮箱）" style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px"></div>
-  <div class="pw-row" style="margin-top:6px"><input type="password" id="regImapPass" placeholder="IMAP 密码 / 授权码" style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px"></div>
-</div>
-<div id="regTempApi" style="display:none;margin-top:8px">
-  <div class="pw-row"><input id="regTempUrl" placeholder="临时邮箱 JSON API URL（返回含 6 位验证码的 JSON）" style="width:100%;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:10px;font-size:13px"></div>
-</div>
-<div class="row" style="margin-top:10px;display:flex;gap:8px;align-items:center">
-  <button class="btn bp" onclick="startBatch()">开始批量注册</button>
-  <button class="btn" style="background:#7f1d1d;color:#fca5a5" onclick="stopBatch()">停止任务</button>
-  <button class="btn" style="background:#334155;color:#e2e8f0" onclick="loadRegStatus()">刷新状态</button>
-  <button class="btn" style="background:#0d9488;color:#fff" onclick="exportAccounts()">下载账号列表</button>
-</div>
-<div id="regStatus" style="margin-top:12px;font-size:12px;color:#64748b"></div>
-</div>
+
 </div>
 
 <div id="toast" class="toast"></div>
@@ -1827,7 +1777,7 @@ emailPlaceholder:'邮箱地址',waitingCfg:'等待配置',configured:'已配置'
 loggingDS:'正在登录 DeepSeek...',loginOk:'登录成功',loginFail:'失败:',
 error:'错误:',saveCurlBtn:'保存 cURL',
 parsing:'解析中...',saved:'已保存',apiConfig:'API 配置',apiAddr:'API 地址',
-apiKey:'API Key',apiKeyVal:'任意填写',refreshModels:'🔄 刷新模型列表',
+apiKey:'API Key',apiKeyVal:'使用已配置的接口密钥',refreshModels:'🔄 刷新模型列表',
 refreshingModels:'刷新中...',foundModels:'✅ 发现',foundModelsSuffix:'个模型:',
 refreshOk:'刷新成功',refreshFail:'刷新失败',
 periodAll:'全部',periodWeek:'本周',periodToday:'今日',refreshBtn:'刷新',clearBtn:'清空',
@@ -1862,7 +1812,7 @@ emailPlaceholder:'Email Address',waitingCfg:'Awaiting Config',configured:'Config
 loggingDS:'Logging into DeepSeek...',loginOk:'Login Successful',loginFail:'Failed:',
 error:'Error:',saveCurlBtn:'Save cURL',
 parsing:'Parsing...',saved:'Saved',apiConfig:'API Config',apiAddr:'API Endpoint',
-apiKey:'API Key',apiKeyVal:'Any value',refreshModels:'🔄 Refresh Models',
+apiKey:'API Key',apiKeyVal:'Use the configured API key',refreshModels:'🔄 Refresh Models',
 refreshingModels:'Refreshing...',foundModels:'✅ Found',foundModelsSuffix:'model(s):',
 refreshOk:'Refreshed',refreshFail:'Refresh Failed',
 periodAll:'All',periodWeek:'This Week',periodToday:'Today',refreshBtn:'Refresh',clearBtn:'Clear',
@@ -1907,19 +1857,17 @@ function Qs(s){return document.querySelectorAll(s)}
 document.addEventListener('DOMContentLoaded',function(){Q('langBtn').textContent=_lang==='zh'?'🌐 EN':'🌐 中';applyI18n()});
 function Q(id){return document.getElementById(id)}
 function switchTab(type){
-var ti={'phone':0,'email':1,'usage':2,'accounts':3,'settings':4,'register':5};
+var ti={'phone':0,'email':1,'usage':2,'accounts':3,'settings':4};
 document.querySelectorAll('.tab').forEach((t,i)=>{t.className='tab'+(i===ti[type]?' active':'');});
 Q('phonePanel').className='panel'+(type==='phone'?' active':'');
 Q('emailPanel').className='panel'+(type==='email'?' active':'');
 if(Q('usagePanel'))Q('usagePanel').className='panel'+(type==='usage'?' active':'');
 if(Q('accountsPanel'))Q('accountsPanel').className='panel'+(type==='accounts'?' active':'');
 if(Q('settingsPanel'))Q('settingsPanel').className='panel'+(type==='settings'?' active':'');
-if(Q('registerPanel'))Q('registerPanel').className='panel'+(type==='register'?' active':'');
-var as=Q('apiSection');if(as)as.style.display=(type==='usage'||type==='accounts'||type==='settings'||type==='register')?'none':'';
+var as=Q('apiSection');if(as)as.style.display=(type==='usage'||type==='accounts'||type==='settings')?'none':'';
 if(type==='usage')loadUsage();
 if(type==='accounts')loadAccounts();
 if(type==='settings'){loadProxy();loadPassthrough();loadCompression();}
-if(type==='register'){loadRegStatus();regPwToggle();}
 }
 async function cs(){
 try{const r=await fetch('/api/config');const d=await r.json()
@@ -1986,9 +1934,10 @@ h+='<table class="acct-tbl"><tr><th>'+_('accountHeader')+'</th><th>'+_('statusHe
 for(var a of d.accounts){
 var st=a.is_valid?'ok':'no';
 var stT=a.is_valid?_('valid'):_('notLogin');
-var l=encodeURIComponent(a.account_label);
-h+='<tr><td>'+a.account_label+'</td><td><span class="acct-st '+st+'"></span>'+stT+'</td><td>'+(a.token_masked||'***')+'</td><td>'+(a.login_time||'-')+'</td>';
-h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">`+_('reloginBtn')+`</button><br><button class="acct-btn rm" onclick="removeAccount('${l}')">`+_('deleteBtn')+`</button></td>`;
+var l=encodeURIComponent(a.account_label).replace(/'/g,'%27');
+var esc=v=>String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+h+='<tr><td>'+esc(a.account_label)+'</td><td><span class="acct-st '+st+'"></span>'+stT+'</td><td>'+esc(a.token_masked||'***')+'</td><td>'+esc(a.login_time||'-')+'</td>';
+h+=`<td><button class="acct-btn rl" onclick="reloginAccount('${l}')">`+_('reloginBtn')+`</button><br><button class="acct-btn rl" onclick="setDeviceId('${l}')">设置设备标识</button><br><span>`+(a.device_source==='provided'?'用户提供':a.device_source==='generated'?'程序生成':'未设置')+`</span><br><button class="acct-btn rm" onclick="removeAccount('${l}')">`+_('deleteBtn')+`</button></td>`;
 }
 h+='</table>';
 }else{h='<div class="acct-empty">'+_('noAccounts')+'</div>'}
@@ -2015,6 +1964,16 @@ var d=await r.json();
 if(d.ok){t(_('deleted'));loadAccounts()}
 else{t(_('deleteFail')+(d.error||_('unknownErr')),1)}
 }catch(e){t(_('deleteFail')+e.message,1)}
+}
+async function setDeviceId(label){
+var value=prompt('请输入该账号本人设备的 device_id。请勿输入密码、令牌或完整请求内容。');
+if(value===null)return;
+try{
+var r=await fetch('/api/accounts/'+label+'/device-id',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_id:value})});
+var d=await r.json();
+if(!r.ok||!d.ok){t(d.detail||d.error||'设置失败',1);return}
+t('设备标识已保存');loadAccounts();
+}catch(e){t('设置失败: '+e.message,1)}
 }
 async function reloginAccount(label){
 var btn=event&&event.target;if(btn){btn.disabled=true;btn.textContent='...'}
@@ -2047,171 +2006,6 @@ var d=await r.json();
 t(d.ok?d.msg:_('cleanupFail')+(d.msg||_('unknown')),d.ok?0:1)
 }catch(e){t(_('cleanupFail')+e.message,1)}
 if(btn){btn.disabled=false;btn.textContent=_('cleanupSessionsBtn')}
-}
-// === 批量注册 ===
-var _regJob='';
-function regReaderChange(){
-  var m=Q('regReader').value;
-  Q('regImap').style.display=(m==='imap')?'':'none';
-  Q('regTempApi').style.display=(m==='temp_api')?'':'none';
-  Q('regMailcx').style.display=(m==='mailcx')?'':'none';
-  if(m==='mailcx')loadMailcxConfig();
-}
-async function loadMailcxConfig(){
-  try{
-    const r=await fetch('/api/register/mailcx-config');
-    const d=await r.json();
-    if(d.api_key){Q('regMailcxKey').value=d.api_key;loadMailcxDomains();}
-    if(d.domain)Q('regMailcxDomain').value=d.domain;
-  }catch(e){}
-}
-async function loadMailcxDomains(){
-  var key=Q('regMailcxKey').value.trim();
-  if(!key){t('请先填写 mail.cx API Key',1);return}
-  try{
-    const r=await fetch('/api/register/mailcx-domains?api_key='+encodeURIComponent(key));
-    const d=await r.json();
-    if(!d.ok){t(d.error||'获取域名失败',1);return}
-    var sel=Q('regMailcxDomain');
-    sel.innerHTML='<option value="">（选择邮箱后缀）</option>'+d.domains.map(x=>'<option value="'+x+'">'+x+'</option>').join('');
-    var cur=Q('regMailcxDomain').value;
-    t('获取到 '+d.domains.length+' 个可用后缀');
-    saveMailcxConfig();
-  }catch(e){t('错误: '+e.message,1)}
-}
-async function saveMailcxConfig(){
-  var key=Q('regMailcxKey').value.trim();
-  if(!key)return;
-  try{
-    await fetch('/api/register/mailcx-config',{method:'PUT',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({api_key:key,domain:Q('regMailcxDomain').value})});
-  }catch(e){}
-}
-function regPwToggle(){
-  Q('regPassword').disabled=Q('regRandomPw').checked;
-  Q('regPassword').style.opacity=Q('regRandomPw').checked?'0.5':'1';
-}
-async function startBatch(){
-  var emails=(Q('regEmails').value||'').split(String.fromCharCode(10)).map(s=>s.trim()).filter(Boolean);
-  var count=parseInt(Q('regCount').value)||0;
-  var randomPw=Q('regRandomPw').checked;
-  var password=randomPw?'':Q('regPassword').value;
-  if(!emails.length&&!count){t('请填写注册数量',1);return}
-  if(!randomPw&&!password){t('请填写注册密码或勾选随机生成',1);return}
-  var reader={mode:Q('regReader').value};
-  var domain='';
-  if(reader.mode==='mailcx'){
-    reader.api_key=Q('regMailcxKey').value.trim();
-    domain=Q('regMailcxDomain').value;
-    if(!reader.api_key){t('请填写 mail.cx API Key',1);return}
-    if(!domain){t('请选择邮箱后缀',1);return}
-    saveMailcxConfig();
-  }else if(reader.mode==='imap'){
-    reader.host=Q('regImapHost').value.trim();
-    reader.port=parseInt(Q('regImapPort').value)||993;
-    reader.user=Q('regImapUser').value.trim();
-    reader.password=Q('regImapPass').value;
-    reader.folder='INBOX';
-    if(!reader.host||!reader.user||!reader.password){t('请填写完整 IMAP 配置',1);return}
-  }else if(reader.mode==='temp_api'){
-    reader.url=Q('regTempUrl').value.trim();
-    if(!reader.url){t('请填写临时邮箱 API URL',1);return}
-  }
-  try{
-    const r=await fetch('/api/register/start',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({emails:emails,count:count,password:password,random_password:randomPw,region:Q('regRegion').value,
-        auto_login:true,reader:reader,wait_timeout:300,domain:domain})});
-    const d=await r.json();
-    if(d.ok){_regJob=d.job_id;t('任务已启动: '+d.job_id);
-      Q('regStatus').innerHTML='<div style="color:#7dd3fc">任务 '+d.job_id+' 运行中，共 '+d.emails.length+' 个邮箱...</div>';
-      pollRegStatus();
-    }else t(d.error||d.detail||'启动失败',1);
-  }catch(e){t('错误: '+e.message,1)}
-}
-function pollRegStatus(){
-  if(!_regJob)return;
-  loadRegStatus();
-  setTimeout(pollRegStatus,2000);
-}
-async function loadRegStatus(){
-  if(!_regJob){Q('regStatus').innerHTML='';return}
-  try{
-    const r=await fetch('/api/register/status?job_id='+encodeURIComponent(_regJob));
-    const d=await r.json();
-    renderRegStatus(d);
-    if(d.status==='done'||d.status==='stopped')_regJob='';
-  }catch(e){}
-}
-function renderRegStatus(job){
-  var stColor=job.status==='done'?'#4ade80':(job.status==='failed'||job.status==='stopped'?'#f87171':'#7dd3fc');
-  var h='<div style="color:'+stColor+';margin-bottom:6px;font-weight:600">任务 '+job.id+' ['+job.status+']'+
-        ' · 密码：'+(job.password_masked||'-')+' · 完成 '+
-        Object.values(job.results).filter(function(r){return r.status==='done'}).length+'/'+job.emails.length+'</div>';
-  h+='<table class="acct-tbl"><tr><th>邮箱</th><th>状态</th><th>Token</th><th>耗时(s)</th><th>错误</th></tr>';
-  for(var email of job.emails){
-    var r=job.results[email]||{};
-    var c=r.status==='done'?'#4ade80':(r.status==='failed'?'#f87171':'#94a3b8');
-    h+='<tr><td>'+email+'</td><td style="color:'+c+'">'+r.status+'</td><td>'+(r.token_masked||'')+'</td><td>'+(r.elapsed||'')+'</td><td style="color:#f87171;font-size:11px">'+(r.error||'')+'</td></tr>';
-  }
-  h+='</table>';
-  h+='<div id="regLogBox" style="margin-top:6px;max-height:160px;overflow:auto;font-family:monospace;font-size:11px;color:#94a3b8;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px">'+job.logs.join('<br>')+'</div>';
-  if(job.status==='running'){
-    h+='<div style="margin-top:8px;display:flex;gap:6px;align-items:center">'+
-       '<input id="regCodeEmail" placeholder="邮箱" style="flex:2;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:8px;font-size:12px">'+
-       '<input id="regCode" placeholder="6位验证码" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;padding:8px;font-size:12px">'+
-       '<button class="btn" style="background:#2563eb;color:#fff;font-size:12px;padding:8px 14px" onclick="submitBatchCode()">提交验证码</button></div>';
-  }else{
-    h+='<div style="margin-top:8px;display:flex;gap:8px">'+
-       '<button class="btn" style="background:#0d9488;color:#fff;font-size:12px;padding:8px 14px" onclick="exportAccounts()">下载账号密码列表</button>'+
-       '<button class="btn" style="background:#334155;color:#e2e8f0;font-size:12px;padding:8px 14px" onclick="exportPool()">导出账号池全部账号</button></div>';
-  }
-  Q('regStatus').innerHTML=h;
-  var lb=Q('regLogBox');if(lb)lb.scrollTop=lb.scrollHeight;
-}
-async function exportAccounts(){
-  if(!_regJob){t('无任务，先启动批量注册');return}
-  try{
-    const r=await fetch('/api/register/export?job_id='+encodeURIComponent(_regJob));
-    if(!r.ok){let d={};try{d=await r.json()}catch(e){};t(d.detail||('导出失败 HTTP '+r.status),1);return}
-    const blob=await r.blob();
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement('a');
-    a.href=url;a.download='deepseek_accounts_'+_regJob+'.csv';
-    document.body.appendChild(a);a.click();a.remove();
-    URL.revokeObjectURL(url);
-    t('已导出账号密码列表');
-  }catch(e){t('下载失败: '+e.message,1)}
-}
-async function exportPool(){
-  try{
-    const r=await fetch('/api/accounts/export');
-    if(!r.ok){t('导出失败',1);return}
-    const blob=await r.blob();
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement('a');
-    a.href=url;a.download='deepseek_accounts_pool.csv';
-    document.body.appendChild(a);a.click();a.remove();
-    URL.revokeObjectURL(url);
-    t('已导出账号池');
-  }catch(e){t('下载失败: '+e.message,1)}
-}
-async function submitBatchCode(){
-  var email=Q('regCodeEmail').value.trim();
-  var code=Q('regCode').value.trim();
-  if(!email||!code){t('请填写邮箱和验证码',1);return}
-  try{
-    const r=await fetch('/api/register/code',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({job_id:_regJob,email:email,code:code})});
-    const d=await r.json();
-    if(d.ok){t('验证码已提交');loadRegStatus()}else t(d.error||d.detail||'提交失败',1);
-  }catch(e){t('错误: '+e.message,1)}
-}
-async function stopBatch(){
-  if(!_regJob){t('无运行中的任务');return}
-  try{
-    await fetch('/api/register/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_id:_regJob})});
-    t('已请求停止');loadRegStatus();
-  }catch(e){t('错误: '+e.message,1)}
 }
 // === 代理配置 ===
 async function loadProxy(){
@@ -2387,14 +2181,14 @@ async def save_config(data: dict, creds: HTTPBasicCredentials = Depends(verify_a
 
 # ── DeepSeek 登录 API ─────────────────────────────────────
 @app.post("/api/login")
-async def deepseek_login(data: dict):
+async def deepseek_login(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
     login_type = data.get("login_type", "phone")
     password = data.get("password", "").strip()
     if not password:
         raise HTTPException(400, "请提供密码")
 
     # 构造登录 payload（参考 NIyueeE/ds-free-api: email 和 mobile 二选一）
-    login_payload = {"password": password, "device_id": new_device_id(), "os": "ios"}
+    login_payload = {"password": password, "os": "ios"}
     account_label = ""
     email, mobile, area_code = "", "", "+86"
 
@@ -2416,7 +2210,23 @@ async def deepseek_login(data: dict):
         login_payload["email"] = ""
         account_label = f"{area_code} {mobile}"
 
-    DS_HEADERS = random_ios_headers()
+    with config_manager.lock:
+        existing = config_manager.get_account_by_label(account_label)
+        device_id = existing.device_id if existing and existing.device_id else new_device_id()
+        DS_HEADERS = dict(existing.headers) if existing and existing.headers else random_ios_headers()
+        if not existing:
+            existing = DsAccount(account_label=account_label, login_type=login_type, device_id=device_id, device_source="generated", headers=dict(DS_HEADERS))
+            config_manager.add_account(existing)
+        elif not existing.device_id or not existing.headers:
+            if not existing.device_id:
+                existing.device_source = "generated"
+            existing.device_id = device_id
+            if not existing.headers:
+                existing.headers = dict(DS_HEADERS)
+            config_manager.save()
+    login_payload["device_id"] = device_id
+    DS_HEADERS.pop("authorization", None)
+    DS_HEADERS.pop("x-ds-pow-response", None)
 
     try:
         # 1. 登录（iOS 随机指纹绕过 WAF）
@@ -2501,6 +2311,8 @@ async def deepseek_login(data: dict):
             token=token,
             session_id=session_id,
             headers={**DS_HEADERS, "authorization": f"Bearer {token}"},
+            device_id=device_id,
+            device_source=existing.device_source if existing and existing.device_source else "generated",
             login_time=time.strftime("%Y-%m-%d %H:%M:%S"),
             is_valid=True,
         )
@@ -2585,6 +2397,26 @@ async def remove_account(account_label: str, creds: HTTPBasicCredentials = Depen
     raise HTTPException(404, f"账号 {label} 不存在")
 
 
+@app.put("/api/accounts/{account_label}/device-id")
+async def set_account_device_id(account_label: str, data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
+    from urllib.parse import unquote
+    label = unquote(account_label)
+    value = data.get("device_id")
+    if not isinstance(value, str) or not value.strip() or len(value) > 512 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise HTTPException(400, "设备标识无效")
+    value = value.strip()
+    with config_manager.lock:
+        account = config_manager.get_account_by_label(label)
+        if not account:
+            raise HTTPException(404, "账号不存在")
+        if any(a.account_label != label and a.device_id == value for a in config_manager.accounts):
+            raise HTTPException(400, "该设备标识已用于其他账号")
+        account.device_id = value
+        account.device_source = "provided"
+        config_manager.save()
+    return {"ok": True, "device_source": "provided"}
+
+
 @app.post("/api/accounts/{account_label}/relogin")
 async def relogin_account(account_label: str, creds: HTTPBasicCredentials = Depends(verify_admin)):
     """重新登录指定账号"""
@@ -2638,179 +2470,6 @@ async def relogin_all(creds: HTTPBasicCredentials = Depends(verify_admin)):
         results.append({"label": label, "ok": bool(new_cfg), "error": None if new_cfg else "登录失败"})
 
     return {"results": results, "total": len(results), "success": sum(1 for r in results if r["ok"])}
-
-
-# ─── 批量注册 API ─────────────────────────────────────────
-# 流程：发送验证码 → 读取邮箱验证码（IMAP/临时邮箱API/手动）→ 注册 → 自动登录并入池。
-# 注册接口对大陆 IP 返回 REGISTER_FROM_MAINLAND，需在设置中配置海外代理。
-
-@app.post("/api/register/send-code")
-async def register_send_code(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
-    """单独发送注册验证码（测试用）。body: {email, locale?}"""
-    email = (data.get("email") or "").strip()
-    if not email:
-        raise HTTPException(400, "请提供邮箱")
-    ok, info = send_verification_code(email, locale=data.get("locale", "zh_CN"), proxy=_get_proxy_dict())
-    if not ok:
-        return {"ok": False, "error": info.get("error", "发送失败")}
-    return {"ok": True, "email": email, "send_window_secs": info.get("send_window_secs", 60)}
-
-
-@app.post("/api/register/start")
-async def register_batch_start(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
-    """启动批量注册任务。body:
-    {
-      "count": 5,                                  // 注册数量：随机生成邮箱前缀（推荐，无需 emails）
-      "emails": ["a@x.com", "b+{1-3}@x.com"],      // 可选：自定义邮箱列表，支持 {N-M} 展开
-      "password": "...",                           // 可留空；留空或 random_password=true 时随机生成独立密码
-      "random_password": false,
-      "region": "US", "locale": "zh_CN",
-      "auto_login": true,                          // 注册后自动登录并入池
-      "wait_timeout": 180, "poll_interval": 5,
-      "codes": {"a@x.com": "123456"},              // 预置验证码（可选）
-      "domain": "ds.mail.zjb.edu.kg",              // 临时邮箱后缀；纯本地部分/随机前缀会自动补全
-      "reader": {"mode": "manual"|"imap"|"temp_api"|"mailcx",
-                 "api_key": "...",                 // mailcx 模式的 API Key
-                 "host": "...", "port": 993, "user": "...", "password": "...",
-                 "folder": "INBOX", "url": "..."}
-    }
-    """
-    emails = expand_email_patterns([str(e) for e in data.get("emails", [])])
-    count = int(data.get("count") or 0)
-    # 未填邮箱列表时，按数量随机生成邮箱前缀 + 域名后缀
-    if not emails and count > 0:
-        domain = (data.get("domain") or config_manager.get_mailcx_domain() or "").strip().lstrip("@")
-        if not domain:
-            raise HTTPException(400, "随机生成邮箱需要先选择邮箱后缀")
-        seen = set()
-        generated = []
-        while len(generated) < min(count, 500):
-            local = generate_local_part()
-            email = f"{local}@{domain}"
-            if email in seen:
-                continue
-            seen.add(email)
-            generated.append(email)
-        emails = generated
-    if not emails:
-        raise HTTPException(400, "请填写注册数量或邮箱列表")
-    password = (data.get("password") or "").strip()
-    reader = data.get("reader") or {"mode": "manual"}
-    # mailcx 模式：未显式传 api_key 时，回退到已保存的配置
-    if reader.get("mode") == "mailcx" and not reader.get("api_key"):
-        reader["api_key"] = config_manager.get_mailcx_api_key()
-    try:
-        job_id = _registrar.start(emails, password, {
-            "region": data.get("region", "US"),
-            "locale": data.get("locale", "zh_CN"),
-            "auto_login": data.get("auto_login", True),
-            "random_password": data.get("random_password", False),
-            "wait_timeout": data.get("wait_timeout", 180),
-            "poll_interval": data.get("poll_interval", 5),
-            "codes": data.get("codes") or {},
-            "domain": data.get("domain") or config_manager.get_mailcx_domain(),
-            "reader": reader,
-        })
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    return {"ok": True, "job_id": job_id, "emails": emails}
-
-
-@app.get("/api/register/status")
-async def register_batch_status(job_id: str = "", creds: HTTPBasicCredentials = Depends(verify_admin)):
-    """查询批量注册任务状态。不带 job_id 时列出所有任务摘要。"""
-    if not job_id:
-        return {"jobs": _registrar.list_jobs()}
-    job = _registrar.get(job_id)
-    if not job:
-        raise HTTPException(404, f"任务 {job_id} 不存在")
-    return job
-
-
-@app.post("/api/register/code")
-async def register_submit_code(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
-    """手动提交验证码（manual 模式）。body: {job_id, email, code}"""
-    job_id = data.get("job_id", "")
-    email = (data.get("email") or "").strip()
-    code = (data.get("code") or "").strip()
-    if not job_id or not email or not code:
-        raise HTTPException(400, "job_id / email / code 均不能为空")
-    if _registrar.submit_code(job_id, email, code):
-        return {"ok": True}
-    raise HTTPException(404, f"任务或邮箱不存在: {job_id} / {email}")
-
-
-@app.post("/api/register/stop")
-async def register_batch_stop(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
-    """停止批量注册任务。body: {job_id}"""
-    job_id = data.get("job_id", "")
-    if not job_id:
-        raise HTTPException(400, "请提供 job_id")
-    if _registrar.stop(job_id):
-        return {"ok": True}
-    raise HTTPException(404, f"任务 {job_id} 不存在")
-
-
-@app.get("/api/register/mailcx-domains")
-async def register_mailcx_domains(api_key: str = "", creds: HTTPBasicCredentials = Depends(verify_admin)):
-    """获取 mail.cx 可用邮箱后缀。优先用配置的 API Key，可用 ?api_key= 覆盖。"""
-    key = api_key.strip() or config_manager.get_mailcx_api_key()
-    if not key:
-        return {"ok": False, "error": "未配置 mail.cx API Key"}
-    ok, result = list_mailcx_domains(key)
-    if not ok:
-        return {"ok": False, "error": result}
-    return {"ok": True, "domains": result}
-
-
-@app.get("/api/register/mailcx-config")
-async def register_mailcx_config_get(creds: HTTPBasicCredentials = Depends(verify_admin)):
-    """读取 mail.cx 配置（API Key / 邮箱后缀）。"""
-    return {
-        "api_key": config_manager.get_mailcx_api_key(),
-        "domain": config_manager.get_mailcx_domain(),
-    }
-
-
-@app.put("/api/register/mailcx-config")
-async def register_mailcx_config_set(data: dict, creds: HTTPBasicCredentials = Depends(verify_admin)):
-    """保存 mail.cx 配置。body: {api_key, domain?}"""
-    key = (data.get("api_key") or "").strip()
-    if not key:
-        raise HTTPException(400, "API Key 不能为空")
-    config_manager.set_mailcx_api_key(key)
-    if data.get("domain"):
-        config_manager.set_mailcx_domain(data["domain"])
-    return {"ok": True}
-
-
-@app.get("/api/register/export")
-async def register_export(job_id: str = "", format: str = "csv",
-                          creds: HTTPBasicCredentials = Depends(verify_admin)):
-    """导出批量注册任务的账号密码列表。默认 CSV，?format=txt 导出「邮箱\t密码」纯文本。"""
-    from fastapi.responses import Response
-    data = _registrar.export_data(job_id) if job_id else None
-    if not data:
-        raise HTTPException(404, f"任务 {job_id} 不存在")
-
-    fmt = "txt" if format == "txt" else "csv"
-    rows = []
-    for email in data["emails"]:
-        pw = data["passwords"].get(email, "")
-        st = data["results"].get(email, {}).get("status", "")
-        rows.append((email, pw, st))
-
-    if fmt == "txt":
-        body = "\n".join(f"{e}\t{p}" for e, p, _s in rows)
-        media = "text/plain; charset=utf-8"
-        ext = "txt"
-    else:
-        body = "\ufeff" + "email,password,status\n" + "\n".join(f"{e},{p},{s}" for e, p, s in rows)
-        media = "text/csv; charset=utf-8"
-        ext = "csv"
-    filename = f"deepseek_accounts_{job_id}.{ext}"
-    return Response(content=body, media_type=media,
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.get("/api/accounts/export")
@@ -3237,7 +2896,7 @@ def relogin(cfg: dict) -> dict | None:
         print("[Token] 无保存密码，无法自动刷新")
         return None
 
-    login_payload = {"password": password, "device_id": new_device_id(), "os": "ios"}
+    login_payload = {"password": password, "os": "ios"}
     account_label = cfg.get("account_label", "") or cfg.get("account", "")
 
     if login_type == "email":
@@ -3258,7 +2917,20 @@ def relogin(cfg: dict) -> dict | None:
     else:
         return None
 
-    DS_HEADERS = random_ios_headers()
+    with config_manager.lock:
+        existing = config_manager.get_account_by_label(account_label)
+        device_id = (existing.device_id if existing else "") or cfg.get("device_id") or new_device_id()
+        DS_HEADERS = dict(existing.headers if existing and existing.headers else cfg.get("headers") or random_ios_headers())
+        if existing and (not existing.device_id or not existing.headers):
+            if not existing.device_id:
+                existing.device_source = "generated"
+            existing.device_id = device_id
+            if not existing.headers:
+                existing.headers = dict(DS_HEADERS)
+            config_manager.save()
+    login_payload["device_id"] = device_id
+    DS_HEADERS.pop("authorization", None)
+    DS_HEADERS.pop("x-ds-pow-response", None)
 
     try:
         print(f"[Token] 自动重新登录 {account_label}...")
@@ -3336,6 +3008,7 @@ def relogin(cfg: dict) -> dict | None:
             "cookie": "",
             "account": account_label,
             "login_type": login_type,
+            "device_id": device_id,
             # 保留凭证供下次刷新
             "_password": password,
             "_email": cfg.get("_email", ""),
@@ -3346,12 +3019,20 @@ def relogin(cfg: dict) -> dict | None:
         config_manager.update_account(account_label,
             token=token, session_id=session_id,
             headers={**DS_HEADERS, "authorization": f"Bearer {token}"},
-            is_valid=True, login_time=time.strftime("%Y-%m-%d %H:%M:%S"))
+            device_id=device_id, is_valid=True, login_time=time.strftime("%Y-%m-%d %H:%M:%S"))
         return new_cfg
 
     except Exception as e:
         print(f"[Token] 自动登录异常: {e}")
         return None
+
+
+def auto_relogin(cfg: dict) -> dict | None:
+    if cfg.get("_request_scoped_session"):
+        return None
+    if os.getenv("DEEPSEEK_AUTO_RELOGIN", "true").lower() not in ("1", "true", "yes", "on"):
+        return None
+    return relogin(cfg)
 
 
 def load_config_with_refresh() -> dict:
@@ -3434,6 +3115,72 @@ def build_request_headers(cfg: dict, session_id: str) -> dict:
     req_headers["referer"] = f"https://chat.deepseek.com/a/chat/s/{session_id}"
 
     return req_headers
+
+
+def create_request_session(cfg: dict) -> dict:
+    headers = build_request_headers(cfg, cfg.get("session_id", ""))
+    headers["authorization"] = f"Bearer {cfg.get('token', '')}"
+    label = cfg.get("account_label")
+    status = 0
+    try:
+        with upstream_slot():
+            if label:
+                with config_manager.lock:
+                    account = config_manager.get_account_by_label(label)
+                    now = time.time()
+                    if not account or not account.is_valid or float(account.muted_until or 0) > now or float(account.cooldown_until or 0) > now:
+                        raise HTTPException(503, detail={"error": {"message": "账号当前不可用，请稍后重试", "type": "account_unavailable"}})
+            response = cffi_requests.post(
+                "https://chat.deepseek.com/api/v0/chat_session/create",
+                json={}, headers=headers, impersonate="chrome120", timeout=15,
+                proxies=_get_proxy_dict(),
+            )
+            status = response.status_code
+            try:
+                data = response.json()
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                _raise_if_account_restricted_from_bytes(json.dumps(data, ensure_ascii=False), status, label)
+            else:
+                _raise_if_account_restricted_from_bytes(getattr(response, "text", ""), status, label)
+            if status != 200 or not isinstance(data, dict) or data.get("code", 0) != 0:
+                raise ValueError("session creation failed")
+            data_block = data.get("data")
+            if not isinstance(data_block, dict) or data_block.get("biz_code", 0) != 0:
+                raise ValueError("session creation failed")
+            biz = data_block.get("biz_data")
+            if not isinstance(biz, dict):
+                raise ValueError("session creation failed")
+            chat_session = biz.get("chat_session") or {}
+            if not isinstance(chat_session, dict):
+                raise ValueError("session creation failed")
+            session_id = chat_session.get("id") or biz.get("id")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("missing session id")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if label:
+            try:
+                config_manager.mark_account_cooldown(label, SESSION_INVALID_COOLDOWN_SEC if status in (401, 403) else ERROR_COOLDOWN_SEC)
+            except Exception:
+                pass
+        raise HTTPException(502, detail={"error": {"message": "创建 DeepSeek 对话失败，请稍后重试", "type": "upstream_error"}}) from exc
+    return {**cfg, "session_id": session_id, "_request_scoped_session": True}
+
+
+def run_chat_with_slot(*args, **kwargs):
+    with upstream_slot():
+        cfg = args[0]
+        label = cfg.get("account_label")
+        if label:
+            with config_manager.lock:
+                account = config_manager.get_account_by_label(label)
+                now = time.time()
+                if not account or not account.is_valid or float(account.muted_until or 0) > now or float(account.cooldown_until or 0) > now:
+                    raise HTTPException(503, detail={"error": {"message": "账号当前不可用，请稍后重试", "type": "account_unavailable"}})
+        return _do_chat(*args, **kwargs)
 
 
 def get_pow_response(target_path: str = "/api/v0/chat/completion",
@@ -3813,7 +3560,7 @@ async def chat(request: Request):
     messages = body.get("messages", [])
     model = body.get("model", "deepseek-default")
     stream = body.get("stream", False)
-    tools = body.get("tools", None)
+    tools, tool_required = select_tools(body.get("tools"), body.get("tool_choice"))
     passthrough = body.get("passthrough", False) or config_manager.get_passthrough()
     # 采样参数纯透传：未指定则不写入上游请求体，不猜默认值（与 MiMo2API 对齐）
     temperature = body.get("temperature")
@@ -3851,6 +3598,7 @@ async def chat(request: Request):
         "_area_code": account._area_code,
     }
     account_label = account.account_label
+    cfg = await asyncio.to_thread(create_request_session, cfg)
     ref_file_ids = []
     import time as _vtime
 
@@ -3894,29 +3642,6 @@ async def chat(request: Request):
             _vlog(f"parse_check -> {len(ref_file_ids)} ready ({_vtime.time()-_t3:.1f}s)")
         _vlog(f"DONE: {len(images)} images -> {len(ref_file_ids)} ready ({_vtime.time()-_t0:.1f}s)")
 
-        # Create a FRESH session for vision to avoid parallel_chat_limit_by_queue
-        # from any lingering requests on the main session
-        try:
-            token = cfg.get("token", "")
-            if token:
-                auth_h = {**cfg.get("headers", {}), "authorization": f"Bearer {token}"}
-                sess_resp = cffi_requests.post(
-                    "https://chat.deepseek.com/api/v0/chat_session/create",
-                    json={}, headers=auth_h, impersonate="chrome120", timeout=15,
-                    proxies=_get_proxy_dict())
-                if sess_resp.status_code == 200:
-                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
-                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
-                    if new_sid:
-                        old_sid = cfg.get("session_id", "")
-                        cfg = dict(cfg)
-                        cfg["session_id"] = new_sid
-                        if old_sid and old_sid != new_sid:
-                            on_new_session(account_label, new_sid, model)
-                        _vlog(f"vision fresh session: {new_sid}")
-        except Exception as e:
-            _vlog(f"fresh session failed: {e}")
-
     # 构建 prompt：先做上下文压缩/裁剪，再转 DeepSeek 格式
     try:
         from context_manager import enforce_context_limit
@@ -3940,12 +3665,12 @@ async def chat(request: Request):
                 async def _llm_summary(prompt_text, _m):
                     # 用非流式内部调用做摘要（同账号，避免再轮询）
                     summary_model = model if "reasoner" in str(model) else "deepseek-default"
-                    with upstream_slot():
-                        result = _do_chat(
-                            cfg, prompt_text, summary_model, False, False,
-                            False, is_retry=True, has_tools=False, tools=None,
-                            ref_file_ids=None,
-                        )
+                    summary_cfg = await asyncio.to_thread(create_request_session, cfg)
+                    result = await asyncio.to_thread(
+                        run_chat_with_slot, summary_cfg, prompt_text, summary_model,
+                        False, False, False, is_retry=True, has_tools=False,
+                        tools=None, ref_file_ids=None,
+                    )
                     if isinstance(result, JSONResponse):
                         body = json.loads(result.body)
                         msg = body.get("choices", [{}])[0].get("message", {})
@@ -3954,36 +3679,14 @@ async def chat(request: Request):
                 _, messages = await _compress_messages(messages, model, _llm_summary)
             else:
                 messages = _truncate_messages(messages)
+    except HTTPException:
+        raise
     except Exception as e:
         _vlog(f"context compress skipped: {e}")
 
     # 构建 prompt：使用 convert_messages_for_deepseek 处理完整多轮对话
-    prompt = convert_messages_for_deepseek(messages, tools, passthrough=passthrough)
+    prompt = convert_messages_for_deepseek(messages, tools, passthrough=passthrough, tool_required=tool_required)
     prompt_tokens = _count_tokens(prompt)
-
-    # 会话管理：token 超限时自动建新 DeepSeek session
-    if needs_renewal(account_label):
-        status = get_usage_status(account_label)
-        print(f"[Session] {account_label} tokens {status['prompt_tokens']}/{status['threshold']} exceeded, creating new session...")
-        try:
-            token = cfg.get("token", "")
-            if token:
-                auth_h = {**cfg.get("headers", {}), "authorization": f"Bearer {token}"}
-                sess_resp = cffi_requests.post(
-                    "https://chat.deepseek.com/api/v0/chat_session/create",
-                    json={}, headers=auth_h, impersonate="chrome120", timeout=15,
-                    proxies=_get_proxy_dict())
-                if sess_resp.status_code == 200:
-                    biz = sess_resp.json().get("data", {}).get("biz_data", {})
-                    new_sid = biz.get("chat_session", {}).get("id", "") or biz.get("id", "")
-                    if new_sid:
-                        cfg = dict(cfg)
-                        cfg["session_id"] = new_sid
-                        config_manager.update_account(account_label, session_id=new_sid)
-                        on_new_session(account_label, new_sid, model)
-                        print(f"[Session] {account_label} new session: {new_sid}")
-        except Exception as e:
-            print(f"[Session] Failed to create new session: {e}")
 
     has_tools = bool(tools)
 
@@ -3997,12 +3700,19 @@ async def chat(request: Request):
         search_enabled = False
 
     try:
-        with upstream_slot():
+        if stream:
             result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream,
                             is_retry=False, has_tools=has_tools, tools=tools,
                             ref_file_ids=ref_file_ids,
-                            temperature=temperature, top_p=top_p, max_tokens=max_tokens)
-        if _result_looks_successful(result):
+                            temperature=temperature, top_p=top_p, max_tokens=max_tokens, tool_required=tool_required)
+        else:
+            result = await asyncio.to_thread(
+                run_chat_with_slot, cfg, prompt, model, thinking_enabled, search_enabled, stream,
+                is_retry=False, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids,
+                temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+                tool_required=tool_required,
+            )
+        if not stream and _result_looks_successful(result):
             try:
                 config_manager.mark_account_ok(account_label)
             except Exception:
@@ -4019,15 +3729,6 @@ async def chat(request: Request):
         raise
 
     # (Vision SSE wrapper removed — all models now stream directly via fragments format)
-
-    # 重登重试后 cfg 里的 session_id 可能已过期——以账号池中的最新会话为准
-    final_sid = cfg.get("session_id", "")
-    try:
-        _acc_now = config_manager.get_account_by_label(account_label)
-        if _acc_now and _acc_now.session_id:
-            final_sid = _acc_now.session_id
-    except Exception:
-        pass
 
     # 用量统计：非流式直接计数，流式包装生成器
     if stream and hasattr(result, 'body_iterator'):
@@ -4046,11 +3747,9 @@ async def chat(request: Request):
                     except: pass
                 yield chunk
             add_usage(model, prompt_tokens, _count_tokens(completion_text))
-            add_tokens(account_label, final_sid, prompt_tokens)
         result.body_iterator = _counted_stream()
     else:
         add_usage(model, prompt_tokens, 0)
-        add_tokens(account_label, final_sid, prompt_tokens)
     return result
 
 
@@ -4774,7 +4473,15 @@ async def delete_response(response_id: str):
     return {"id": response_id, "object": "response", "deleted": True}
 
 
-def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None, ref_file_ids=None, temperature=None, top_p=None, max_tokens=None):
+def _extract_declared_tool_calls(text, tools):
+    names = get_tool_names(tools or [])
+    calls, cleaned = extract_tool_call(text, names, tools)
+    if calls and any(call.get("function", {}).get("name") not in names for call in calls):
+        return None, text
+    return calls, cleaned
+
+
+def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_retry=False, has_tools=False, tools=None, ref_file_ids=None, temperature=None, top_p=None, max_tokens=None, tool_required=False):
     """核心聊天逻辑，支持 token 过期后重试
 
     DeepSeek SSE 流结构（thinking_enabled=True 时）：
@@ -4790,9 +4497,6 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
     """
     session_id = cfg["session_id"]
     req_headers = build_request_headers(cfg, session_id)
-    pow_response = get_pow_response(cfg=cfg)
-    if pow_response:
-        req_headers["x-ds-pow-response"] = pow_response
 
     # model_type 字段：DeepSeek 根据此值路由到不同模型后端。
     # 映射：模型名含 "vision" → "vision"，含 "expert" → "expert"，其余 → "default"
@@ -5028,15 +4732,15 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 # ── New format: response/fragments ──────────────────
                 # Fragment append event: {"p":"response/fragments","o":"APPEND","v":[{"id":N,"type":"RESPONSE","content":"...",...}]}
                 if path == "response/fragments" and obj.get("o") == "APPEND" and isinstance(val, list):
-                    if val:
-                        last_frag = val[-1] if isinstance(val[-1], dict) else {}
-                        new_type = last_frag.get("type", "")
+                    for fragment in val:
+                        if not isinstance(fragment, dict):
+                            continue
+                        new_type = fragment.get("type", "")
                         if new_type:
                             fragment_type = new_type
                             if thinking_enabled:
                                 _vlog(f"SSE: new fragment type={new_type}")
-                        # Extract initial content from fragment object
-                        frag_content = last_frag.get("content", "")
+                        frag_content = fragment.get("content", "")
                         if frag_content and isinstance(frag_content, str):
                             if fragment_type == "THINK":
                                 yield ("thinking", frag_content)
@@ -5093,6 +4797,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
     def do_stream():
         """SSE streaming for OpenAI-compatible clients."""
         try:
+            pow_response = get_pow_response(cfg=cfg)
+            if pow_response:
+                req_headers["x-ds-pow-response"] = pow_response
             resp = None
             last_err = None
             for attempt in range(max(1, RETRY_MAX_ATTEMPTS)):
@@ -5132,9 +4839,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 # 会话失效（401/403/带登出提示的非 200）：自动重新登录并重试一次
                 if resp.status_code in (401, 403) or _session_invalid_error(_err_text):
                     print(f"[Token] HTTP {resp.status_code} session-invalid signal, trying refresh...")
-                    new_cfg = relogin(cfg)
+                    new_cfg = auto_relogin(cfg)
                     if new_cfg:
-                        for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens):
+                        for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens, tool_required=tool_required):
                             yield chunk
                         return
                     else:
@@ -5156,33 +4863,26 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
             if has_tools:
                 # 输出 tool_calls SSE 事件的辅助函数
                 def _emit_tool_calls(tc_result, _cid, _created, _model):
-                    if tc_result:
-                        for i, tc in enumerate(tc_result):
-                            delta = {"role": "assistant", "content": None,
-                                     "tool_calls": [{"index": i, "id": tc["id"], "type": "function",
-                                                     "function": {"name": tc["function"]["name"], "arguments": ""}}]}
-                            r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
-                                 "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                            args = tc["function"]["arguments"]
-                            r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
-                                 "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, "function": {"arguments": args}}]}, "finish_reason": None}]}
-                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    nonlocal _role_sent, _tool_index
+                    if not _role_sent:
                         r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
-                             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
-                    else:
+                        _role_sent = True
+                    for tc in tc_result:
+                        delta = {"tool_calls": [{"index": _tool_index, "id": tc["id"], "type": "function",
+                                                 "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}]}
+                        _tool_index += 1
                         r = {"id": _cid, "object": "chat.completion.chunk", "created": _created, "model": _model,
-                             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                             "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
 
-                # 流式筛分 + 并行缓冲：正文先缓冲，命中工具调用则丢弃，否则收尾补发
-                # （与非流式一致：同一条消息不同时含 content + tool_calls）
                 def _parse_fn(text):
-                    return extract_tool_call(text, get_tool_names(tools) if tools else [])
+                    return _extract_declared_tool_calls(text, tools)
 
                 sieve = StreamSieve(parse_fn=_parse_fn)
                 _role_sent = False
+                _tool_index = 0
                 _full_buf = ""
                 content_buffer = []
                 _had_tool_calls = False
@@ -5212,21 +4912,26 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                                     if chunk:
                                         content_buffer.append(chunk)
                             elif evt.type == "tool_calls":
-                                # 提前命中工具：丢弃已缓冲正文，只发 tool_calls
-                                content_buffer.clear()
+                                for chunk in _flush_content_buffer():
+                                    yield chunk
                                 _had_tool_calls = True
                                 for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
                                     yield chunk
                     elif etype == "thinking":
+                        if not _role_sent:
+                            r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
+                            yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                            _role_sent = True
                         r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
                              "choices": [{"index": 0, "delta": {"reasoning_content": val}, "finish_reason": None}]}
                         yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
                     elif etype == "error":
                         if not is_retry and _session_invalid_error(val.get("message", "")):
                             print("[Token] SSE session-invalid error, trying refresh...")
-                            new_cfg = relogin(cfg)
+                            new_cfg = auto_relogin(cfg)
                             if new_cfg:
-                                for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens):
+                                for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens, tool_required=tool_required):
                                     yield chunk
                                 return
                             else:
@@ -5240,32 +4945,42 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                         break
 
                 # Flush + fallback：筛分没抓到就用全量解析
-                if not _had_tool_calls:
-                    for evt in sieve.flush():
-                        if evt.type == "text":
-                            if isinstance(evt.data, str) and evt.data:
-                                chunk = clean_tool_text(sanitize_leaked_output(evt.data))
-                                if chunk:
-                                    content_buffer.append(chunk)
-                        elif evt.type == "tool_calls":
-                            _had_tool_calls = True
-                            content_buffer.clear()
-                            for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
-                                yield chunk
+                for evt in sieve.flush():
+                    if evt.type == "text":
+                        if isinstance(evt.data, str) and evt.data:
+                            chunk = clean_tool_text(sanitize_leaked_output(evt.data))
+                            if chunk:
+                                content_buffer.append(chunk)
+                    elif evt.type == "tool_calls":
+                        for chunk in _flush_content_buffer():
+                            yield chunk
+                        _had_tool_calls = True
+                        for chunk in _emit_tool_calls(evt.data, chat_id, created, model):
+                            yield chunk
 
                 if not _had_tool_calls and _full_buf:
-                    tc_result, _ = extract_tool_call(_full_buf, get_tool_names(tools) if tools else [])
+                    tc_result, _ = _extract_declared_tool_calls(_full_buf, tools)
                     if tc_result:
                         _had_tool_calls = True
                         content_buffer.clear()
+                        _, cleaned = _extract_declared_tool_calls(_full_buf, tools)
+                        if cleaned:
+                            content_buffer.append(cleaned)
+                        for chunk in _flush_content_buffer():
+                            yield chunk
                         for chunk in _emit_tool_calls(tc_result, chat_id, created, model):
                             yield chunk
 
                 if _had_tool_calls:
-                    if not _role_sent:
-                        r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                             "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}
-                        yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    for chunk in _flush_content_buffer():
+                        yield chunk
+                    r = {"id": chat_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+                    yield f'data: {json.dumps(r, ensure_ascii=False)}\n\n'
+                    yield "data: [DONE]\n\n"
+                    return
+                elif tool_required:
+                    yield f'data: {json.dumps({"error": {"message": "上游未按要求调用工具", "type": "upstream_error"}}, ensure_ascii=False)}\n\n'
                     yield "data: [DONE]\n\n"
                     return
                 else:
@@ -5303,9 +5018,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 elif etype == "error":
                     if not is_retry and _session_invalid_error(val.get("message", "")):
                         print("[Token] SSE session-invalid error, trying refresh...")
-                        new_cfg = relogin(cfg)
+                        new_cfg = auto_relogin(cfg)
                         if new_cfg:
-                            for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens):
+                            for chunk in _do_chat_stream_only(new_cfg, prompt, model, thinking_enabled, search_enabled, has_tools, tools, ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens, tool_required=tool_required):
                                 yield chunk
                             return
                         else:
@@ -5321,6 +5036,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                     yield "data: [DONE]\n\n"
                     return
 
+        except ToolFormatError as e:
+            yield f'data: {json.dumps({"error": {"message": str(e), "type": "tool_format_error"}}, ensure_ascii=False)}\n\n'
+            yield "data: [DONE]\n\n"
         except Exception as e:
             print(f"[Error] do_stream failed: {e}")
             yield f'data: {json.dumps({"error": {"message": str(e), "type": "server_error"}})}\n\n'
@@ -5333,6 +5051,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         full_thinking = ""
 
         try:
+            pow_response = get_pow_response(cfg=cfg)
+            if pow_response:
+                req_headers["x-ds-pow-response"] = pow_response
             resp = None
             last_err = None
             for attempt in range(max(1, RETRY_MAX_ATTEMPTS)):
@@ -5371,9 +5092,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 # 会话失效（401/403/带登出提示的非 200）：自动重新登录并重试一次
                 if resp.status_code in (401, 403) or _session_invalid_error(_err_text):
                     print(f"[Token] HTTP {resp.status_code} session-invalid signal (nonstream), trying refresh...")
-                    new_cfg = relogin(cfg)
+                    new_cfg = auto_relogin(cfg)
                     if new_cfg:
-                        return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+                        return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens, tool_required=tool_required)
                     else:
                         al = cfg.get("account_label", "") or cfg.get("account", "")
                         if al:
@@ -5445,9 +5166,9 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                 elif etype == "error":
                     if not is_retry and _session_invalid_error(val.get("message", "")):
                         print("[Token] SSE session-invalid error (nonstream), trying refresh...")
-                        new_cfg = relogin(cfg)
+                        new_cfg = auto_relogin(cfg)
                         if new_cfg:
-                            return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+                            return _do_chat(new_cfg, prompt, model, thinking_enabled, search_enabled, False, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens, tool_required=tool_required)
                         else:
                             al = cfg.get("account_label", "") or cfg.get("account", "")
                             if al:
@@ -5478,9 +5199,14 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         tc_result = None
         final_content = full_content
         if has_tools:
-            tc_result, final_content = extract_tool_call(full_content, get_tool_names(tools) if tools else None)
+            try:
+                tc_result, final_content = _extract_declared_tool_calls(full_content, tools)
+            except ToolFormatError as e:
+                raise HTTPException(502, detail={"error": {"message": str(e), "type": "tool_format_error"}}) from e
             if tc_result:
                 finish_reason = "tool_calls"
+            elif tool_required:
+                raise HTTPException(502, detail={"error": {"message": "上游未按要求调用工具", "type": "upstream_error"}})
 
         msg = {"role": "assistant", "content": final_content}
         if full_thinking:
@@ -5517,16 +5243,66 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         # （Starlette 的 StreamingResponse 会把同步生成器包装成异步生成器，
         #   导致 yield from body_iterator 报 'async_generator' object is not iterable）
         _raw_gen = do_stream()
-        _sr = StreamingResponse(_raw_gen, media_type="text/event-stream",
+        def guarded_stream():
+            with upstream_slot():
+                label = cfg.get("account_label") or cfg.get("account")
+                snapshot = None
+                if label:
+                    with config_manager.lock:
+                        account = config_manager.get_account_by_label(label)
+                        now = time.time()
+                        unavailable = not account or not account.is_valid or float(account.muted_until or 0) > now or float(account.cooldown_until or 0) > now
+                        if not unavailable:
+                            snapshot = (account.cooldown_until, account.muted_until, account.consecutive_errors, account.is_valid)
+                    if unavailable:
+                        yield f'data: {json.dumps({"error": {"message": "账号当前不可用，请稍后重试", "type": "account_unavailable"}}, ensure_ascii=False)}\n\n'
+                        yield "data: [DONE]\n\n"
+                        return
+                failed = False
+                completed = False
+                has_output = False
+                for chunk in _raw_gen:
+                    for line in chunk.splitlines():
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            completed = True
+                            continue
+                        try:
+                            data = json.loads(payload)
+                        except (ValueError, TypeError):
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+                        if "error" in data:
+                            failed = True
+                            if label:
+                                with config_manager.lock:
+                                    account = config_manager.get_account_by_label(label)
+                                    if account and account.is_valid and float(account.muted_until or 0) <= time.time():
+                                        cooldown = max(ERROR_COOLDOWN_SEC, float(account.cooldown_until or 0) - time.time())
+                                        config_manager.mark_account_cooldown(label, cooldown)
+                        for choice in data.get("choices", []):
+                            delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+                            if isinstance(delta, dict) and any(delta.get(k) for k in ("content", "reasoning_content", "tool_calls")):
+                                has_output = True
+                    yield chunk
+                if label and completed and has_output and not failed:
+                    with config_manager.lock:
+                        account = config_manager.get_account_by_label(label)
+                        if account and snapshot == (account.cooldown_until, account.muted_until, account.consecutive_errors, account.is_valid):
+                            config_manager.mark_account_ok(label)
+        _sr = StreamingResponse(guarded_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
         _sr._raw_stream_gen = _raw_gen
         return _sr
     return do_nonstream()
 
 
-def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, has_tools=False, tools=None, ref_file_ids=None, temperature=None, top_p=None, max_tokens=None):
+def _do_chat_stream_only(cfg, prompt, model, thinking_enabled, search_enabled, has_tools=False, tools=None, ref_file_ids=None, temperature=None, top_p=None, max_tokens=None, tool_required=False):
     """Token 刷新重试专用的流式生成器"""
-    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+    result = _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream=True, is_retry=True, has_tools=has_tools, tools=tools, ref_file_ids=ref_file_ids, temperature=temperature, top_p=top_p, max_tokens=max_tokens, tool_required=tool_required)
     if isinstance(result, StreamingResponse):
         # 优先迭代原始同步生成器（避免 Starlette 异步包装导致 yield from 失败）
         _raw = getattr(result, "_raw_stream_gen", None)

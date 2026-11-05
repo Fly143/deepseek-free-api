@@ -16,159 +16,24 @@ class SieveEvent:
 
 
 class StreamSieve:
-    """DSML 模式流式筛分器"""
-
-    _TOOL_STARTS = [
-        "<|DSML|tool_calls>",
-        "|DSML|tool_calls>",     # 模型有时丢开头的 <
-        "<tool_calls>",
-        "<tool_call>",
-        "<invoke ",
-        "<|DSML|invoke ",
-        "|DSML|invoke ",         # 模型有时丢开头的 <
-    ]
-
-    def __init__(
-        self,
-        parse_fn: Optional[Callable[[str], Tuple[List[Dict], str]]] = None,
-    ):
+    def __init__(self, parse_fn: Optional[Callable[[str], Tuple[List[Dict], str]]] = None):
         self.parse_fn = parse_fn
-        self._pending = ""
-        self._capture_buf = ""
-        self._capturing = False
+        self._parts = []
 
     def feed(self, chunk: str) -> List[SieveEvent]:
-        events: List[SieveEvent] = []
-
-        if self._capturing:
-            self._capture_buf += chunk
-            result = self._try_finish_capture()
-            if result is not None:
-                prefix_text, tool_calls, suffix = result
-                if prefix_text:
-                    events.append(SieveEvent("text", prefix_text))
-                if tool_calls:
-                    events.append(SieveEvent("tool_calls", tool_calls))
-                if suffix:
-                    self._pending = suffix
-                self._capture_buf = ""
-                self._capturing = False
-                if suffix:
-                    events.extend(self.feed(""))
-            return events
-
-        self._pending += chunk
-        start_idx = self._find_tool_start(self._pending)
-
-        if start_idx >= 0:
-            prefix = self._pending[:start_idx]
-            rest = self._pending[start_idx:]
-            self._pending = ""
-
-            if prefix:
-                events.append(SieveEvent("text", prefix))
-
-            self._capture_buf = rest
-            self._capturing = True
-
-            result = self._try_finish_capture()
-            if result is not None:
-                prefix_text, tool_calls, suffix = result
-                if prefix_text:
-                    events.append(SieveEvent("text", prefix_text))
-                if tool_calls:
-                    events.append(SieveEvent("tool_calls", tool_calls))
-                if suffix:
-                    self._pending = suffix
-                self._capture_buf = ""
-                self._capturing = False
-        else:
-            safe, hold = self._split_safe(self._pending)
-            if safe:
-                events.append(SieveEvent("text", safe))
-            self._pending = hold
-
-        return events
+        self._parts.append(chunk)
+        return []
 
     def flush(self) -> List[SieveEvent]:
-        events: List[SieveEvent] = []
-
-        if self._capturing:
-            result = self._try_finish_capture()
-            if result is not None:
-                prefix_text, tool_calls, suffix = result
-                if prefix_text:
-                    events.append(SieveEvent("text", prefix_text))
-                if tool_calls:
-                    events.append(SieveEvent("tool_calls", tool_calls))
-                if suffix:
-                    events.append(SieveEvent("text", suffix))
-            else:
-                from tool_dsml import sanitize_loose_cdata, parse_dsml_tool_calls
-                repaired = sanitize_loose_cdata(self._capture_buf)
-                tcs, _ = parse_dsml_tool_calls(repaired)
-                if tcs:
-                    events.append(SieveEvent("tool_calls", tcs))
-                elif self._capture_buf:
-                    events.append(SieveEvent("text", self._capture_buf))
-            self._capture_buf = ""
-            self._capturing = False
-
-        if self._pending:
-            events.append(SieveEvent("text", self._pending))
-            self._pending = ""
-
+        text = "".join(self._parts)
+        self._parts = []
+        if not text:
+            return []
+        if not self.parse_fn:
+            return [SieveEvent("text", text)]
+        calls, cleaned = self.parse_fn(text)
+        if not calls:
+            return [SieveEvent("text", cleaned)] if cleaned else []
+        events = [SieveEvent("text", cleaned)] if cleaned else []
+        events.append(SieveEvent("tool_calls", calls))
         return events
-
-    def _find_tool_start(self, text: str) -> int:
-        for tag in self._TOOL_STARTS:
-            pos = text.find(tag)
-            if pos >= 0:
-                return pos
-        for prefix in ("<|DSML|", "|DSML|", "<tool_calls", "<tool_call", "<invoke", "|DSML|invoke"):
-            pos = text.find(prefix)
-            if pos >= 0:
-                return pos
-        return -1
-
-    def _split_safe(self, text: str) -> Tuple[str, str]:
-        # 先找 <，找不到再找 |
-        last_lt = text.rfind("<")
-        if last_lt == -1:
-            last_lt = text.rfind("|")
-        if last_lt == -1:
-            return text, ""
-
-        # 大小写不敏感：小写标记跨 chunk 切断时不应被当正文吐出
-        tail = text[last_lt:]
-        tail_l = tail.lower()
-        for tag in self._TOOL_STARTS:
-            tag_l = tag.lower()
-            if tag_l.startswith(tail_l) or tail_l == tag_l[:len(tail_l)]:
-                return text[:last_lt], tail
-        for prefix in ("<|DSML|", "|DSML|", "<tool_calls", "<tool_call", "<invoke", "|DSML|invoke"):
-            prefix_l = prefix.lower()
-            if prefix_l.startswith(tail_l) or (len(tail_l) <= len(prefix_l) and tail_l == prefix_l[:len(tail_l)]):
-                return text[:last_lt], tail
-        return text, ""
-
-    def _try_finish_capture(self):
-        if not self._capture_buf or not self.parse_fn:
-            return None
-        if not self._is_capture_complete():
-            return None
-        tool_calls, cleaned = self.parse_fn(self._capture_buf)
-        if tool_calls:
-            return ("", tool_calls, "")
-        else:
-            return (self._capture_buf, None, "")
-
-    def _is_capture_complete(self) -> bool:
-        buf = self._capture_buf
-        if "<|DSML|tool_calls>" in buf or "<tool_calls>" in buf:
-            return "</|DSML|tool_calls>" in buf or "</tool_calls>" in buf
-        if "<tool_call>" in buf or "<|DSML|tool_call>" in buf:
-            return "</tool_call>" in buf or "</|DSML|tool_call>" in buf
-        if "<invoke " in buf or "<|DSML|invoke " in buf:
-            return "</invoke>" in buf or "</|DSML|invoke>" in buf
-        return False

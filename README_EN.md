@@ -61,7 +61,7 @@ Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-comp
 - [Tool Calling](#tool-calling)
 - [Branch Info](#branch-info)
 - [PoW Solver](#pow-solver)
-- [Token Auto-Refresh](#token-auto-refresh)
+- [Sessions and credentials](#sessions-and-credentials)
 - [Management Commands](#management-commands)
 - [Project Structure](#project-structure)
 - [Configuration Reference](#configuration-reference)
@@ -77,7 +77,7 @@ Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-comp
 - **Pure Chat Proxy** — No tool call prompt injection, cleaner output, model attention focused on user queries
 - **Dynamic Model Discovery** — Real-time model list fetched from DeepSeek official API at startup, auto-refreshes hourly (includes context size and full metadata)
 - **Automatic PoW Solving** — Node.js WASM primary solver + Python pure algorithm fallback, auto-fetches and solves challenges before each request
-- **Token Auto-Refresh** — Automatically re-logins with saved password on 401, no manual intervention needed
+- **Account credentials** — Re-login through the admin panel when credentials expire
 - **Deep Thinking** — Supports DeepSeek's `<thought>` tags, separated as `reasoning_content` in streaming output
 - **Vision** — Image upload, parsing, and conversation
 - **Text File Upload** — Upload .txt/.md/.py files for chat via `ref_file_ids` (same as web UI)
@@ -99,12 +99,12 @@ Reverse-engineer **DeepSeek web chat** (chat.deepseek.com) into an **OpenAI-comp
 │             DeepSeek Free API Proxy (FastAPI)              │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
 │  │ Routes  │  │  tool_call   │  │  tool_sieve │ tool_dsml │ │
-│  │ /v1/*   │──│ (DSML prompt)│──│ (streaming  │ (DSML     │ │
+│  │ /v1/*   │──│ (tool prompt)│──│ (streaming  │ (DSML     │ │
 │  └─────────┘  │ injection)   │  │ sieve)     │  parser)  │ │
 │               └──────────────┘  └──────────────────────┘ │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
 │  │ Model   │  │ PoW Solver   │  │   Token Refresh     │ │
-│  │ Disc.   │  │ (Node+Python)│  │ (auto-relogin)      │ │
+│  │ Disc.   │  │ (Node+Python)│  │ (admin re-login)    │ │
 │  └─────────┘  └──────────────┘  └──────────────────────┘ │
 │  ┌─────────┐  ┌──────────────┐                            │
 │  │ curl    │  │ Vision/Files │                            │
@@ -160,7 +160,7 @@ After deployment, visit: **http://localhost:8000/admin** (default credentials: `
 ### Docker
 
 ```bash
-docker run -d -p 8000:8000 -v $(pwd)/config.json:/app/config.json ghcr.io/fly143/deepseek-free-api:latest
+docker run -d -p 8000:8000 -v deepseek-data:/data ghcr.io/fly143/deepseek-free-api:latest sh -c 'ln -sf /data/config.json /app/config.json && ln -sf /data/.secret_key /app/.secret_key && exec python proxy.py'
 ```
 
 > ⚠️ **`no-tools` branch discontinued.**
@@ -192,7 +192,7 @@ The easiest way, same experience as the web login:
 3. Enter your password
 4. Click **Login**
 
-The system automatically completes: login to get Token → create chat Session → save config to `token.json` (including password for auto-refresh).
+The system automatically completes: login to get Token → create chat Session → save account configuration to `config.json`.
 
 ### Method 2: cURL Import
 
@@ -507,11 +507,11 @@ The model list **changes dynamically with DeepSeek**. Currently 3 base models ×
 
 ## Tool Calling
 
-DeepSeek's web UI **does not** support OpenAI function calling format. This proxy implements tool calling via **DSML prompt injection + multi-strategy extraction**:
+DeepSeek's web UI **does not** support OpenAI function calling format. This proxy implements tool calling via **tool prompts and multi-strategy extraction**:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer *** \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -531,23 +531,20 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-### DSML Prompt Injection
+### Tool prompt
 
-OpenAI tools definitions are converted to DSML format and injected into the system message:
+The default prompt asks the model to use this format. Tool passthrough mode allows the model to choose its format:
 
-```xml
-<|DSML|tool_calls>
-  <|DSML|invoke name="search_file">
-    <|DSML|parameter name="query"><![CDATA[config.yaml]]></|DSML|parameter>
-  </|DSML|invoke>
-</|DSML|tool_calls>
+```text
+do: {"name":"search_file","arguments":{"query":"config.yaml"}}
 ```
 
 ### Extraction Strategies
 
 | Priority | Format | Description |
 |----------|--------|-------------|
-| DSML | `<\|DSML\|tool_calls><\|DSML\|invoke name="X">...</\|DSML\|invoke></\|DSML\|tool_calls>` | Primary format, 7 noise variant tolerances |
+| DO | `do: {"name":"x","arguments":{}}` | Default prompt format |
+| DSML | `<\|DSML\|tool_calls><\|DSML\|invoke name="X">...</\|DSML\|invoke></\|DSML\|tool_calls>` | Compatible format with noise tolerance |
 | TOOL_CALL | `TOOL_CALL: name(key=value)` | Legacy format fallback |
 | JSON | `{"name":"x","arguments":{...}}` | JSON block parsing |
 | XML | `<tool_call><function=NAME>...</function></tool_call>` | Native XML |
@@ -595,16 +592,13 @@ Requires Node.js installation + `sha3_wasm_bg.wasm` file (included in the projec
 
 DeepSeek uses a custom `DeepSeekHashV1` algorithm, essentially SHA3-256 hash collision. The WASM version (via Node.js) matches the official algorithm exactly.
 
-## Token Auto-Refresh
+## Sessions and credentials
 
-Token validity is approximately **24 hours**. When a request returns 401:
+Each chat request creates a separate upstream conversation. When credentials expire, the request does not automatically re-login or retry. Re-login in the admin panel or re-import cURL/Cookie credentials. Clients must send the history needed for each request; long histories may still be compressed or trimmed. New conversations are not deleted automatically.
 
-1. Detect 401 → trigger `relogin()` function
-2. Re-login using saved password via `POST /api/v0/users/login`
-3. Obtain new Token → create new Session → save to `token.json`
-4. Retry current request with new Token (transparent to user)
+For password login, the proxy saves and reuses an account-specific device ID and request headers. The admin panel also accepts a manually supplied device ID. A generated ID is not a real device fingerprint, and these measures do not guarantee protection from account bans.
 
-> **Prerequisite:** Initial configuration must use **account password login**. Pure cURL/Cookie imports do not include passwords and cannot auto-refresh.
+The default tool prompt uses `do:` followed by JSON and still parses older formats. Tool passthrough mode lets the model choose its format. Changing formats does not guarantee protection from account bans.
 
 ## Management Commands
 
@@ -657,7 +651,8 @@ ds-free-api/
 ├── deploy.sh             # One-click deploy script (install deps, start/stop/status)
 ├── requirements.txt      # Python dependencies
 ├── token.example.json    # Config file template
-└── token.json            # Actual config (.gitignore, contains credentials)
+├── config.json           # Accounts and settings (.gitignore)
+└── .secret_key           # Encryption key (.gitignore)
 ```
 
 ### Core File Descriptions
@@ -671,45 +666,25 @@ ds-free-api/
 
 ## Configuration Reference
 
-Full `token.json` configuration:
+Accounts and settings are stored in `config.json`, with accounts in the `accounts` list. Sensitive fields including tokens, passwords, cookies, request headers, device IDs and the admin password are encrypted using Fernet. The key is stored in `.secret_key` in the same directory. Other fields, including account identifiers, are not all encrypted.
 
-```json
-{
-  "token": "***",
-  "session_id": "abc-def-123...",
-  "headers": {
-    "content-type": "application/json",
-    "origin": "https://chat.deepseek.com",
-    "referer": "https://chat.deepseek.com/",
-    "user-agent": "Mozilla/5.0 ...",
-    "x-client-version": "2.0.2",
-    "x-client-platform": "web",
-    "authorization": "Bearer YOUR_TOKEN"
-  },
-  "account": "+86 138xxxx",
-  "login_type": "phone",
-  "_password": "your_password",
-  "_email": "",
-  "_mobile": "138xxxx",
-  "_area_code": "+86"
-}
-```
+Both files are excluded by `.gitignore`. Restrict access and back them up together; losing or replacing the key prevents existing credentials from being decrypted. On first startup, if `config.json` is absent, the application attempts to migrate a legacy `token.json` account and renames that file to `token.json.bak`. The old file may contain plaintext credentials and should be handled accordingly.
 
-| Config Item | Description | Auto-Generated |
-|-------------|-------------|:--------------:|
-| `token` | Bearer Token (~24h validity) | ✓ |
-| `session_id` | Chat session ID (UUID) | ✓ |
-| `headers` | Request headers (UA, authorization, etc.) | ✓ |
-| `account` | Account identifier (display only) | ✓ |
-| `login_type` | Login method: `phone` / `email` | On first setup |
-| `_password` | Login password (for auto-refresh) | On first setup |
-| `_mobile` | Phone number (for auto-refresh) | On first setup |
-| `_email` | Email (for auto-refresh) | On first setup |
-| `_area_code` | Area code (default +86) | On first setup |
+The Docker example uses a persistent volume for both the configuration and key; retain the volume when recreating the container.
 
-> **Security note:** `_password` is stored in plaintext locally. Ensure `token.json` has proper permissions (`chmod 600`) and is excluded from distribution/packaging (already in `.gitignore`).
+**Environment variables:**
 
-**Environment variable:** `PROXY_PORT` — listening port (default `8000`)
+| Variable | Purpose and default |
+|----------|---------------------|
+| `PROXY_PORT` | Listening port; default `8000` |
+| `DEEPSEEK_PROXY_API_KEY` | `/v1` API key; authentication is disabled when unset. Send a Bearer token or `x-api-key` |
+| `DEEPSEEK_MIN_INTERVAL_SEC` | Minimum start interval for controlled upstream operations; default `2.5` seconds |
+| `DEEPSEEK_MAX_CONCURRENT` | Maximum concurrent controlled upstream operations; default `1` |
+| `DEEPSEEK_ERROR_COOLDOWN_SEC` | Account cooldown after a general error; default `60` seconds |
+| `DEEPSEEK_SESSION_INVALID_COOLDOWN_SEC` | Account cooldown after session invalidation; default `300` seconds |
+| `DEEPSEEK_AUTO_RELOGIN` | Auto-relogin for other paths; enabled by default, but disabled for chat requests with a new conversation |
+
+These controls do not cover every upstream operation, such as attachment uploads. For public deployment, set an API key and configure HTTPS and access controls.
 
 ## Dependencies
 
@@ -731,47 +706,11 @@ pip install fastapi uvicorn curl-cffi python-dotenv
 - **Node.js** — PoW solver (required, install with `pkg install nodejs` or `apt install nodejs`)
 - Python 3.10+ — runtime
 
-## Batch Register Accounts (auto-login & pool)
-
-The admin panel now has a **"Batch Register"** tab: register DeepSeek accounts in bulk, auto-login after success, and write them into the multi-account pool for automatic round-robin load balancing.
-
-### Flow
-
-1. `POST /auth-api/v0/users/create_guest_challenge` — get the registration PoW challenge
-2. Solve the challenge (reuses `pow_native`, Node WASM in seconds) → put into `x-ds-guest-pow-response` header
-3. `POST /auth-api/v0/users/create_email_verification_code` — send email verification code
-4. Read the code: **mail.cx temporary mailbox** (recommended) / IMAP inbox / generic temp-mail API / manual input
-5. `POST /auth-api/v0/users/register` — registration returns token directly (iOS client fingerprint + real device ID reduces risk-control interception)
-6. Auto-login: use the registered email/password through the standard login flow to get chat token + session, written into the `config.json` account pool
-
-### Usage (mail.cx recommended)
-
-1. Open admin panel `http://localhost:8000/admin` → **Batch Register** tab
-2. Verification source: select **mail.cx temporary mailbox (recommended)**
-3. Fill in the mail.cx API Key → click **Get Domains** → choose a mailbox suffix (e.g. `ds.mail.zjb.edu.kg`) → save config
-4. Fill in the **registration count** (email prefix auto-randomized); password is random by default (unique per account), or uncheck to set a common password manually
-5. Click **Start Batch Register**; real-time logs scroll automatically
-6. After the task ends, click **Download Account List** to export CSV (`email,password,status`), or export all accounts in the pool
-
-> "Advanced: custom email list" can be expanded to specify emails manually (one local-part per line, supports `{N-M}` expansion); leave empty to randomize by count.
-
-> ⚠️ **Notes:**
-> - The registration endpoint returns `REGISTER_FROM_MAINLAND` for mainland China IPs — configure an overseas proxy in **Settings** first.
-> - DeepSeek has a send-rate limit (`EMAIL_REQUEST_TOO_FREQUENT`); the task auto-waits and retries.
-> - Registration and login both use a **random iOS client fingerprint** (UA/version/timezone/rangers-id/device_id randomized each time) to bypass the AWS WAF interception triggered by Web traffic on chat.deepseek.com.
->
-> 💡 **Key to reducing ban probability: more accounts is better.** Using this batch-register feature can greatly reduce the impact of a single-account ban — **it is recommended to add as many accounts as possible (ideally 100)**. Combined with the existing multi-account round-robin, when one account gets banned it automatically switches to another, significantly improving overall availability.
->
-> ⚠️ **Limits of batch registration:**
-> - **A single IP can register at most ~30 accounts in a short period**; exceeding this gets rate-limited — spread it out or change IP.
-> - **Mainland China IPs may be unable to use mail.cx batch registration** (endpoint returns `REGISTER_FROM_MAINLAND`).
-> - If registering via VPN/proxy, **watch out for DNS leaks**: if your system DNS still goes through the local ISP (rather than inside the VPN tunnel), registration may fail or be flagged as abnormal. Make sure DNS also routes through the proxy after enabling it.
-
 ## Limitations & Known Issues
 
 | Limitation | Description |
 |------------|-------------|
-| Token validity | ~24 hours expiry, requires password login for auto-refresh |
+| Token validity | ~24 hours expiry; re-login or re-import credentials when expired |
 | Concurrency limit | DeepSeek free tier limits ~2 concurrent requests per account |
 | Chat Completions + Responses only | Embeddings, Fine-tuning, and other endpoints are not supported |
 | PoW latency | Each request requires fetching and solving a PoW challenge (Node.js ~1-3 seconds) |
@@ -793,13 +732,13 @@ A: Check if Node.js is installed (`node --version`). If Node.js solving fails, t
 A: Verify your password is correct. DeepSeek passwords require at least 8 characters with letters + numbers. You may need to complete a captcha first in some cases.
 
 **Q: What happens when Token expires?**
-A: If configured via **account password login**, the proxy auto-relogins and refreshes the Token on 401. If configured via cURL/Cookie import, manual re-import is required.
+A: Re-login in the admin panel, or re-import credentials for cURL/Cookie accounts.
 
 **Q: Specified expert model but conversation appears in "Quick Mode" (default)?**
 A: Usually caused by expired Token or Session. DeepSeek silently downgrades requests to the default model when credentials are invalid. Solution: **re-login** with phone/email on the admin panel at `http://localhost:8000/admin` — the login will auto-refresh both Token and Session.
 
 **Q: Can this be deployed on a public server?**
-A: Yes, but recommend using Nginx reverse proxy + HTTPS + IP whitelist. API Key is not validated (any value works), so access control should be handled through other means.
+A: Set `DEEPSEEK_PROXY_API_KEY` and configure HTTPS and access controls. When the variable is unset, `/v1` does not validate an API key.
 
 ## License & Credits
 

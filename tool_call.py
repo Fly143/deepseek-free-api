@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -70,8 +71,143 @@ def get_tool_names(tools: List[Dict[str, Any]]) -> List[str]:
 
 # ─── 主入口：从文本中提取工具调用 ────────────────────────────
 
+class ToolFormatError(ValueError):
+    pass
+
+
+def _valid_schema_metadata(schema):
+    if "$schema" in schema:
+        dialect = schema["$schema"]
+        if not isinstance(dialect, str) or not re.fullmatch(
+            r"https?://json-schema\.org/(?:draft-0[467]/schema|draft/(?:2019-09|2020-12)/schema)#?", dialect
+        ):
+            return False
+    return "$id" not in schema or isinstance(schema["$id"], str)
+
+
+def _safe_schema_value(value, schema):
+    if not isinstance(schema, dict):
+        return False
+    allowed = {"type", "title", "description", "default", "examples", "$schema", "$id", "$comment", "enum", "const", "minLength", "maxLength"}
+    if set(schema) - allowed or not _valid_schema_metadata(schema):
+        return False
+    kind = schema.get("type")
+    kinds = {
+        "string": lambda x: isinstance(x, str),
+        "integer": lambda x: isinstance(x, int) and not isinstance(x, bool),
+        "number": lambda x: isinstance(x, (int, float)) and not isinstance(x, bool),
+        "boolean": lambda x: isinstance(x, bool),
+        "null": lambda x: x is None,
+    }
+    if kind not in kinds or not kinds[kind](value):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    def same(candidate):
+        if isinstance(value, bool) or isinstance(candidate, bool):
+            return type(value) is type(candidate) and value == candidate
+        return value == candidate
+    if "enum" in schema and (not isinstance(schema["enum"], list) or not any(same(item) for item in schema["enum"])):
+        return False
+    if "const" in schema and not same(schema["const"]):
+        return False
+    if "minLength" in schema or "maxLength" in schema:
+        if kind != "string":
+            return False
+        for key, compare in (("minLength", lambda n: len(value) >= n), ("maxLength", lambda n: len(value) <= n)):
+            if key in schema and (not isinstance(schema[key], int) or isinstance(schema[key], bool) or schema[key] < 0 or not compare(schema[key])):
+                return False
+    return True
+
+
+def _placeholder_call(name, command, tool_names, tools):
+    if name != "bash" or name not in tool_names or not isinstance(tools, list):
+        raise ToolFormatError("工具格式无法安全解析，请按 do JSON 格式重新生成调用。")
+    matches = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if fn.get("name") == name:
+            matches.append(fn)
+    if len(matches) != 1:
+        raise ToolFormatError("工具定义无法确认，请按 do JSON 格式重新生成调用。")
+    schema = matches[0].get("parameters")
+    allowed = {"type", "properties", "required", "additionalProperties", "title", "description", "default", "examples", "$schema", "$id", "$comment"}
+    if not isinstance(schema, dict) or set(schema) - allowed or not _valid_schema_metadata(schema) or schema.get("type") != "object":
+        raise ToolFormatError("工具参数结构无法安全验证，请按 do JSON 格式重新生成调用。")
+    properties = schema.get("properties")
+    required = schema.get("required", [])
+    if (not isinstance(properties, dict) or not isinstance(required, list)
+            or any(not isinstance(key, str) for key in required)
+            or not isinstance(schema.get("additionalProperties", True), bool)):
+        raise ToolFormatError("工具参数结构无法安全验证，请按 do JSON 格式重新生成调用。")
+    if not command or not _safe_schema_value(command, properties.get("command")):
+        raise ToolFormatError("命令无法匹配工具参数，请按 do JSON 格式重新生成调用。")
+    args = {"command": command}
+    for key in required:
+        if key == "command":
+            continue
+        field = properties.get(key)
+        if not isinstance(field, dict) or "default" not in field or not _safe_schema_value(field["default"], field):
+            raise ToolFormatError("缺少必要工具参数，请按 do JSON 格式重新生成调用。")
+        args[key] = field["default"]
+    return normalize_tool_call({"name": name, "arguments": args})
+
+
+def _validate_tool_calls(calls, tools):
+    if tools is None:
+        return calls
+    from jsonschema import Draft202012Validator
+    from jsonschema.validators import validator_for
+    from referencing import Registry
+
+    definitions = {}
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise ToolFormatError("工具定义无效，请检查工具参数结构后重试。")
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = function.get("name")
+        if not isinstance(name, str) or name in definitions:
+            raise ToolFormatError("工具定义无效，请检查工具参数结构后重试。")
+        definitions[name] = function
+
+    def check_references(node):
+        if isinstance(node, dict):
+            if "$schema" in node and not _valid_schema_metadata(node):
+                raise ValueError("unsupported schema")
+            for key, value in node.items():
+                if key in ("$ref", "$dynamicRef", "$recursiveRef"):
+                    if not isinstance(value, str) or not value.startswith("#"):
+                        raise ValueError("external reference")
+                check_references(value)
+        elif isinstance(node, list):
+            for value in node:
+                check_references(value)
+
+    for call in calls:
+        try:
+            function = call["function"]
+            definition = definitions[function["name"]]
+            schema = definition["parameters"]
+            if not isinstance(schema, (dict, bool)):
+                raise ValueError("invalid schema")
+            check_references(schema)
+            validator_class = validator_for(schema, default=Draft202012Validator)
+            validator_class.check_schema(schema)
+            arguments = json.loads(function["arguments"], parse_constant=_reject_json_constant)
+            validator_class(schema, registry=Registry()).validate(arguments)
+        except Exception as exc:
+            raise ToolFormatError("工具参数不符合声明的结构或无法验证，请按工具定义重新生成调用。") from exc
+    return calls
+
+
+def _reject_json_constant(value):
+    raise ValueError(value)
+
+
 def extract_tool_call(
-    text: str, tool_names: List[str]
+    text: str, tool_names: List[str], tools: Optional[List[Dict[str, Any]]] = None
 ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
     """从文本中提取 DSML 工具调用。
 
@@ -82,6 +218,189 @@ def extract_tool_call(
         return None, clean_tool_text(text) if text else text
 
     text = text.replace("\x00", "")
+
+    fence_ranges = []
+    fence_start = None
+    fence_char = ""
+    fence_length = 0
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        marker = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})", line)
+        if marker:
+            value = marker.group(1)
+            if fence_start is None:
+                fence_start, fence_char, fence_length = offset, value[0], len(value)
+            elif value[0] == fence_char and len(value) >= fence_length and not line[marker.end():].strip():
+                fence_ranges.append((fence_start, offset + len(line)))
+                fence_start = None
+        offset += len(line)
+    if fence_start is not None:
+        fence_ranges.append((fence_start, len(text)))
+
+    native_start = "<|begin_of_tool_calls_begin|>"
+    native_call = "<|begin_of_tool_call_begin|>"
+    native_sep = "<|begin_of_tool_sep|>"
+    native_key = "<|begin_of_tool_call_arg_key|>"
+    native_call_end = "<|begin_of_tool_call_end|>"
+    native_end = "<|begin_of_tool_calls_end|>"
+    for header in re.finditer(r"(?m)^[ \t]*" + re.escape(native_start), text):
+        if any(start <= header.start() < end for start, end in fence_ranges):
+            continue
+        if not isinstance(tools, list):
+            raise ToolFormatError("无法验证工具定义，请按 do JSON 格式重新生成调用。")
+        definitions = {}
+        for tool in tools:
+            if not isinstance(tool, dict):
+                raise ToolFormatError("工具定义无效，请检查工具参数结构后重试。")
+            function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            name = function.get("name")
+            if not isinstance(name, str) or name in definitions:
+                raise ToolFormatError("工具定义无效，请检查工具参数结构后重试。")
+            definitions[name] = function
+        position = header.end()
+        calls = []
+        while True:
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if text.startswith(native_end, position):
+                if not calls:
+                    raise ToolFormatError("工具调用为空，请按 do JSON 格式重新生成调用。")
+                position += len(native_end)
+                validated = _validate_tool_calls(calls, tools)
+                cleaned = text[:header.start()] + text[position:]
+                cleaned = re.sub(r"<\s*\|{1,2}DSML\|{1,2}\s*calls\s*>\s*</\s*\|{1,2}DSML\|{1,2}\s*calls\s*>", "", cleaned, flags=re.IGNORECASE)
+                return validated, cleaned if cleaned.strip() else ""
+            if not text.startswith(native_call, position):
+                raise ToolFormatError("工具调用格式不完整，请按 do JSON 格式重新生成调用。")
+            position += len(native_call)
+            name_end = text.find(native_sep, position)
+            if name_end < 0:
+                raise ToolFormatError("工具调用格式不完整，请按 do JSON 格式重新生成调用。")
+            name = text[position:name_end].strip()
+            if name not in tool_names or name not in definitions:
+                raise ToolFormatError("工具未声明，请按工具定义重新生成调用。")
+            schema = definitions[name].get("parameters")
+            properties = schema.get("properties") if isinstance(schema, dict) else None
+            if not isinstance(properties, dict):
+                raise ToolFormatError("无法验证工具参数，请按 do JSON 格式重新生成调用。")
+            position = name_end + len(native_sep)
+            arguments = {}
+            while not text.startswith(native_call_end, position):
+                if not text.startswith(native_key, position):
+                    raise ToolFormatError("工具参数格式不完整，请按 do JSON 格式重新生成调用。")
+                position += len(native_key)
+                key_end = text.find(native_sep, position)
+                if key_end < 0:
+                    raise ToolFormatError("工具参数格式不完整，请按 do JSON 格式重新生成调用。")
+                key = text[position:key_end].strip()
+                field = properties.get(key)
+                if not key or key in arguments or not isinstance(field, dict):
+                    raise ToolFormatError("工具参数未声明或重复，请按工具定义重新生成调用。")
+                position = key_end + len(native_sep)
+                next_key = text.find(native_key, position)
+                next_end = text.find(native_call_end, position)
+                if next_end < 0:
+                    raise ToolFormatError("工具调用格式不完整，请按 do JSON 格式重新生成调用。")
+                value_end = min(next_key, next_end) if next_key >= 0 else next_end
+                value = text[position:value_end]
+                kind = field.get("type")
+                if kind == "string":
+                    arguments[key] = value
+                elif kind in ("integer", "number", "boolean", "null", "object", "array"):
+                    try:
+                        arguments[key] = json.loads(value, parse_constant=_reject_json_constant)
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        raise ToolFormatError("工具参数格式无效，请按工具定义重新生成调用。") from exc
+                else:
+                    raise ToolFormatError("工具参数类型无法确认，请按 do JSON 格式重新生成调用。")
+                position = value_end
+            position += len(native_call_end)
+            calls.append(normalize_tool_call({"name": name, "arguments": arguments}))
+
+    decoder = json.JSONDecoder(parse_constant=_reject_json_constant)
+    json_header = re.compile(r"(?im)^[ \t]*<[|｜]\s*DSML\s*[|｜]\s*tool_calls\s*>")
+    json_closer = re.compile(r"</[|｜]?\s*DSML\s*[|｜]\s*tool_calls\s*>", re.IGNORECASE)
+    for header in json_header.finditer(text):
+        if any(start <= header.start() < end for start, end in fence_ranges):
+            continue
+        position = header.end()
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text) or text[position] != "{":
+            continue
+        calls = []
+        while position < len(text):
+            try:
+                obj, end = decoder.raw_decode(text, position)
+            except (json.JSONDecodeError, ValueError):
+                return None, text
+            if (not isinstance(obj, dict) or set(obj) != {"name", "arguments"}
+                    or not isinstance(obj["name"], str) or obj["name"] not in tool_names
+                    or not isinstance(obj["arguments"], dict)):
+                return None, text
+            calls.append(normalize_tool_call(obj))
+            position = end
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position == len(text):
+                cleaned = text[:header.start()]
+                return _validate_tool_calls(calls, tools), cleaned if cleaned.strip() else ""
+            closer = json_closer.match(text, position)
+            if closer:
+                cleaned = text[:header.start()] + text[closer.end():]
+                return _validate_tool_calls(calls, tools), cleaned if cleaned.strip() else ""
+            if text[position] != "{" or "\n" not in text[end:position]:
+                return None, text
+
+    header_pattern = re.compile(r"<\s*\|{1,2}DSML\|{1,2}\s*calls\s*>", re.IGNORECASE)
+    marker_pattern = re.compile(r"<\s*\|place_holder_no_1\|\s*>", re.IGNORECASE)
+    for header in header_pattern.finditer(text):
+        if any(start <= header.start() < end for start, end in fence_ranges):
+            continue
+        if re.match(r"\s*</\s*\|{1,2}DSML\|{1,2}\s*calls\s*>", text[header.end():], re.IGNORECASE):
+            continue
+        first = marker_pattern.search(text, header.end())
+        second = marker_pattern.search(text, first.end()) if first else None
+        third = marker_pattern.search(text, second.end()) if second else None
+        if not first or not second or not third or text[header.end():first.start()].strip():
+            raise ToolFormatError("工具调用格式不完整，请按 do JSON 格式重新生成调用。")
+        name = text[first.end():second.start()].strip()
+        command = text[second.end():third.start()].strip()
+        call = _placeholder_call(name, command, tool_names, tools)
+        cleaned = text[:header.start()] + text[third.end():]
+        return _validate_tool_calls([call], tools), cleaned if cleaned.strip() else ""
+
+    parsed = []
+    spans = []
+    for match in re.finditer(r"(?im)^[ \t]*do:[ \t]*", text):
+        if any(start <= match.start() < end for start, end in fence_ranges):
+            continue
+        if spans and match.start() < spans[-1][1]:
+            continue
+        try:
+            obj, end = decoder.raw_decode(text, match.end())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        line_end = text.find("\n", end)
+        if line_end < 0:
+            line_end = len(text)
+        if text[end:line_end].strip():
+            continue
+        if (not isinstance(obj, dict) or set(obj) != {"name", "arguments"}
+                or not isinstance(obj["name"], str) or obj["name"] not in tool_names
+                or not isinstance(obj["arguments"], dict)):
+            continue
+        parsed.append(normalize_tool_call(obj))
+        spans.append((match.start(), line_end))
+    if parsed:
+        segments = []
+        last = 0
+        for start, end in spans:
+            segments.append(text[last:start])
+            last = end
+        segments.append(text[last:])
+        remainder = "".join(segments)
+        return _validate_tool_calls(parsed, tools), remainder if remainder.strip() else ""
 
     # 尝试 DSML 解析
     tool_calls, cleaned = parse_dsml_tool_calls(text, tool_names)
@@ -95,8 +414,10 @@ def extract_tool_call(
     if tool_calls:
         # 标准化为 OpenAI 格式
         normalized = [normalize_tool_call(tc) for tc in tool_calls]
-        normalized = [tc for tc in normalized if tc]
-        return (normalized if normalized else None), clean_tool_text(text)
+        normalized = [tc for tc in normalized if tc and tc.get("function", {}).get("name") in tool_names]
+        if normalized:
+            return _validate_tool_calls(normalized, tools), clean_tool_text(cleaned)
+        return None, text
 
     return None, clean_tool_text(text)
 
@@ -182,7 +503,7 @@ def clean_tool_text(text: str) -> str:
 
 # ─── 消息转换为 DeepSeek 格式 ──────────────────────────────
 
-def convert_messages_for_deepseek(messages, tools=None, passthrough=False):
+def convert_messages_for_deepseek(messages, tools=None, passthrough=False, tool_required=False):
     """将 OpenAI 消息列表转换为 DeepSeek 原生 prompt 格式。
 
     参照 ds2api 的 MessagesPrepare:
@@ -210,6 +531,8 @@ def convert_messages_for_deepseek(messages, tools=None, passthrough=False):
             text = str(content) if content else ""
             if tools:
                 tool_text = build_dsml_tool_prompt(tools, passthrough=passthrough)
+                if tool_required:
+                    tool_text += "\nYou must call an available tool; do not answer without calling one."
                 if tool_text:
                     if text.strip():
                         text = text + "\n\n" + tool_text
@@ -240,32 +563,26 @@ def convert_messages_for_deepseek(messages, tools=None, passthrough=False):
                 dsml = format_tool_calls_for_prompt(tool_calls)
                 if dsml:
                     segs.append(dsml)
+                    ids = [tc.get("id", "") if isinstance(tc, dict) else "" for tc in tool_calls]
+                    if any(ids):
+                        segs.append("Tool call IDs in order: " + json.dumps(ids, ensure_ascii=False))
             if segs:
                 parts.append(ASST + "\n\n".join(segs) + EOS)
             elif content:
                 parts.append(ASST + str(content) + EOS)
             last_role = "assistant"
         elif role == "tool":
-            result = str(content) if content else ""
-            if result:
-                try:
-                    rd = json.loads(result)
-                    if isinstance(rd, dict):
-                        extracted = []
-                        for k in ("output", "error", "result", "content"):
-                            v = rd.get(k)
-                            if v is not None and str(v).strip():
-                                extracted.append(str(v).strip())
-                        if extracted:
-                            result = "\n".join(extracted)
-                except (json.JSONDecodeError, ValueError):
-                    pass
-                parts.append(TOOL + result[:500] + TOOL_END)
+            result = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            call_id = msg.get("tool_call_id", "")
+            payload = json.dumps({"tool_call_id": call_id, "content": result}, ensure_ascii=False)
+            parts.append(TOOL + payload + TOOL_END)
             last_role = "tool"
 
     # 如果没有 system 消息但有 tools，将 tool prompt 作为 system 消息插入
     if tools and not has_system:
         tool_text = build_dsml_tool_prompt(tools, passthrough=passthrough)
+        if tool_required:
+            tool_text += "\nYou must call an available tool; do not answer without calling one."
         if tool_text:
             parts.insert(1, SYS + tool_text + SYS_END)
 

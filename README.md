@@ -19,7 +19,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![FastAPI](https://img.shields.io/badge/FastAPI-teal)](https://fastapi.tiangolo.com/)
 
-将 **DeepSeek 网页端免费对话**（chat.deepseek.com）反代为 **OpenAI 兼容 API**，支持动态模型发现、PoW 自动求解、Token 自动刷新。
+将 **DeepSeek 网页端免费对话**（chat.deepseek.com）反代为 **OpenAI 兼容 API**，支持动态模型发现、PoW 自动求解、手动更新账号凭证。
 
 本项目所修改代码均为ai完成，不含任何一句人工代码，望周知！
 
@@ -55,7 +55,7 @@
 - [工具调用详解](#工具调用详解)
 - [无工具分支 (no-tools，已停更)](#无工具分支-no-tools)
 - [PoW 求解机制](#pow-求解机制)
-- [Token 自动刷新](#token-自动刷新)
+- [会话和凭证](#会话和凭证)
 - [管理命令](#管理命令)
 - [项目结构](#项目结构)
 - [配置参考](#配置参考)
@@ -71,7 +71,7 @@
 - **纯聊天代理** — 无工具调用 prompt 注入，输出更干净，模型注意力集中在用户问题上
 - **动态模型发现** — 启动时从 DeepSeek 官方 API 实时探测模型列表，每小时自动刷新（含上下文大小等完整信息）
 - **PoW 自动求解** — Node.js WASM 主求解器 + Python 纯算法回退，请求前自动获取 challenge 并求解
-- **Token 自动刷新** — 检测到 401 时自动用保存的密码重新登录，无需人工干预
+- **账号凭证管理** — 凭证失效后可在管理面板重新登录
 - **深度思考** — 支持 DeepSeek 的 `<thought>` 标签，流式输出时分离为 `reasoning_content`
 - **Vision 图像理解** — 支持图片上传、解析、对话
 - **文本文件上传** — 支持 .txt/.md/.py 等文本文件直接上传对话，走 ref_file_ids（和网页端一致）
@@ -93,11 +93,11 @@
 │                 DeepSeek Free API Proxy (FastAPI)           │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
 │  │ 路由层   │  │  tool_call   │  │  tool_sieve  │  │  tool_dsml   │  │   curl_cffi 客户端    │ │
-│  │ /v1/*   │──│ (DSML提示词) │──│ (流式筛分)   │──│ (DSML解析)   │──│ (模拟Chrome指纹)      │ │
+│  │ /v1/*   │──│ (工具提示词) │──│ (流式筛分)   │──│ (DSML解析)   │──│ (模拟Chrome指纹)      │ │
 │  └─────────┘  └──────────────┘  └──────────────────────┘ │
 │  ┌─────────┐  ┌──────────────┐  ┌──────────────────────┐ │
-│  │ 模型发现 │  │   PoW 求解   │  │   Token 自动刷新      │ │
-│  │ (动态)   │  │ (Node+Python) │  │ (保存密码自动relogin) │ │
+│  │ 模型发现 │  │   PoW 求解   │  │   账号凭证管理        │ │
+│  │ (动态)   │  │ (Node+Python) │  │ (管理面板重新登录)   │ │
 │  └─────────┘  └──────────────┘  └──────────────────────┘ │
 │  ┌─────────┐  ┌──────────────────────────┐              │
 │  │ Vision  │  │ 文件上传/解析             │              │
@@ -153,7 +153,7 @@ chmod +x deploy.sh
 ### Docker 部署
 
 ```bash
-docker run -d -p 8000:8000 -v $(pwd)/config.json:/app/config.json ghcr.io/fly143/deepseek-free-api:latest
+docker run -d -p 8000:8000 -v deepseek-data:/data ghcr.io/fly143/deepseek-free-api:latest sh -c 'ln -sf /data/config.json /app/config.json && ln -sf /data/.secret_key /app/.secret_key && exec python proxy.py'
 ```
 
 > ⚠️ **`no-tools` 分支已停更。**
@@ -185,7 +185,7 @@ python3 proxy.py
 3. 填入密码
 4. 点击 **登录**
 
-系统会自动完成：登录获取 Token → 创建聊天 Session → 保存配置到 `token.json`（含密码用于自动刷新）。
+系统会自动完成：登录获取 Token → 创建聊天 Session → 保存账号配置到 `config.json`。
 
 ### 方法2：cURL 导入
 
@@ -506,11 +506,11 @@ def _discover_models():
 
 ## 工具调用详解
 
-DeepSeek 网页端**不支持** OpenAI function calling 格式。本代理通过 **DSML 提示词注入 + 多策略提取**实现工具调用：
+DeepSeek 网页端**不支持** OpenAI function calling 格式。本代理通过 **工具提示词 + 多策略提取**实现工具调用：
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer *** \
+  -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -530,23 +530,20 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-### DSML 提示词注入
+### 工具调用提示词
 
-将 OpenAI tools 定义转换为 DSML 格式，注入到 system 消息中：
+默认提示模型使用以下格式，工具透传模式则允许模型选择格式：
 
-```xml
-<|DSML|tool_calls>
-  <|DSML|invoke name="search_file">
-    <|DSML|parameter name="query"><![CDATA[config.yaml]]></|DSML|parameter>
-  </|DSML|invoke>
-</|DSML|tool_calls>
+```text
+do: {"name":"search_file","arguments":{"query":"config.yaml"}}
 ```
 
 ### 提取策略
 
 | 优先级 | 格式 | 说明 |
 |--------|------|------|
-| DSML | `<\|DSML\|tool_calls><\|DSML\|invoke name="X">...</\|DSML\|invoke></\|DSML\|tool_calls>` | 主力格式，7 种噪声变体容错 |
+| DO | `do: {"name":"x","arguments":{}}` | 默认提示格式 |
+| DSML | `<\|DSML\|tool_calls><\|DSML\|invoke name="X">...</\|DSML\|invoke></\|DSML\|tool_calls>` | 兼容格式，支持噪声变体 |
 | TOOL_CALL | `TOOL_CALL: name(key=value)` | 旧格式兜底 |
 | JSON | `{"name":"x","arguments":{...}}` | JSON 块解析 |
 | XML | `<tool_call><function=NAME>...</function></tool_call>` | 原生 XML |
@@ -584,66 +581,13 @@ DeepSeek 对 `/api/v0/chat/completion` 端点要求 **Proof of Work (PoW)** 验�
 
 DeepSeek 使用自定义算法 `DeepSeekHashV1`，本质是 SHA3-256 哈希碰撞。WASM 版（Node.js 调用）的算法与官方完全匹配。
 
-## Token 自动刷新
+## 会话和凭证
 
-Token 有效期约 **24 小时**。当请求返回 401 时：
+聊天请求每次创建独立的上游对话；如果凭证失效，当前请求不会自动重新登录或重试。请在管理面板重新登录，或重新导入 cURL/Cookie 凭证。客户端每次请求都应发送所需历史消息，历史过长时仍可能被压缩或裁剪。新对话不会自动删除。
 
-1. 检测到 401 → 触发 `relogin()` 函数
-2. 用保存的密码重新调用 `POST /api/v0/users/login`
-3. 获取新 Token → 创建新 Session → 保存到 `token.json`
-4. 用新 Token **重试当前请求**（用户无感知）
+账号密码登录时，程序为每个账号保存并复用设备标识和请求头；管理面板也支持手动设置设备标识。程序生成的标识不是真实设备指纹，这些措施不能保证避免封号。
 
-> **注意：** cURL 导入不含密码，无法自动刷新 Token。如需自动刷新请使用账号密码登录。
-
-## 批量注册账号（自动登录并入池）
-
-管理面板新增 **「批量注册」** 标签页：批量注册 DeepSeek 账号，注册成功后自动登录并把账号写入多账号池，由轮询负载均衡自动使用。
-
-### 流程
-
-1. `POST /auth-api/v0/users/create_guest_challenge` — 获取注册 PoW challenge
-2. 求解 challenge（复用 `pow_native`，Node WASM 秒级）→ 放入 `x-ds-guest-pow-response` 头
-3. `POST /auth-api/v0/users/create_email_verification_code` — 发送邮箱验证码
-4. 读取验证码：**mail.cx 临时邮箱**（推荐）/ IMAP 收件箱 / 通用临时邮箱 API / 手动输入
-5. `POST /auth-api/v0/users/register` — 注册成功直接返回 token（iOS 客户端指纹 + 真实设备 ID 降低风控拦截）
-6. 自动登录：用注册的邮箱密码走标准登录流获取聊天 token + session，写入 `config.json` 账号池
-
-### 使用（mail.cx 推荐方式）
-
-1. 打开管理面板 `http://localhost:8000/admin` → **批量注册** 标签页
-2. 验证码来源选 **mail.cx 临时邮箱（推荐）**
-3. 填入 mail.cx API Key → 点击 **获取域名** → 选择邮箱后缀（如 `ds.mail.zjb.edu.kg`）→ 保存配置
-4. 填写**注册数量**（邮箱前缀自动随机生成）；密码默认随机生成（每账号独立），也可取消勾选手动填统一密码
-5. 点击 **开始批量注册**，实时日志自动滚动输出每个账号的状态
-6. 任务结束后点击 **下载账号列表** 导出 CSV（`email,password,status`），也可导出账号池全部账号
-
-> 「高级：自定义邮箱列表」可展开后手动指定邮箱（每行一个本地部分，支持 `{N-M}` 展开），留空则按数量随机生成。
-
-> ⚠️ **注意：**
-> - 注册接口对大陆 IP 返回 `REGISTER_FROM_MAINLAND`，需先在「设置」中配置海外代理
-> - DeepSeek 有发送频率限制（`EMAIL_REQUEST_TOO_FREQUENT`），任务会自动等待重试
-> - 注册与登录均使用**随机 iOS 客户端指纹**（UA/版本/时区/rangers-id/device_id 每次随机），可绕过 chat.deepseek.com 对 Web 流量触发的 AWS WAF 拦截
->
-> 💡 **降低封号概率的关键：账号越多越好。** 使用本批量注册功能后，可大幅降低单账号封号对使用的影响——**建议添加越多越好的账号（最好 100 个）**，配合已有的多账号轮询，单个账号被封时自动切换到其他账号，整体可用性显著提升。
->
-> ⚠️ **批量注册的限制：**
-> - **单个 IP 短时间内最多只能注册约 30 个账号**，超出会被限流，建议错峰或换 IP。
-> - **中国大陆 IP 可能无法使用 mail.cx 邮箱批量注册**（接口会返回 `REGISTER_FROM_MAINLAND`）。
-> - 若使用 VPN/代理注册，**注意 DNS 泄露问题**：如果系统 DNS 仍走本地运营商（而非 VPN 隧道内），可能导致注册失败或判定异常，请确保代理开启后 DNS 也一并走代理。
-
-### API
-
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| POST | `/api/register/send-code` | 单独发送验证码（`{email}`） |
-| POST | `/api/register/start` | 启动批量注册任务（`count` 随机生成邮箱，或 `emails` 自定义，返回 job_id） |
-| GET | `/api/register/status?job_id=` | 查询任务进度（不带 job_id 列出全部任务） |
-| POST | `/api/register/code` | 手动提交验证码（`{job_id, email, code}`） |
-| POST | `/api/register/stop` | 停止任务（`{job_id}`） |
-| GET | `/api/register/mailcx-domains` | 获取 mail.cx 可用邮箱后缀 |
-| GET/PUT | `/api/register/mailcx-config` | 读取/保存 mail.cx API Key 与后缀 |
-| GET | `/api/register/export?job_id=` | 导出任务的账号密码列表（CSV，`?format=txt` 为纯文本） |
-| GET | `/api/accounts/export` | 导出账号池全部账号（含密码） |
+默认工具调用提示使用 `do:` 加 JSON，仍可解析旧格式。启用工具透传模式后，模型可自行选择工具调用格式。更改格式不能保证避免封号。
 
 ## 管理命令
 
@@ -693,7 +637,8 @@ ds-free-api/
 ├── deploy.sh             # 一键部署脚本（安装依赖、启动/停止/状态管理）
 ├── requirements.txt      # Python 依赖
 ├── token.example.json    # 配置文件模板
-└── token.json            # 实际配置（.gitignore，含凭证）
+├── config.json           # 账号与设置（.gitignore）
+└── .secret_key           # 加密密钥（.gitignore）
 ```
 
 ### 核心文件说明
@@ -707,45 +652,25 @@ ds-free-api/
 
 ## 配置参考
 
-`token.json` 完整配置项：
+账号与设置保存在 `config.json` 的 `accounts` 列表及其他配置字段中。令牌、密码、Cookie、请求头、设备标识和管理密码等敏感字段使用 Fernet 加密后保存；解密密钥保存在同目录的 `.secret_key`。账号标识等其他字段并非全部加密。
 
-```json
-{
-  "token": "***",
-  "session_id": "abc-def-123...",
-  "headers": {
-    "content-type": "application/json",
-    "origin": "https://chat.deepseek.com",
-    "referer": "https://chat.deepseek.com/",
-    "user-agent": "Mozilla/5.0 ...",
-    "x-client-version": "2.0.2",
-    "x-client-platform": "web",
-    "authorization": "Bearer YOUR_TOKEN"
-  },
-  "account": "+86 138xxxx",
-  "login_type": "phone",
-  "_password": "your_password",
-  "_email": "",
-  "_mobile": "138xxxx",
-  "_area_code": "+86"
-}
-```
+两个文件均已列入 `.gitignore`。请限制访问权限，妥善保存并一起备份；丢失或更换密钥将无法解密现有凭证。首次启动时，如果没有 `config.json`，程序会尝试从旧版 `token.json` 迁移账号并将旧文件重命名为 `token.json.bak`；旧文件可能包含明文凭证，应妥善处理。
 
-| 配置项 | 说明 | 自动生成 |
-|--------|------|:--------:|
-| `token` | Bearer Token（约24小时有效） | ✓ |
-| `session_id` | 聊天会话 ID（UUID） | ✓ |
-| `headers` | 请求头（含 UA、authorization 等） | ✓ |
-| `account` | 账号标识（显示用） | ✓ |
-| `login_type` | 登录方式：`phone` / `email` | 首次设置 |
-| `_password` | 登录密码（用于自动刷新） | 首次设置 |
-| `_mobile` | 手机号（自动刷新用） | 首次设置 |
-| `_email` | 邮箱（自动刷新用） | 首次设置 |
-| `_area_code` | 区号（默认 +86） | 首次设置 |
+Docker 示例使用持久卷保存配置和密钥，重建容器时请保留该卷。
 
-> **安全提示：** `_password` 明文存储在本地文件。请确保 `token.json` 权限正确（`chmod 600`），并在分发/打包时排除（已加入 `.gitignore`）。
+**环境变量：**
 
-**环境变量：** `PROXY_PORT` — 监听端口（默认 `8000`）
+| 变量 | 作用和默认值 |
+|------|-------------|
+| `PROXY_PORT` | 监听端口，默认 `8000` |
+| `DEEPSEEK_PROXY_API_KEY` | `/v1` 接口密钥；未设置时不鉴权。客户端使用 Bearer 令牌或 `x-api-key` |
+| `DEEPSEEK_MIN_INTERVAL_SEC` | 受控上游操作的最小启动间隔，默认 `2.5` 秒 |
+| `DEEPSEEK_MAX_CONCURRENT` | 受控上游操作的最大并发数，默认 `1` |
+| `DEEPSEEK_ERROR_COOLDOWN_SEC` | 一般错误后的账号冷却时间，默认 `60` 秒 |
+| `DEEPSEEK_SESSION_INVALID_COOLDOWN_SEC` | 会话失效后的账号冷却时间，默认 `300` 秒 |
+| `DEEPSEEK_AUTO_RELOGIN` | 其他路径的自动重登开关，默认启用；每次新建对话的聊天请求不会自动重登 |
+
+这些限制不覆盖所有上游操作，例如附件上传。公网部署应设置接口密钥，并配置 HTTPS 和其他访问控制。
 
 ## 依赖
 
@@ -771,7 +696,7 @@ pip install fastapi uvicorn curl-cffi python-dotenv
 
 | 限制 | 说明 |
 |------|------|
-| Token 有效期 | 约 24 小时过期，需要密码登录来自动刷新 |
+| Token 有效期 | 约 24 小时过期，失效后需手动重新登录或重新导入凭证 |
 | 并发限制 | DeepSeek 免费版每账号限制约 2 并发请求 |
 | 仅 Chat Completions + Responses | 不支持 Embeddings、Fine-tuning 等端点 |
 | PoW 耗时 | 每次请求需要先获取并求解 PoW challenge（Node.js 约 1-3 秒） |
@@ -793,13 +718,13 @@ A: 检查 Node.js 是否安装（`node --version`）。如果 Node.js 求解失�
 A: 确认密码正确。DeepSeek 密码要求至少 8 位，含字母+数字。某些情况下可能需要先完成人机验证再试。
 
 **Q: Token 过期后怎么办？**
-A: 如果使用**账号密码登录**配置的，代理会在 401 时自动重新登录刷新 Token。如果使用 cURL 导入的，需要手动重新导入。
+A: 请在管理面板重新登录；使用 cURL/Cookie 导入的账号需重新导入凭证。
 
 **Q: 指定 expert 模型但对话记录显示在"快速模式"（default）？**
 A: 通常是 Token 或 Session 过期导致的。DeepSeek 在凭证失效时会把请求降级到 default 模型。解决方法：在管理面板 `http://localhost:8000/admin` 用手机号/邮箱**重新登录**一次即可，登录后自动刷新 Token 和 Session。
 
 **Q: 可以部署到服务器公网访问吗？**
-A: 可以，但建议使用 Nginx 反向代理 + HTTPS + IP 白名单。API Key 不校验（任意值即可），需要通过其他方式控制访问。
+A: 请设置 `DEEPSEEK_PROXY_API_KEY` 并配置 HTTPS 和访问控制。未设置该变量时，`/v1` 接口不校验密钥。
 
 ## 许可与致谢
 

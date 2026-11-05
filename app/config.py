@@ -87,6 +87,8 @@ class DsAccount:
     token: str = ""
     session_id: str = ""
     headers: dict = field(default_factory=dict)
+    device_id: str = ""
+    device_source: str = ""
     cookie: str = ""
     # 状态
     login_time: str = ""
@@ -107,6 +109,7 @@ class DsAccount:
         d.pop("_password", None)
         d.pop("cookie", None)
         d.pop("headers", None)
+        d.pop("device_id", None)
         return d
 
     def to_save_dict(self, box: Optional[SecretBox] = None):
@@ -116,6 +119,7 @@ class DsAccount:
             d["token"] = box.encrypt(self.token or "")
             d["_password"] = box.encrypt(self._password or "")
             d["cookie"] = box.encrypt(self.cookie or "")
+            d["device_id"] = box.encrypt(self.device_id or "")
             if self.headers:
                 # headers 整体序列化后加密，避免泄露 authorization
                 d["headers"] = box.encrypt(json.dumps(self.headers, ensure_ascii=False))
@@ -130,6 +134,7 @@ class DsAccount:
             fields["token"] = box.decrypt(fields.get("token", "") or "")
             fields["_password"] = box.decrypt(fields.get("_password", "") or "")
             fields["cookie"] = box.decrypt(fields.get("cookie", "") or "")
+            fields["device_id"] = box.decrypt(fields.get("device_id", "") or "")
             headers = fields.get("headers", {})
             if isinstance(headers, str) and headers:
                 decrypted = box.decrypt(headers)
@@ -156,6 +161,10 @@ class ConfigManager:
         # 批量注册：mail.cx 临时邮箱配置
         self._mailcx_api_key: str = ""
         self._mailcx_domain: str = ""
+        self._cloudmail_base_url = ""
+        self._cloudmail_token = ""
+        self._cloudmail_domain = ""
+        self._cloudmail_sender_domain = ""
         self.load()
 
     def _migrate_legacy(self):
@@ -222,6 +231,10 @@ class ConfigManager:
                 self._admin_password = self.box.decrypt(data.get('admin_password', '') or '') or 'admin'
                 self._mailcx_api_key = self.box.decrypt(data.get('mailcx_api_key', '') or '')
                 self._mailcx_domain = data.get('mailcx_domain', '') or ''
+                self._cloudmail_base_url = data.get('cloudmail_base_url', '') or ''
+                self._cloudmail_token = self.box.decrypt(data.get('cloudmail_token', '') or '')
+                self._cloudmail_domain = data.get('cloudmail_domain', '') or ''
+                self._cloudmail_sender_domain = data.get('cloudmail_sender_domain', '') or ''
         except Exception as e:
             print(f"[Config] 加载配置失败: {e}")
             self.accounts = []
@@ -239,6 +252,10 @@ class ConfigManager:
                     "admin_password": self.box.encrypt(self._admin_password or "admin"),
                     "mailcx_api_key": self.box.encrypt(self._mailcx_api_key or ""),
                     "mailcx_domain": self._mailcx_domain or "",
+                    "cloudmail_base_url": self._cloudmail_base_url or "",
+                    "cloudmail_token": self.box.encrypt(self._cloudmail_token or ""),
+                    "cloudmail_domain": self._cloudmail_domain or "",
+                    "cloudmail_sender_domain": self._cloudmail_sender_domain or "",
                 }
                 with open(self.config_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
@@ -347,6 +364,9 @@ class ConfigManager:
                         acc.headers = account.headers
                     if account.cookie:
                         acc.cookie = account.cookie
+                    if account.device_id and not acc.device_id:
+                        acc.device_id = account.device_id
+                        acc.device_source = account.device_source
                     acc.is_valid = account.is_valid or acc.is_valid
                     self.save()
                     return False
@@ -448,6 +468,19 @@ class ConfigManager:
     def set_mailcx_domain(self, domain: str):
         with self.lock:
             self._mailcx_domain = (domain or "").strip()
+            self.save()
+
+
+    def get_cloudmail_config(self):
+        with self.lock:
+            return {'base_url': self._cloudmail_base_url, 'token': self._cloudmail_token, 'domain': self._cloudmail_domain, 'sender_domain': self._cloudmail_sender_domain}
+
+    def set_cloudmail_config(self, base_url, token, domain, sender_domain):
+        with self.lock:
+            self._cloudmail_base_url = base_url
+            self._cloudmail_token = token
+            self._cloudmail_domain = domain
+            self._cloudmail_sender_domain = sender_domain
             self.save()
 
 

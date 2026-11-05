@@ -265,6 +265,39 @@ class ProtocolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(calls, [("bash", {"command": "ls -la"})])
                         self.assertNotIn("DSML", data)
 
+    async def test_begin_tool_call_bash(self):
+        for path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
+            for stream in (False, True):
+                for chunk_size in (1, 7, 1000):
+                    with self.subTest(path=path, stream=stream, chunk_size=chunk_size):
+                        raw = '<|begin_of_tool_calls_begin|><|begin_of_tool_call_begin|>bash<|begin_of_tool_sep|><|begin_of_tool_call_arg_key|>command<|begin_of_tool_sep|>mkdir -p /tmp/new-folder && ls -la /tmp/new-folder<|begin_of_tool_call_end|><|begin_of_tool_calls_end|>'
+                        data, _ = await self.call(path, stream, "", raw, "bash", chunk_size)
+                        if stream:
+                            events = [json.loads(line[6:]) for line in data.splitlines() if line.startswith("data: ") and line[6:] != "[DONE]"]
+                            if path == "/v1/responses":
+                                items = next(event["response"]["output"] for event in events if event["type"] == "response.completed")
+                                calls = [(item["name"], json.loads(item["arguments"])) for item in items if item["type"] == "function_call"]
+                            elif path == "/v1/chat/completions":
+                                chunks = [call for event in events for choice in event.get("choices", []) for call in choice.get("delta", {}).get("tool_calls", [])]
+                                names = [call["function"]["name"] for call in chunks if call.get("function", {}).get("name")]
+                                arguments = "".join(call.get("function", {}).get("arguments", "") for call in chunks)
+                                calls = [(names[0], json.loads(arguments))] if names else []
+                            else:
+                                starts = [event for event in events if event["type"] == "content_block_start" and event["content_block"]["type"] == "tool_use"]
+                                calls = []
+                                for start in starts:
+                                    fragments = [event["delta"]["partial_json"] for event in events if event["type"] == "content_block_delta" and event["index"] == start["index"] and event["delta"]["type"] == "input_json_delta"]
+                                    calls.append((start["content_block"]["name"], json.loads("".join(fragments))))
+                        elif path == "/v1/responses":
+                            calls = [(item["name"], json.loads(item["arguments"])) for item in json.loads(data)["output"] if item["type"] == "function_call"]
+                        elif path == "/v1/chat/completions":
+                            items = json.loads(data)["choices"][0]["message"].get("tool_calls", [])
+                            calls = [(item["function"]["name"], json.loads(item["function"]["arguments"])) for item in items]
+                        else:
+                            calls = [(item["name"], item["input"]) for item in json.loads(data)["content"] if item["type"] == "tool_use"]
+                        self.assertEqual(calls, [("bash", {"command": 'mkdir -p /tmp/new-folder && ls -la /tmp/new-folder'})])
+                        self.assertNotIn("begin_of_tool_call", data)
+
     async def test_undeclared_and_fenced_calls_are_text(self):
         examples = [
             '示例：\n```text\ndo: {"name":"read","arguments":{"path":"demo"}}\n```',

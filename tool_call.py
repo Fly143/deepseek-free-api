@@ -237,6 +237,86 @@ def extract_tool_call(
     if fence_start is not None:
         fence_ranges.append((fence_start, len(text)))
 
+    native_start = "<|begin_of_tool_calls_begin|>"
+    native_call = "<|begin_of_tool_call_begin|>"
+    native_sep = "<|begin_of_tool_sep|>"
+    native_key = "<|begin_of_tool_call_arg_key|>"
+    native_call_end = "<|begin_of_tool_call_end|>"
+    native_end = "<|begin_of_tool_calls_end|>"
+    for header in re.finditer(r"(?m)^[ \t]*" + re.escape(native_start), text):
+        if any(start <= header.start() < end for start, end in fence_ranges):
+            continue
+        if not isinstance(tools, list):
+            raise ToolFormatError("无法验证工具定义，请按 do JSON 格式重新生成调用。")
+        definitions = {}
+        for tool in tools:
+            if not isinstance(tool, dict):
+                raise ToolFormatError("工具定义无效，请检查工具参数结构后重试。")
+            function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            name = function.get("name")
+            if not isinstance(name, str) or name in definitions:
+                raise ToolFormatError("工具定义无效，请检查工具参数结构后重试。")
+            definitions[name] = function
+        position = header.end()
+        calls = []
+        while True:
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if text.startswith(native_end, position):
+                if not calls:
+                    raise ToolFormatError("工具调用为空，请按 do JSON 格式重新生成调用。")
+                position += len(native_end)
+                validated = _validate_tool_calls(calls, tools)
+                cleaned = text[:header.start()] + text[position:]
+                cleaned = re.sub(r"<\s*\|{1,2}DSML\|{1,2}\s*calls\s*>\s*</\s*\|{1,2}DSML\|{1,2}\s*calls\s*>", "", cleaned, flags=re.IGNORECASE)
+                return validated, cleaned if cleaned.strip() else ""
+            if not text.startswith(native_call, position):
+                raise ToolFormatError("工具调用格式不完整，请按 do JSON 格式重新生成调用。")
+            position += len(native_call)
+            name_end = text.find(native_sep, position)
+            if name_end < 0:
+                raise ToolFormatError("工具调用格式不完整，请按 do JSON 格式重新生成调用。")
+            name = text[position:name_end].strip()
+            if name not in tool_names or name not in definitions:
+                raise ToolFormatError("工具未声明，请按工具定义重新生成调用。")
+            schema = definitions[name].get("parameters")
+            properties = schema.get("properties") if isinstance(schema, dict) else None
+            if not isinstance(properties, dict):
+                raise ToolFormatError("无法验证工具参数，请按 do JSON 格式重新生成调用。")
+            position = name_end + len(native_sep)
+            arguments = {}
+            while not text.startswith(native_call_end, position):
+                if not text.startswith(native_key, position):
+                    raise ToolFormatError("工具参数格式不完整，请按 do JSON 格式重新生成调用。")
+                position += len(native_key)
+                key_end = text.find(native_sep, position)
+                if key_end < 0:
+                    raise ToolFormatError("工具参数格式不完整，请按 do JSON 格式重新生成调用。")
+                key = text[position:key_end].strip()
+                field = properties.get(key)
+                if not key or key in arguments or not isinstance(field, dict):
+                    raise ToolFormatError("工具参数未声明或重复，请按工具定义重新生成调用。")
+                position = key_end + len(native_sep)
+                next_key = text.find(native_key, position)
+                next_end = text.find(native_call_end, position)
+                if next_end < 0:
+                    raise ToolFormatError("工具调用格式不完整，请按 do JSON 格式重新生成调用。")
+                value_end = min(next_key, next_end) if next_key >= 0 else next_end
+                value = text[position:value_end]
+                kind = field.get("type")
+                if kind == "string":
+                    arguments[key] = value
+                elif kind in ("integer", "number", "boolean", "null", "object", "array"):
+                    try:
+                        arguments[key] = json.loads(value, parse_constant=_reject_json_constant)
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        raise ToolFormatError("工具参数格式无效，请按工具定义重新生成调用。") from exc
+                else:
+                    raise ToolFormatError("工具参数类型无法确认，请按 do JSON 格式重新生成调用。")
+                position = value_end
+            position += len(native_call_end)
+            calls.append(normalize_tool_call({"name": name, "arguments": arguments}))
+
     decoder = json.JSONDecoder(parse_constant=_reject_json_constant)
     json_header = re.compile(r"(?im)^[ \t]*<[|｜]\s*DSML\s*[|｜]\s*tool_calls\s*>")
     json_closer = re.compile(r"</[|｜]?\s*DSML\s*[|｜]\s*tool_calls\s*>", re.IGNORECASE)
@@ -276,6 +356,8 @@ def extract_tool_call(
     marker_pattern = re.compile(r"<\s*\|place_holder_no_1\|\s*>", re.IGNORECASE)
     for header in header_pattern.finditer(text):
         if any(start <= header.start() < end for start, end in fence_ranges):
+            continue
+        if re.match(r"\s*</\s*\|{1,2}DSML\|{1,2}\s*calls\s*>", text[header.end():], re.IGNORECASE):
             continue
         first = marker_pattern.search(text, header.end())
         second = marker_pattern.search(text, first.end()) if first else None

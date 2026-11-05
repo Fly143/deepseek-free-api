@@ -217,6 +217,45 @@ class DoToolsTests(unittest.TestCase):
         calls, _ = extract_tool_call(raw, ["bash"], [{"name": "bash", "parameters": local}])
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"command": "ls -la"})
 
+    def test_native_tool_marker_calls(self):
+        start = '<|begin_of_tool_calls_begin|>'
+        call = '<|begin_of_tool_call_begin|>'
+        sep = '<|begin_of_tool_sep|>'
+        key = '<|begin_of_tool_call_arg_key|>'
+        end_call = '<|begin_of_tool_call_end|>'
+        end = '<|begin_of_tool_calls_end|>'
+        command = 'mkdir -p /tmp/new-folder && ls -la /tmp/new-folder'
+        raw = start + call + 'bash' + sep + key + 'command' + sep + command + end_call + end
+        schema = {"type": "object", "properties": {"command": {"type": "string", "minLength": 1}, "workdir": {"type": "string"}, "timeout": {"type": "integer", "minimum": 1}}, "required": ["command"], "additionalProperties": False}
+        tools = [{"type": "function", "function": {"name": "bash", "parameters": schema}}]
+        calls, content = extract_tool_call(raw, ["bash"], tools)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"command": command})
+        self.assertEqual(content, "")
+        for cut in range(len(raw) + 1):
+            sieve = StreamSieve(lambda text: extract_tool_call(text, ["bash"], tools))
+            events = sieve.feed(raw[:cut]) + sieve.feed(raw[cut:]) + sieve.flush()
+            self.assertEqual([event.type for event in events], ["tool_calls"])
+            self.assertEqual(json.loads(events[0].data[0]["function"]["arguments"]), {"command": command})
+        multi = ('准备\n' + start + call + 'bash' + sep + key + 'command' + sep + 'pwd' + key + 'workdir' + sep + '/tmp' + key + 'timeout' + sep + '5' + end_call + call + 'bash' + sep + key + 'command' + sep + 'ls' + end_call + end + '\n完成')
+        calls, content = extract_tool_call(multi, ["bash"], tools)
+        self.assertEqual([json.loads(item["function"]["arguments"]) for item in calls], [{"command": "pwd", "workdir": "/tmp", "timeout": 5}, {"command": "ls"}])
+        self.assertEqual(content, '准备\n\n完成')
+        for invalid in (raw.replace('bash', 'unknown', 1), raw.replace('command', 'unknown', 1), raw.replace(command, ''), raw.replace(end_call, ''), raw.replace(end, ''), start + call + 'bash' + sep + key + 'timeout' + sep + '5' + end_call + end, start + call + 'bash' + sep + key + 'command' + sep + 'pwd' + key + 'timeout' + sep + 'bad' + end_call + end, start + call + 'bash' + sep + key + 'command' + sep + 'pwd' + key + 'command' + sep + 'ls' + end_call + end):
+            with self.assertRaises(ToolFormatError):
+                extract_tool_call(invalid, ["bash"], tools)
+        empty_wrapper = '<||DSML|| calls>\n</||DSML|| calls>'
+        calls, content = extract_tool_call('正文\n' + empty_wrapper + '\n' + raw, ["bash"], tools)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"command": command})
+        self.assertEqual(content, '正文\n\n')
+        ordinary = '正文\n' + empty_wrapper + '\n后续'
+        self.assertEqual(extract_tool_call(ordinary, ["bash"], tools), (None, ordinary))
+        with self.assertRaises(ToolFormatError):
+            extract_tool_call(empty_wrapper + '\n' + raw.replace('bash', 'unknown', 1), ["bash"], tools)
+        fenced = '```text\n' + raw + '\n```'
+        self.assertIsNone(extract_tool_call(fenced, ["bash"], tools)[0])
+        prose = '这是示例：' + raw
+        self.assertIsNone(extract_tool_call(prose, ["bash"], tools)[0])
+
     def test_stream_at_all_boundaries(self):
         value = 'do: ' + json.dumps({"name": "a", "arguments": {"x": '汉字\n" } <|DSML|tool_calls><|DSML|invoke name="a"></|DSML|invoke></|DSML|tool_calls>'}}, ensure_ascii=False)
         def parse(text):

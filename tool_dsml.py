@@ -387,6 +387,12 @@ def _escape_xml_attr(text: str) -> str:
 def build_dsml_tool_prompt(tools: List[Dict[str, Any]], passthrough: bool = False) -> str:
     if not tools:
         return ""
+    execution_rules = (
+        "Tools are executed by the client, not by writing a command in your answer. "
+        "To perform an action, request the appropriate tool and wait for its result. "
+        "Do not claim an action was performed or succeeded unless a tool result confirms it. "
+        "If a tool fails or no result is available, say what is known and do not invent an outcome."
+    )
     if passthrough:
         tools_json = json.dumps(tools, indent=2, ensure_ascii=False)
         return (
@@ -394,7 +400,8 @@ def build_dsml_tool_prompt(tools: List[Dict[str, Any]], passthrough: bool = Fals
             "Use your native tool-calling format when you need to invoke one.\n\n"
             f"<tools>\n{tools_json}\n</tools>\n\n"
             "When you use a tool, use whatever tool call format you normally use "
-            "(<|DSML|tool_calls>, TOOL_CALL:, or the standard format you prefer)."
+            "(<|DSML|tool_calls>, TOOL_CALL:, or the standard format you prefer).\n\n"
+            + execution_rules
         )
     definitions = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
     return (
@@ -405,7 +412,8 @@ def build_dsml_tool_prompt(tools: List[Dict[str, Any]], passthrough: bool = Fals
         'do: {"name":"tool_name","arguments":{"query":"example"}}. '
         "For multiple calls, output one do: JSON object per line. "
         "Do not use markdown fences or include explanatory text in a tool call response. "
-        "If no tool is needed, respond normally."
+        "If no tool is needed, respond normally.\n\n"
+        + execution_rules
     )
 
 

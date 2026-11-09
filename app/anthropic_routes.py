@@ -127,7 +127,12 @@ async def anthropic_messages(request: Request):
 
     openai_body = _anthropic_convert_request(body)
     messages = openai_body.get("messages", [])
-    tools, tool_required = select_tools(openai_body.get("tools"), body.get("tool_choice"))
+    try:
+        tools, tool_required = select_tools(openai_body.get("tools"), body.get("tool_choice"))
+    except HTTPException as exc:
+        # Anthropic 端点统一用 error 体，避免把 FastAPI 的 {"detail": "..."} 直接回给 SDK
+        message = exc.detail if isinstance(exc.detail, str) else "invalid tool_choice"
+        raise HTTPException(status_code=exc.status_code, detail=_anthropic_error_response(message, "invalid_request_error"))
     stream = openai_body.get("stream", False)
     has_tools = bool(tools)
 

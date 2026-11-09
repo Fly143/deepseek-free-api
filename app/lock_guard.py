@@ -29,6 +29,30 @@ _slots = threading.Semaphore(MAX_CONCURRENT)
 _last_start = 0.0
 
 
+_login_slots = threading.Semaphore(1)
+_last_login = 0.0
+
+
+@contextmanager
+def login_slot():
+    """登录/重登专用的节流+单并发闸门（与聊天槽分离，避免在同一条请求里自锁）。"""
+    global _last_login
+    if not _login_slots.acquire(timeout=SLOT_WAIT_TIMEOUT_SEC):
+        raise UpstreamBusy(f"登录通道繁忙（等待超过 {SLOT_WAIT_TIMEOUT_SEC:.0f}s），请稍后重试")
+    try:
+        while True:
+            with _lock:
+                now = time.time()
+                wait = (_last_login + MIN_INTERVAL_SEC) - now
+                if wait <= 0:
+                    _last_login = time.time()
+                    break
+            time.sleep(min(wait, MIN_INTERVAL_SEC))
+        yield
+    finally:
+        _login_slots.release()
+
+
 @contextmanager
 def upstream_slot():
     """Serialize/pace calls to chat.deepseek.com to reduce mute/ban signals."""

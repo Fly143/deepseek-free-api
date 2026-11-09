@@ -423,6 +423,7 @@ def extract_tool_call(
                 cleaned = text[:header.start()] + text[closer.end():]
                 return _validate_tool_calls(calls, tools), cleaned if cleaned.strip() else ""
             if text[position] != "{" or "\n" not in text[end:position]:
+                # 块内尾随文字/紧邻第二个 JSON：按作者语义视为普通文本，不执行
                 return None, text
 
     header_pattern = re.compile(r"<\s*\|{1,2}DSML\|{1,2}\s*calls\s*>", re.IGNORECASE)
@@ -565,7 +566,7 @@ def clean_tool_text(text: str) -> str:
         return text
 
     # DSML 标签
-    text = re.sub(r"</?\|?DSML\|?(?:tool_calls|invoke|parameter)[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?[|｜]?DSML[|｜]?(?:tool_calls|invoke|parameter)[^>]*>", "", text, flags=re.IGNORECASE)
     # 无 DSML 前缀的 XML 标签
     text = re.sub(r"<tool_calls?>.*?</tool_calls?>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<invoke[^>]*>.*?</invoke>", "", text, flags=re.DOTALL | re.IGNORECASE)

@@ -261,6 +261,62 @@ class DevicePoolBoundedTests(unittest.TestCase):
         self.assertEqual(len(identity._recent_device_ids), 400)  # 逐个淘汰，不清空
 
 
+class StreamingIncrementalTests(unittest.TestCase):
+    def test_long_text_streams_before_flush(self):
+        long_text = "".join(f"第{i}段内容。\n" for i in range(60))
+        sieve = StreamSieve(lambda t: extract_tool_call(t, ["bash"], BASH))
+        emitted = []
+        for i in range(0, len(long_text), 40):
+            emitted.extend(sieve.feed(long_text[i:i + 40]))
+        self.assertTrue(emitted, "长正文应在 flush 前增量下发")
+        rest = sieve.flush()
+        joined = "".join(e.data for e in emitted + rest if e.type == "text")
+        self.assertEqual(joined, long_text)
+
+    def test_tool_call_at_end_still_parses(self):
+        raw = ("填充内容。" * 100) + "\n" + '<|DSML|tool_calls>\n{"name":"bash","arguments":{"command":"ls"}}\n</|DSML|tool_calls>'
+        sieve = StreamSieve(lambda t: extract_tool_call(t, ["bash"], BASH))
+        events = []
+        for i in range(0, len(raw), 30):
+            events.extend(sieve.feed(raw[i:i + 30]))
+        events.extend(sieve.flush())
+        texts = "".join(e.data for e in events if e.type == "text")
+        self.assertTrue(any(e.type == "tool_calls" for e in events))
+        self.assertIn("填充内容", texts)
+        self.assertNotIn("<|DSML", texts)
+
+
+class LoginSlotTests(unittest.TestCase):
+    def test_login_slot_timeout_raises_busy(self):
+        from app import lock_guard
+
+        old = lock_guard.SLOT_WAIT_TIMEOUT_SEC
+        lock_guard.SLOT_WAIT_TIMEOUT_SEC = 0.05
+        lock_guard._login_slots = threading.Semaphore(1)
+        try:
+            lock_guard._login_slots.acquire()
+            with self.assertRaises(lock_guard.UpstreamBusy):
+                with lock_guard.login_slot():
+                    pass
+        finally:
+            try:
+                lock_guard._login_slots.release()
+            except Exception:
+                pass
+            lock_guard.SLOT_WAIT_TIMEOUT_SEC = old
+            lock_guard._login_slots = threading.Semaphore(1)
+
+
+class FullwidthTagCleanTests(unittest.TestCase):
+    def test_fullwidth_dsml_tags_removed(self):
+        from tool_call import clean_tool_text
+
+        text = "前文<｜DSML|tool_calls>{\"name\":\"a\"}后文"
+        cleaned = clean_tool_text(text)
+        self.assertNotIn("DSML", cleaned)
+        self.assertIn("前文", cleaned)
+
+
 class TransientSessionRegistryTests(unittest.TestCase):
     def test_register_buffer_and_expire(self):
         import tempfile, pathlib

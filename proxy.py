@@ -51,7 +51,7 @@ CONFIG_FILE = BASE_DIR / "config.json"
 
 # 多账号管理
 from app.config import config_manager, DsAccount
-from app.lock_guard import upstream_slot, UpstreamBusy, ERROR_COOLDOWN_SEC, SESSION_INVALID_COOLDOWN_SEC
+from app.lock_guard import upstream_slot, login_slot, UpstreamBusy, ERROR_COOLDOWN_SEC, SESSION_INVALID_COOLDOWN_SEC
 from app.auth import verify_admin
 from app.identity import random_ios_headers, new_device_id
 from app.tool_choice import select_tools
@@ -2244,7 +2244,7 @@ async def deepseek_login(data: dict, creds: HTTPBasicCredentials = Depends(verif
 
     try:
         # 1. 登录（iOS 随机指纹绕过 WAF）
-        login_resp = cffi_requests.post(
+        login_resp = _paced_post(
             "https://chat.deepseek.com/api/v0/users/login",
             json=login_payload,
             headers=DS_HEADERS,
@@ -2283,7 +2283,7 @@ async def deepseek_login(data: dict, creds: HTTPBasicCredentials = Depends(verif
 
         # 2. 创建会话（iOS 随机指纹）
         auth_headers = {**DS_HEADERS, "authorization": f"Bearer {token}"}
-        session_resp = cffi_requests.post(
+        session_resp = _paced_post(
             "https://chat.deepseek.com/api/v0/chat_session/create",
             json={},
             headers=auth_headers,
@@ -2952,7 +2952,7 @@ def relogin(cfg: dict) -> dict | None:
         print(f"[Token] 自动重新登录 {account_label}...")
 
         # 1. 登录（iOS 随机指纹绕过 WAF）
-        login_resp = cffi_requests.post(
+        login_resp = _paced_post(
             "https://chat.deepseek.com/api/v0/users/login",
             json=login_payload,
             headers=DS_HEADERS,
@@ -2994,7 +2994,7 @@ def relogin(cfg: dict) -> dict | None:
 
         # 2. 创建新会话（iOS 随机指纹）
         auth_headers = {**DS_HEADERS, "authorization": f"Bearer {token}"}
-        session_resp = cffi_requests.post(
+        session_resp = _paced_post(
             "https://chat.deepseek.com/api/v0/chat_session/create",
             json={},
             headers=auth_headers,
@@ -3377,6 +3377,12 @@ class _IdleGuardedResponse:
 
     def __getattr__(self, item):
         return getattr(self._resp, item)
+
+
+def _paced_post(*args, **kwargs):
+    """登录/建会话等受控上游操作：走 login_slot 节流（独立闸门，不与聊天槽互相死锁）。"""
+    with login_slot():
+        return cffi_requests.post(*args, **kwargs)
 
 
 def cleanup_old_sessions():
@@ -3835,7 +3841,16 @@ async def chat(request: Request):
                         delta = obj.get("choices", [{}])[0].get("delta", {})
                         c = delta.get("content", "") or ""
                         r = delta.get("reasoning_content", "") or ""
-                        completion_text += (c + r)
+                        # 工具调用时正文常为空，arguments 才是真正的输出，必须计入 completion_tokens
+                        tc_text = ""
+                        for tc in delta.get("tool_calls") or []:
+                            fn = (tc or {}).get("function") or {}
+                            name = fn.get("name") or ""
+                            args = fn.get("arguments") or ""
+                            if isinstance(args, (dict, list)):
+                                args = json.dumps(args, ensure_ascii=False)
+                            tc_text += str(name) + str(args)
+                        completion_text += (c + r + tc_text)
                     except: pass
                 yield chunk
             add_usage(model, prompt_tokens, _count_tokens(completion_text))

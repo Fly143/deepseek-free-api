@@ -1,6 +1,6 @@
 """配置管理模块 — DeepSeek 多账号管理 + 轮询负载均衡
 
-敏感字段（token / password / cookie / headers / admin_password / mailcx_api_key）
+敏感字段（token / password / cookie / headers / admin_password / device_id）
 落盘时用 Fernet 加密，前缀 enc:v1:。密钥在同目录 .secret_key（已 gitignore）。
 旧明文配置可直接加载，下次 save 自动升级为密文。
 """
@@ -159,12 +159,7 @@ class ConfigManager:
         self._admin_password: str = "admin"
         self._compression_mode: str = DEFAULT_COMPRESSION_MODE
         # 批量注册：mail.cx 临时邮箱配置
-        self._mailcx_api_key: str = ""
-        self._mailcx_domain: str = ""
-        self._cloudmail_base_url = ""
-        self._cloudmail_token = ""
-        self._cloudmail_domain = ""
-        self._cloudmail_sender_domain = ""
+        # 注册/批量注册功能已在 v2.5.0 移除，对应的邮箱服务配置不再保留
         self.load()
 
     def _migrate_legacy(self):
@@ -229,12 +224,7 @@ class ConfigManager:
                 self._passthrough = data.get('passthrough', False)
                 self._compression_mode = data.get('compression_mode', DEFAULT_COMPRESSION_MODE)
                 self._admin_password = self.box.decrypt(data.get('admin_password', '') or '') or 'admin'
-                self._mailcx_api_key = self.box.decrypt(data.get('mailcx_api_key', '') or '')
-                self._mailcx_domain = data.get('mailcx_domain', '') or ''
-                self._cloudmail_base_url = data.get('cloudmail_base_url', '') or ''
-                self._cloudmail_token = self.box.decrypt(data.get('cloudmail_token', '') or '')
-                self._cloudmail_domain = data.get('cloudmail_domain', '') or ''
-                self._cloudmail_sender_domain = data.get('cloudmail_sender_domain', '') or ''
+                # v2.5.0：mailcx / cloudmail 字段已废弃，旧配置读取时忽略
         except Exception as e:
             print(f"[Config] 加载配置失败: {e}")
             self.accounts = []
@@ -250,12 +240,7 @@ class ConfigManager:
                     "passthrough": self._passthrough,
                     "compression_mode": self._compression_mode,
                     "admin_password": self.box.encrypt(self._admin_password or "admin"),
-                    "mailcx_api_key": self.box.encrypt(self._mailcx_api_key or ""),
-                    "mailcx_domain": self._mailcx_domain or "",
-                    "cloudmail_base_url": self._cloudmail_base_url or "",
-                    "cloudmail_token": self.box.encrypt(self._cloudmail_token or ""),
-                    "cloudmail_domain": self._cloudmail_domain or "",
-                    "cloudmail_sender_domain": self._cloudmail_sender_domain or "",
+                    # v2.5.0：mailcx / cloudmail 配置已随注册功能移除
                 }
                 with open(self.config_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
@@ -451,37 +436,5 @@ class ConfigManager:
     def count_valid(self) -> int:
         with self.lock:
             return sum(1 for a in self.accounts if a.is_valid)
-
-    def get_mailcx_api_key(self) -> str:
-        with self.lock:
-            return self._mailcx_api_key or ""
-
-    def set_mailcx_api_key(self, key: str):
-        with self.lock:
-            self._mailcx_api_key = (key or "").strip()
-            self.save()
-
-    def get_mailcx_domain(self) -> str:
-        with self.lock:
-            return self._mailcx_domain or ""
-
-    def set_mailcx_domain(self, domain: str):
-        with self.lock:
-            self._mailcx_domain = (domain or "").strip()
-            self.save()
-
-
-    def get_cloudmail_config(self):
-        with self.lock:
-            return {'base_url': self._cloudmail_base_url, 'token': self._cloudmail_token, 'domain': self._cloudmail_domain, 'sender_domain': self._cloudmail_sender_domain}
-
-    def set_cloudmail_config(self, base_url, token, domain, sender_domain):
-        with self.lock:
-            self._cloudmail_base_url = base_url
-            self._cloudmail_token = token
-            self._cloudmail_domain = domain
-            self._cloudmail_sender_domain = sender_domain
-            self.save()
-
 
 config_manager = ConfigManager()

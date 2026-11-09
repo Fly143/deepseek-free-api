@@ -166,7 +166,7 @@ python3 --version
 node --version
 
 # 2. 安装 Python 依赖
-pip install fastapi uvicorn curl-cffi python-dotenv
+pip install fastapi uvicorn curl-cffi python-dotenv tiktoken cryptography jsonschema
 
 # 3. 启动
 python3 proxy.py
@@ -583,11 +583,10 @@ DeepSeek 使用自定义算法 `DeepSeekHashV1`，本质是 SHA3-256 哈希碰�
 
 ## 会话和凭证
 
-聊天请求每次创建独立的上游对话；如果凭证失效，当前请求不会自动重新登录或重试。请在管理面板重新登录，或重新导入 cURL/Cookie 凭证。客户端每次请求都应发送所需历史消息，历史过长时仍可能被压缩或裁剪。新对话不会自动删除。
+聊天请求每次创建独立的上游对话；如果凭证失效，当前请求不会自动重新登录或重试。请在管理面板重新登录，或重新导入 cURL/Cookie 凭证。客户端每次请求都应发送所需历史消息，历史过长时仍可能被压缩或裁剪。新建的上游对话不会立即删除，过期（默认 3 天）后随清理任务回收。
 
-账号密码登录时，程序为每个账号保存并复用设备标识和请求头；管理面板也支持手动设置设备标识。程序生成的标识不是真实设备指纹，这些措施不能保证避免封号。
+账号密码登录时，程序为每个账号保存并复用设备标识和请求头；管理面板也支持手动设置设备标识。设备标识取自仓库共享的真实设备 ID 池，但不是本机指纹，这些措施不能保证避免封号。
 
-默认工具调用提示使用 `do:` 加 JSON，仍可解析旧格式。启用工具透传模式后，模型可自行选择工具调用格式。更改格式不能保证避免封号。
 
 ## 管理命令
 
@@ -668,7 +667,10 @@ Docker 示例使用持久卷保存配置和密钥，重建容器时请保留该�
 | `DEEPSEEK_MAX_CONCURRENT` | 受控上游操作的最大并发数，默认 `1` |
 | `DEEPSEEK_ERROR_COOLDOWN_SEC` | 一般错误后的账号冷却时间，默认 `60` 秒 |
 | `DEEPSEEK_SESSION_INVALID_COOLDOWN_SEC` | 会话失效后的账号冷却时间，默认 `300` 秒 |
-| `DEEPSEEK_AUTO_RELOGIN` | 其他路径的自动重登开关，默认启用；每次新建对话的聊天请求不会自动重登 |
+| `DEEPSEEK_AUTO_RELOGIN` | 自动重登开关，默认启用；v2.5.0 起聊天请求（/v1 全部路径）每次新建上游会话，命中会话失效时不再自动重登，改为冷却账号（默认 300 秒）；手动重登见管理面板 |
+| `DEEPSEEK_SLOT_WAIT_TIMEOUT_SEC` | 等待全局上游槽位的上限，默认 `600` 秒；超时返回 503（建会话/非流式阶段），不冷却账号 |
+| `DS_STREAM_IDLE_TIMEOUT` | 上游流读取空闲上限，默认 `300` 秒（总时长仍不限）；仅在未设置 `DS_CLIENT_TIMEOUT` 时生效 |
+| `DS_CLIENT_TIMEOUT` | 覆盖整个上游请求的超时（秒），默认 `0`=不限；设置后 `DS_STREAM_IDLE_TIMEOUT` 不再生效 |
 
 这些限制不覆盖所有上游操作，例如附件上传。公网部署应设置接口密钥，并配置 HTTPS 和其他访问控制。
 
@@ -677,7 +679,7 @@ Docker 示例使用持久卷保存配置和密钥，重建容器时请保留该�
 ### Python（pip）
 
 ```bash
-pip install fastapi uvicorn curl-cffi python-dotenv
+pip install fastapi uvicorn curl-cffi python-dotenv tiktoken cryptography jsonschema
 ```
 
 | 依赖 | 用途 |
@@ -686,6 +688,9 @@ pip install fastapi uvicorn curl-cffi python-dotenv
 | `uvicorn` | ASGI 服务器 |
 | `curl-cffi` | HTTP 客户端（模拟 Chrome TLS 指纹，绕过反爬） |
 | `python-dotenv` | 环境变量加载 |
+| `tiktoken` | 分词与用量统计 |
+| `cryptography` | config.json 敏感字段加密（Fernet） |
+| `jsonschema` | 工具参数结构校验 |
 
 ### 系统
 

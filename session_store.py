@@ -7,7 +7,10 @@ vision 模式会创建新 session。此模块追踪新旧 session 以便后续�
 - 旧 session：记录被替换的 session_id + 时间，供定时清理
 """
 
+import atexit
 import json
+import os
+import threading
 import time
 from pathlib import Path
 
@@ -23,13 +26,20 @@ def _load() -> dict:
     if not SESSION_FILE.exists():
         return {}
     try:
-        return json.loads(SESSION_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
+        return json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
 
 
+_file_lock = threading.RLock()
+
+
 def _save(data: dict) -> None:
-    SESSION_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    """原子写入：先写临时文件再替换，避免并发读/写读到半个文件。"""
+    with _file_lock:  # RLock：允许在已持锁的调用方内部重入
+        tmp = SESSION_FILE.with_name(SESSION_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, SESSION_FILE)
 
 
 def needs_renewal(account_id: str = "default") -> bool:
@@ -123,6 +133,72 @@ def add_tokens(account_id: str, session_id: str, prompt_tokens: int) -> None:
             "last_used": now,
         }
     _save({**db, key: s})
+
+
+# ── 请求级会话登记（每次聊天新建，不参与 token 计数 / needs_renewal）──
+TRANSIENT_MAX = 2000
+_transient_buffer: list = []
+_transient_lock = threading.Lock()
+
+
+def _flush_transient_locked(batch: list) -> None:
+    """在文件锁内做整文件读改写，避免并发 flush 相互覆盖。"""
+    with _file_lock:
+        db = _load()
+        items = db.get("transient_sessions") or []
+        items.extend(batch)
+        if len(items) > TRANSIENT_MAX:
+            # 只保留最新的记录；更旧的会话已无法追踪，打日志便于排查
+            print(f"[Session] transient 记录超过上限 {TRANSIENT_MAX}，丢弃最旧 {len(items) - TRANSIENT_MAX} 条")
+        db["transient_sessions"] = items[-TRANSIENT_MAX:]
+        _save(db)
+
+
+def register_transient_session(account_id: str, session_id: str) -> None:
+    """登记请求级会话；攒够 20 条再落盘，避免每个请求都写 sessions.json。"""
+    with _transient_lock:
+        _transient_buffer.append({"account": account_id, "session_id": session_id, "created": time.time()})
+        if len(_transient_buffer) < 20:
+            return
+        batch = _transient_buffer[:]
+        _transient_buffer.clear()
+    _flush_transient_locked(batch)
+
+
+def flush_transient_sessions() -> None:
+    """把缓冲中的请求级会话立即写盘（进程退出/测试用）。"""
+    with _transient_lock:
+        if not _transient_buffer:
+            return
+        batch = _transient_buffer[:]
+        _transient_buffer.clear()
+    _flush_transient_locked(batch)
+
+
+def get_expired_transient_sessions(ttl_days: int = SESSION_TTL_DAYS) -> list:
+    """返回超过 TTL 的请求级会话 [(account, session_id, "", days_ago), ...]。"""
+    db = _load()
+    now = time.time()
+    threshold = ttl_days * 86400
+    out = []
+    for item in db.get("transient_sessions") or []:
+        created = item.get("created")
+        created = now if created is None else float(created)
+        age = now - created
+        if age > threshold:
+            out.append((item.get("account", ""), item.get("session_id", ""), "", round(age / 86400, 1)))
+    return out
+
+
+def remove_transient_session(session_id: str) -> None:
+    with _file_lock:
+        db = _load()
+        items = db.get("transient_sessions") or []
+        db["transient_sessions"] = [i for i in items if i.get("session_id") != session_id]
+        _save(db)
+
+
+atexit.register(flush_transient_sessions)
 
 
 def get_expired_sessions(account_id: str = None, ttl_days: int = SESSION_TTL_DAYS) -> list:

@@ -2,7 +2,7 @@
 DeepSeek 网页 → API 代理（纯 HTTP 转发，无浏览器依赖）
 用法: python proxy.py → 打开 http://localhost:8000/admin → 粘贴 cURL → 保存 → 用
 """
-import asyncio, json, os, shlex, time, uuid, webbrowser, base64, re, secrets
+import asyncio, json, os, shlex, threading, time, uuid, webbrowser, base64, re, secrets
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,9 @@ def _count_tokens(text: str) -> int:
 
 # ── 用量统计 ───────────────────────────────────
 from usage_store import add_usage, get_usage, clear_usage
-from session_store import needs_renewal, on_new_session, add_tokens, get_usage_status, get_expired_sessions, remove_old_session
+from session_store import (needs_renewal, on_new_session, add_tokens, get_usage_status, get_expired_sessions,
+                           remove_old_session, register_transient_session, get_expired_transient_sessions,
+                           remove_transient_session)
 from response_store import save_response_record, get_response_record, delete_response_record, update_response_record
 
 # ── 工具调用处理模块 ─────────────────────────────────
@@ -49,7 +51,7 @@ CONFIG_FILE = BASE_DIR / "config.json"
 
 # 多账号管理
 from app.config import config_manager, DsAccount
-from app.lock_guard import upstream_slot, ERROR_COOLDOWN_SEC, SESSION_INVALID_COOLDOWN_SEC
+from app.lock_guard import upstream_slot, UpstreamBusy, ERROR_COOLDOWN_SEC, SESSION_INVALID_COOLDOWN_SEC
 from app.auth import verify_admin
 from app.identity import random_ios_headers, new_device_id
 from app.tool_choice import select_tools
@@ -83,6 +85,14 @@ try:
 except ValueError:
     _to_f = 0.0
 CHAT_TIMEOUT = None if _to_f <= 0 else _to_f
+# 读空闲上限：总时长不限（思考+输出纯透传）时，仍需一个“多久没收到字节即判死”的上限，
+# 否则上游 TCP 卡死会让整条流永久占住上游槽（Semaphore），把后面所有请求挂死。
+_IDLE_TO = (os.getenv("DS_STREAM_IDLE_TIMEOUT", "300") or "300").strip()
+try:
+    STREAM_IDLE_TIMEOUT = float(_IDLE_TO)
+except ValueError:
+    STREAM_IDLE_TIMEOUT = 300.0
+CHAT_REQUEST_TIMEOUT = CHAT_TIMEOUT if CHAT_TIMEOUT else (15, STREAM_IDLE_TIMEOUT)
 RETRY_MAX_ATTEMPTS = int(os.getenv("DS_RETRY_MAX_ATTEMPTS", "3"))
 RETRY_BASE_DELAY = float(os.getenv("DS_RETRY_BASE_DELAY", "1.0"))
 RETRY_MAX_DELAY = float(os.getenv("DS_RETRY_MAX_DELAY", "10.0"))
@@ -1515,7 +1525,7 @@ app.add_middleware(
 @app.middleware("http")
 async def _authenticate_api(request: Request, call_next):
     path = request.scope.get("path", "")
-    key = os.getenv("DEEPSEEK_PROXY_API_KEY", "")
+    key = os.getenv("DEEPSEEK_PROXY_API_KEY", "").strip()
     preflight = request.method == "OPTIONS" and request.headers.get("origin") and request.headers.get("access-control-request-method")
     if key and not preflight and (path == "/v1" or path.startswith("/v1/")):
         authorization = request.headers.get("authorization", "")
@@ -1549,6 +1559,8 @@ app.include_router(_anthropic_router)
 @app.on_event("startup")
 async def startup_discover():
     """启动时自动刷新模型列表，延迟清理过期会话（后台线程，避免风控）。"""
+    if not os.getenv("DEEPSEEK_PROXY_API_KEY", "").strip():
+        print("[启动] 警告：未设置 DEEPSEEK_PROXY_API_KEY —— /v1 接口不鉴权；公网部署请配置密钥并启用 HTTPS")
     print("[启动] 探测模型列表...")
     _discover_models()
     print("[启动] 后台清理过期会话...")
@@ -2225,6 +2237,8 @@ async def deepseek_login(data: dict, creds: HTTPBasicCredentials = Depends(verif
                 existing.headers = dict(DS_HEADERS)
             config_manager.save()
     login_payload["device_id"] = device_id
+    # 登录体的 os 与请求头指纹保持一致：web 头配 os=web，其余按 ios
+    login_payload["os"] = "web" if (DS_HEADERS.get("x-client-platform") or "").lower() == "web" else "ios"
     DS_HEADERS.pop("authorization", None)
     DS_HEADERS.pop("x-ds-pow-response", None)
 
@@ -2507,7 +2521,7 @@ async def clear_usage_stats(creds: HTTPBasicCredentials = Depends(verify_admin))
 async def manual_cleanup(creds: HTTPBasicCredentials = Depends(verify_admin)):
     """手动触发会话清理。"""
     try:
-        cleanup_old_sessions()
+        await asyncio.to_thread(cleanup_old_sessions)
         return {"ok": True, "msg": "清理完成"}
     except Exception as e:
         return {"ok": False, "msg": str(e)}
@@ -2929,6 +2943,8 @@ def relogin(cfg: dict) -> dict | None:
                 existing.headers = dict(DS_HEADERS)
             config_manager.save()
     login_payload["device_id"] = device_id
+    # 登录体的 os 与请求头指纹保持一致：web 头配 os=web，其余按 ios
+    login_payload["os"] = "web" if (DS_HEADERS.get("x-client-platform") or "").lower() == "web" else "ios"
     DS_HEADERS.pop("authorization", None)
     DS_HEADERS.pop("x-ds-pow-response", None)
 
@@ -3158,8 +3174,16 @@ def create_request_session(cfg: dict) -> dict:
             session_id = chat_session.get("id") or biz.get("id")
             if not isinstance(session_id, str) or not session_id.strip():
                 raise ValueError("missing session id")
+            # 登记请求级会话，供 cleanup_old_sessions 按 TTL 回收（此前从不登记 → 上游会话无限增长）
+            if label:
+                try:
+                    register_transient_session(label, session_id)
+                except Exception:
+                    pass
     except HTTPException:
         raise
+    except UpstreamBusy as exc:
+        raise HTTPException(503, detail={"error": {"message": str(exc), "type": "upstream_busy"}}) from exc
     except Exception as exc:
         if label:
             try:
@@ -3171,16 +3195,19 @@ def create_request_session(cfg: dict) -> dict:
 
 
 def run_chat_with_slot(*args, **kwargs):
-    with upstream_slot():
-        cfg = args[0]
-        label = cfg.get("account_label")
-        if label:
-            with config_manager.lock:
-                account = config_manager.get_account_by_label(label)
-                now = time.time()
-                if not account or not account.is_valid or float(account.muted_until or 0) > now or float(account.cooldown_until or 0) > now:
-                    raise HTTPException(503, detail={"error": {"message": "账号当前不可用，请稍后重试", "type": "account_unavailable"}})
-        return _do_chat(*args, **kwargs)
+    try:
+        with upstream_slot():
+            cfg = args[0]
+            label = cfg.get("account_label")
+            if label:
+                with config_manager.lock:
+                    account = config_manager.get_account_by_label(label)
+                    now = time.time()
+                    if not account or not account.is_valid or float(account.muted_until or 0) > now or float(account.cooldown_until or 0) > now:
+                        raise HTTPException(503, detail={"error": {"message": "账号当前不可用，请稍后重试", "type": "account_unavailable"}})
+            return _do_chat(*args, **kwargs)
+    except UpstreamBusy as exc:
+        raise HTTPException(503, detail={"error": {"message": str(exc), "type": "upstream_busy"}}) from exc
 
 
 def get_pow_response(target_path: str = "/api/v0/chat/completion",
@@ -3304,14 +3331,64 @@ def _delete_deepseek_session(token: str, session_id: str) -> bool:
         return False
 
 
+class _IdleGuardedResponse:
+    """包装 curl_cffi 流式响应：超过 idle 秒没有新数据就关闭连接。
+
+    curl_cffi 的 timeout 只在收到响应头之前生效，stream 迭代阶段没有超时；
+    这里用守护线程兜底，避免一条卡死的流永久占住全局上游槽。
+    """
+
+    def __init__(self, resp, idle_sec: float):
+        self._resp = resp
+        self._idle = max(1.0, float(idle_sec or 0))
+        self._last = time.time()
+        self._done = False
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+
+    def _watch(self):
+        step = min(1.0, max(0.2, self._idle / 5))
+        while not self._done:
+            time.sleep(step)
+            if self._done:
+                return
+            if time.time() - self._last > self._idle:
+                try:
+                    self._resp.close()
+                except Exception:
+                    pass
+                return
+
+    def iter_content(self, *args, **kwargs):
+        try:
+            for chunk in self._resp.iter_content(*args, **kwargs):
+                self._last = time.time()
+                yield chunk
+        finally:
+            self._done = True
+
+    def iter_lines(self, *args, **kwargs):
+        try:
+            for line in self._resp.iter_lines(*args, **kwargs):
+                self._last = time.time()
+                yield line
+        finally:
+            self._done = True
+
+    def __getattr__(self, item):
+        return getattr(self._resp, item)
+
+
 def cleanup_old_sessions():
     """清理所有账号中过期的旧会话。每次删除后等待 3 秒，避免触发风控。"""
     expired = get_expired_sessions()
-    if not expired:
+    transient = get_expired_transient_sessions()
+    if not expired and not transient:
         return
 
-    print(f"[Cleanup] Found {len(expired)} expired sessions, deleting with 3s delay...")
     deleted = 0
+    if expired:
+        print(f"[Cleanup] Found {len(expired)} expired sessions, deleting with 3s delay...")
     for account_label, session_id, model, days_ago in expired:
         token = config_manager.get_token(account_label)
         if not token:
@@ -3321,8 +3398,23 @@ def cleanup_old_sessions():
             deleted += 1
             print(f"[Cleanup] Deleted: {session_id[:12]}... ({days_ago}d old)")
         time.sleep(10)
+    # 请求级会话（每次聊天新建）：每轮最多清 20 个，避免一次启动长时间占用账号
+    if transient:
+        print(f"[Cleanup] 请求级会话过期 {len(transient)} 个，本轮清理前 20 个...")
+        for account_label, session_id, _model, days_ago in transient[:20]:
+            token = config_manager.get_token(account_label)
+            if not token:
+                # 账号已删除/无凭证：本地记录超过 2×TTL 后直接淘汰，避免永久占坑
+                if days_ago > SESSION_TTL_DAYS * 2:
+                    remove_transient_session(session_id)
+                continue
+            if _delete_deepseek_session(token, session_id) or days_ago > SESSION_TTL_DAYS * 2:
+                remove_transient_session(session_id)
+                deleted += 1
+                print(f"[Cleanup] Deleted transient: {session_id[:12]}... ({days_ago}d old)")
+            time.sleep(3)
     if deleted:
-        print(f"[Cleanup] Done: {deleted}/{len(expired)} deleted")
+        print(f"[Cleanup] Done: {deleted}/{len(expired) + len(transient[:20])} deleted")
 
 
 def fork_file_to_vision(cfg: dict, file_id: str) -> str | None:
@@ -3720,7 +3812,7 @@ async def chat(request: Request):
     except HTTPException as he:
         detail = he.detail if isinstance(he.detail, dict) else {}
         err = (detail.get("error") or {}) if isinstance(detail, dict) else {}
-        if err.get("type") == "account_muted" or err.get("code") == "account_muted":
+        if err.get("type") in ("account_muted", "upstream_busy") or err.get("code") == "account_muted":
             raise
         try:
             config_manager.mark_account_cooldown(account_label, ERROR_COOLDOWN_SEC)
@@ -4826,6 +4918,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                         raise
             if resp is None:
                 raise last_err or RuntimeError("chat stream request failed")
+            resp = _IdleGuardedResponse(resp, STREAM_IDLE_TIMEOUT)
 
             if ref_file_ids or thinking_enabled:
                 _vlog(f"chat stream response: status={resp.status_code} ct={resp.headers.get('content-type','?')} model={model} thinking={thinking_enabled}")
@@ -4938,6 +5031,14 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                                 al = cfg.get("account_label", "") or cfg.get("account", "")
                                 if al:
                                     config_manager.mark_account_cooldown(al, SESSION_INVALID_COOLDOWN_SEC)
+                        # 上游中途报错：先把筛分器里已收到但尚未流出的正文发出去，再报错
+                        for _pending_evt in sieve.flush():
+                            if _pending_evt.type == "text" and isinstance(_pending_evt.data, str):
+                                _pending_txt = clean_tool_text(sanitize_leaked_output(_pending_evt.data))
+                                if _pending_txt:
+                                    content_buffer.append(_pending_txt)
+                        for chunk in _flush_content_buffer():
+                            yield chunk
                         yield f'data: {json.dumps({"error": {"message": val["message"], "type": "server_error", "code": val.get("code")}})}\n\n'
                         yield "data: [DONE]\n\n"
                         return
@@ -5079,6 +5180,7 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
                         raise
             if resp is None:
                 raise last_err or RuntimeError("chat request failed")
+            resp = _IdleGuardedResponse(resp, STREAM_IDLE_TIMEOUT)
 
             if ref_file_ids or thinking_enabled:
                 _vlog(f"chat nonstream(stream-internal) response: status={resp.status_code} ct={resp.headers.get('content-type','?')}")
@@ -5244,55 +5346,59 @@ def _do_chat(cfg, prompt, model, thinking_enabled, search_enabled, stream, is_re
         #   导致 yield from body_iterator 报 'async_generator' object is not iterable）
         _raw_gen = do_stream()
         def guarded_stream():
-            with upstream_slot():
-                label = cfg.get("account_label") or cfg.get("account")
-                snapshot = None
-                if label:
-                    with config_manager.lock:
-                        account = config_manager.get_account_by_label(label)
-                        now = time.time()
-                        unavailable = not account or not account.is_valid or float(account.muted_until or 0) > now or float(account.cooldown_until or 0) > now
-                        if not unavailable:
-                            snapshot = (account.cooldown_until, account.muted_until, account.consecutive_errors, account.is_valid)
-                    if unavailable:
-                        yield f'data: {json.dumps({"error": {"message": "账号当前不可用，请稍后重试", "type": "account_unavailable"}}, ensure_ascii=False)}\n\n'
-                        yield "data: [DONE]\n\n"
-                        return
-                failed = False
-                completed = False
-                has_output = False
-                for chunk in _raw_gen:
-                    for line in chunk.splitlines():
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if payload == "[DONE]":
-                            completed = True
-                            continue
-                        try:
-                            data = json.loads(payload)
-                        except (ValueError, TypeError):
-                            continue
-                        if not isinstance(data, dict):
-                            continue
-                        if "error" in data:
-                            failed = True
-                            if label:
-                                with config_manager.lock:
-                                    account = config_manager.get_account_by_label(label)
-                                    if account and account.is_valid and float(account.muted_until or 0) <= time.time():
-                                        cooldown = max(ERROR_COOLDOWN_SEC, float(account.cooldown_until or 0) - time.time())
-                                        config_manager.mark_account_cooldown(label, cooldown)
-                        for choice in data.get("choices", []):
-                            delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
-                            if isinstance(delta, dict) and any(delta.get(k) for k in ("content", "reasoning_content", "tool_calls")):
-                                has_output = True
-                    yield chunk
-                if label and completed and has_output and not failed:
-                    with config_manager.lock:
-                        account = config_manager.get_account_by_label(label)
-                        if account and snapshot == (account.cooldown_until, account.muted_until, account.consecutive_errors, account.is_valid):
-                            config_manager.mark_account_ok(label)
+            try:
+                with upstream_slot():
+                    label = cfg.get("account_label") or cfg.get("account")
+                    snapshot = None
+                    if label:
+                        with config_manager.lock:
+                            account = config_manager.get_account_by_label(label)
+                            now = time.time()
+                            unavailable = not account or not account.is_valid or float(account.muted_until or 0) > now or float(account.cooldown_until or 0) > now
+                            if not unavailable:
+                                snapshot = (account.cooldown_until, account.muted_until, account.consecutive_errors, account.is_valid)
+                        if unavailable:
+                            yield f'data: {json.dumps({"error": {"message": "账号当前不可用，请稍后重试", "type": "account_unavailable"}}, ensure_ascii=False)}\n\n'
+                            yield "data: [DONE]\n\n"
+                            return
+                    failed = False
+                    completed = False
+                    has_output = False
+                    for chunk in _raw_gen:
+                        for line in chunk.splitlines():
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if payload == "[DONE]":
+                                completed = True
+                                continue
+                            try:
+                                data = json.loads(payload)
+                            except (ValueError, TypeError):
+                                continue
+                            if not isinstance(data, dict):
+                                continue
+                            if "error" in data:
+                                failed = True
+                                if label:
+                                    with config_manager.lock:
+                                        account = config_manager.get_account_by_label(label)
+                                        if account and account.is_valid and float(account.muted_until or 0) <= time.time():
+                                            cooldown = max(ERROR_COOLDOWN_SEC, float(account.cooldown_until or 0) - time.time())
+                                            config_manager.mark_account_cooldown(label, cooldown)
+                            for choice in data.get("choices", []):
+                                delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+                                if isinstance(delta, dict) and any(delta.get(k) for k in ("content", "reasoning_content", "tool_calls")):
+                                    has_output = True
+                        yield chunk
+                    if label and completed and has_output and not failed:
+                        with config_manager.lock:
+                            account = config_manager.get_account_by_label(label)
+                            if account and snapshot == (account.cooldown_until, account.muted_until, account.consecutive_errors, account.is_valid):
+                                config_manager.mark_account_ok(label)
+            except UpstreamBusy as exc:
+                yield 'data: ' + json.dumps({"error": {"message": str(exc), "type": "upstream_busy"}}, ensure_ascii=False) + '\n\n'
+                yield "data: [DONE]\n\n"
         _sr = StreamingResponse(guarded_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
         _sr._raw_stream_gen = _raw_gen

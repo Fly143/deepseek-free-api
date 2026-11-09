@@ -191,6 +191,7 @@ def _resolve_tool_name(name: str, tool_names: List[str]) -> str:
 def parse_dsml_tool_calls(
     text: str,
     tool_names: Optional[List[str]] = None,
+    string_keys: Optional[set] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
     if not text:
         return [], text
@@ -216,8 +217,8 @@ def parse_dsml_tool_calls(
         for m in invoke_bare.finditer(normalized):
             name = m.group(1).strip()
             inner = m.group(2)
-            args = _parse_parameters(inner)
             resolved = _resolve_tool_name(name, tool_names or [])
+            args = _parse_parameters(inner, _keys_for(string_keys, resolved or name))
             tc = _format_openai_tool_call(resolved, args)
             if tc:
                 tool_calls.append(tc)
@@ -230,8 +231,8 @@ def parse_dsml_tool_calls(
         for m in invoke_pattern.finditer(block_text):
             name = m.group(1).strip()
             inner = m.group(2)
-            args = _parse_parameters(inner)
             resolved = _resolve_tool_name(name, tool_names or [])
+            args = _parse_parameters(inner, _keys_for(string_keys, resolved or name))
             tc = _format_openai_tool_call(resolved, args)
             if tc:
                 tool_calls.append(tc)
@@ -240,7 +241,23 @@ def parse_dsml_tool_calls(
     return tool_calls, cleaned
 
 
-def _parse_parameters(inner_text: str) -> Dict[str, Any]:
+def _keys_for(string_keys, name: str) -> set:
+    """string_keys 可以是 set（旧行为）或 {工具名: set} 映射；映射找不到就回退空集。"""
+    if not string_keys:
+        return set()
+    if isinstance(string_keys, set):
+        return string_keys
+    keys = set(string_keys.get(name) or ())
+    if not keys:
+        low = (name or "").lower()
+        for tool_name, value in string_keys.items():
+            if str(tool_name).lower() == low:
+                keys = set(value or ())
+                break
+    return keys
+
+
+def _parse_parameters(inner_text: str, string_keys: Optional[set] = None) -> Dict[str, Any]:
     args: Dict[str, Any] = {}
     param_pattern = re.compile(
         r"<parameter\s+name=[\"']([^\"']+)[\"']>(.*?)</parameter>",
@@ -252,16 +269,26 @@ def _parse_parameters(inner_text: str) -> Dict[str, Any]:
         wcd = val_raw.startswith(_CDATA_OPEN) and val_raw.endswith(_CDATA_CLOSE)
         if wcd: val_raw = _extract_cdata_safe_dsml(val_raw)
         else: val_raw = extract_cdata(val_raw)
-        if wcd and _preserves_cdata_dsml(key):
+        if string_keys and key in string_keys:  # 声明为 string（含 nullable）的参数保留原文
+            # 保留 123 / true / null 这类文本原样（避免被 _auto_type 改型）；带引号的 JSON 字符串去掉一层引号
+            _raw_string = _html_unescape_dsml(_normalize_br_dsml(val_raw) if wcd else val_raw)
+            _stripped = _raw_string.strip()
+            if len(_stripped) >= 2 and _stripped.startswith('"') and _stripped.endswith('"'):
+                try:
+                    _raw_string = json.loads(_stripped)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            val = _raw_string
+        elif wcd and _preserves_cdata_dsml(key):
             val = _html_unescape_dsml(val_raw)
         else:
             if wcd: val_raw = _normalize_br_dsml(val_raw)
             try: val = json.loads(val_raw)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 rep = _repair_loose_json_dsml(val_raw)
                 if rep != val_raw:
                     try: val = json.loads(rep)
-                    except (json.JSONDecodeError, ValueError): val = _auto_type(val_raw)
+                    except (json.JSONDecodeError, ValueError, RecursionError): val = _auto_type(val_raw)
                 else: val = _auto_type(val_raw)
             if isinstance(val, str): val = _html_unescape_dsml(val)
         if key in args:

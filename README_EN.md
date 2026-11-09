@@ -173,7 +173,7 @@ python3 --version
 node --version
 
 # 2. Install Python dependencies
-pip install fastapi uvicorn curl-cffi python-dotenv
+pip install fastapi uvicorn curl-cffi python-dotenv tiktoken cryptography jsonschema
 
 # 3. Start
 python3 proxy.py
@@ -594,11 +594,10 @@ DeepSeek uses a custom `DeepSeekHashV1` algorithm, essentially SHA3-256 hash col
 
 ## Sessions and credentials
 
-Each chat request creates a separate upstream conversation. When credentials expire, the request does not automatically re-login or retry. Re-login in the admin panel or re-import cURL/Cookie credentials. Clients must send the history needed for each request; long histories may still be compressed or trimmed. New conversations are not deleted automatically.
+Each chat request creates a separate upstream conversation. When credentials expire, the request does not automatically re-login or retry. Re-login in the admin panel or re-import cURL/Cookie credentials. Clients must send the history needed for each request; long histories may still be compressed or trimmed. Newly created upstream conversations are not deleted immediately — they are reclaimed by the cleanup task after they expire (3 days by default).
 
-For password login, the proxy saves and reuses an account-specific device ID and request headers. The admin panel also accepts a manually supplied device ID. A generated ID is not a real device fingerprint, and these measures do not guarantee protection from account bans.
+For password login, the proxy saves and reuses an account-specific device ID and request headers. The admin panel also accepts a manually supplied device ID. Device IDs come from the shared real-device ID pool shipped with the repo; they are not this machine's fingerprint, and these measures do not guarantee protection from account bans.
 
-The default tool prompt uses `do:` followed by JSON and still parses older formats. Tool passthrough mode lets the model choose its format. Changing formats does not guarantee protection from account bans.
 
 ## Management Commands
 
@@ -682,7 +681,10 @@ The Docker example uses a persistent volume for both the configuration and key; 
 | `DEEPSEEK_MAX_CONCURRENT` | Maximum concurrent controlled upstream operations; default `1` |
 | `DEEPSEEK_ERROR_COOLDOWN_SEC` | Account cooldown after a general error; default `60` seconds |
 | `DEEPSEEK_SESSION_INVALID_COOLDOWN_SEC` | Account cooldown after session invalidation; default `300` seconds |
-| `DEEPSEEK_AUTO_RELOGIN` | Auto-relogin for other paths; enabled by default, but disabled for chat requests with a new conversation |
+| `DEEPSEEK_AUTO_RELOGIN` | Auto-relogin switch, enabled by default; since v2.5.0 every chat request creates a fresh upstream session, so session-invalid responses are no longer auto-relogged — the account is cooled down instead (300s default). Use the admin panel to relogin manually |
+| `DEEPSEEK_SLOT_WAIT_TIMEOUT_SEC` | Max wait for the global upstream slot; default `600` seconds. Returns 503 (session creation / non-stream) on timeout without cooling the account |
+| `DS_STREAM_IDLE_TIMEOUT` | Upstream read-idle limit; default `300` seconds (total duration stays unlimited). Only used when `DS_CLIENT_TIMEOUT` is unset |
+| `DS_CLIENT_TIMEOUT` | Total upstream request timeout in seconds; default `0` = unlimited. When set, `DS_STREAM_IDLE_TIMEOUT` no longer applies |
 
 These controls do not cover every upstream operation, such as attachment uploads. For public deployment, set an API key and configure HTTPS and access controls.
 
@@ -691,7 +693,7 @@ These controls do not cover every upstream operation, such as attachment uploads
 ### Python (pip)
 
 ```bash
-pip install fastapi uvicorn curl-cffi python-dotenv
+pip install fastapi uvicorn curl-cffi python-dotenv tiktoken cryptography jsonschema
 ```
 
 | Dependency | Purpose |
@@ -700,6 +702,9 @@ pip install fastapi uvicorn curl-cffi python-dotenv
 | `uvicorn` | ASGI server |
 | `curl-cffi` | HTTP client (emulates Chrome TLS fingerprint, bypasses anti-bot) |
 | `python-dotenv` | Environment variable loading |
+| `tiktoken` | Tokenization and usage accounting |
+| `cryptography` | Fernet encryption of sensitive fields in config.json |
+| `jsonschema` | Tool argument schema validation |
 
 ### System
 

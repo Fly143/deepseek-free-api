@@ -18,7 +18,16 @@ from tool_dsml import (
     format_tool_calls_for_prompt,
     build_dsml_tool_prompt,
     sanitize_loose_cdata,
+    extract_cdata,
 )
+
+_MARKER_BREAK_RE = re.compile(r"<(?=[|｜])")
+
+
+def escape_session_markers(text: str) -> str:
+    """把工具输出里的 <| / <｜ 打断，防止伪造 <｜System｜> 等会话分隔标记注入提示词。"""
+    return _MARKER_BREAK_RE.sub("<\u200b", text)
+
 
 __all__ = [
     "build_tool_prompt",
@@ -155,6 +164,82 @@ def _placeholder_call(name, command, tool_names, tools):
     return normalize_tool_call({"name": name, "arguments": args})
 
 
+def _is_string_schema(spec) -> bool:
+    """判断参数 schema 是否声明为 string（含 ["string","null"] 这类 nullable/联合形式）。"""
+    if not isinstance(spec, dict):
+        return False
+    declared = spec.get("type")
+    if declared == "string":
+        return True
+    if isinstance(declared, list) and "string" in declared:
+        return True
+    for key in ("anyOf", "oneOf"):
+        options = spec.get(key)
+        if isinstance(options, list) and any(_is_string_schema(opt) for opt in options):
+            return True
+    return False
+
+
+def _code_ranges(text: str) -> list:
+    """返回代码区行范围：围栏块（≤4 空格/tab 缩进）+ 4 空格/tab 缩进的缩进代码块。"""
+    ranges = []
+    fence_start = None
+    fence_char = ""
+    fence_len = 0
+    offset = 0
+    indented_start = None
+    for line in text.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        marker = re.match(r"^[ \t]{0,4}(`{3,}|~{3,})", line)
+        if fence_start is not None:
+            if (marker and marker.group(1)[0] == fence_char and len(marker.group(1)) >= fence_len
+                    and not line[marker.end():].strip()):
+                ranges.append((fence_start, offset + len(line)))
+                fence_start = None
+            offset += len(line)
+            continue
+        if marker:
+            fence_start = offset
+            fence_char = marker.group(1)[0]
+            fence_len = len(marker.group(1))
+            if indented_start is not None:
+                ranges.append((indented_start, offset))
+                indented_start = None
+        elif stripped.startswith("    ") or stripped.startswith("\t"):
+            if indented_start is None:
+                indented_start = offset
+        else:
+            if indented_start is not None:
+                ranges.append((indented_start, offset))
+                indented_start = None
+        offset += len(line)
+    if fence_start is not None:
+        ranges.append((fence_start, len(text)))
+    if indented_start is not None:
+        ranges.append((indented_start, len(text)))
+    return ranges
+
+
+def _declared_string_keys(tools) -> dict:
+    """按工具名收集声明为 string 的参数名：{工具名: {参数名}}，供 DSML 解析保留原始文本。"""
+    mapping: dict = {}
+    if not isinstance(tools, list):
+        return mapping
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = function.get("name")
+        params = function.get("parameters")
+        props = params.get("properties") if isinstance(params, dict) else None
+        if not isinstance(name, str) or not isinstance(props, dict):
+            continue
+        keys = {key for key, spec in props.items() if _is_string_schema(spec)}
+        if keys:
+            mapping[name] = keys
+    return mapping
+
+
 def _validate_tool_calls(calls, tools):
     if tools is None:
         return calls
@@ -189,7 +274,8 @@ def _validate_tool_calls(calls, tools):
         try:
             function = call["function"]
             definition = definitions[function["name"]]
-            schema = definition["parameters"]
+            declared_params = definition.get("parameters")
+            schema = {} if declared_params is None else declared_params
             if not isinstance(schema, (dict, bool)):
                 raise ValueError("invalid schema")
             check_references(schema)
@@ -219,23 +305,7 @@ def extract_tool_call(
 
     text = text.replace("\x00", "")
 
-    fence_ranges = []
-    fence_start = None
-    fence_char = ""
-    fence_length = 0
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        marker = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})", line)
-        if marker:
-            value = marker.group(1)
-            if fence_start is None:
-                fence_start, fence_char, fence_length = offset, value[0], len(value)
-            elif value[0] == fence_char and len(value) >= fence_length and not line[marker.end():].strip():
-                fence_ranges.append((fence_start, offset + len(line)))
-                fence_start = None
-        offset += len(line)
-    if fence_start is not None:
-        fence_ranges.append((fence_start, len(text)))
+    fence_ranges = _code_ranges(text)
 
     native_start = "<|begin_of_tool_calls_begin|>"
     native_call = "<|begin_of_tool_call_begin|>"
@@ -243,7 +313,7 @@ def extract_tool_call(
     native_key = "<|begin_of_tool_call_arg_key|>"
     native_call_end = "<|begin_of_tool_call_end|>"
     native_end = "<|begin_of_tool_calls_end|>"
-    for header in re.finditer(r"(?m)^[ \t]*" + re.escape(native_start), text):
+    for header in re.finditer(r"(?m)^ {0,3}" + re.escape(native_start), text):
         if any(start <= header.start() < end for start, end in fence_ranges):
             continue
         if not isinstance(tools, list):
@@ -281,6 +351,8 @@ def extract_tool_call(
                 raise ToolFormatError("工具未声明，请按工具定义重新生成调用。")
             schema = definitions[name].get("parameters")
             properties = schema.get("properties") if isinstance(schema, dict) else None
+            if properties is None:
+                properties = {}  # 零参数工具：parameters 省略 / null / 空对象
             if not isinstance(properties, dict):
                 raise ToolFormatError("无法验证工具参数，请按 do JSON 格式重新生成调用。")
             position = name_end + len(native_sep)
@@ -304,12 +376,13 @@ def extract_tool_call(
                 value_end = min(next_key, next_end) if next_key >= 0 else next_end
                 value = text[position:value_end]
                 kind = field.get("type")
-                if kind == "string":
-                    arguments[key] = value
+                if _is_string_schema(field):
+                    arguments[key] = extract_cdata(sanitize_loose_cdata(value)).strip()
                 elif kind in ("integer", "number", "boolean", "null", "object", "array"):
+                    raw_value = extract_cdata(sanitize_loose_cdata(value)).strip()
                     try:
-                        arguments[key] = json.loads(value, parse_constant=_reject_json_constant)
-                    except (json.JSONDecodeError, ValueError) as exc:
+                        arguments[key] = json.loads(raw_value, parse_constant=_reject_json_constant)
+                    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
                         raise ToolFormatError("工具参数格式无效，请按工具定义重新生成调用。") from exc
                 else:
                     raise ToolFormatError("工具参数类型无法确认，请按 do JSON 格式重新生成调用。")
@@ -318,7 +391,7 @@ def extract_tool_call(
             calls.append(normalize_tool_call({"name": name, "arguments": arguments}))
 
     decoder = json.JSONDecoder(parse_constant=_reject_json_constant)
-    json_header = re.compile(r"(?im)^[ \t]*<[|｜]\s*DSML\s*[|｜]\s*tool_calls\s*>")
+    json_header = re.compile(r"(?im)^ {0,3}<[|｜]\s*DSML\s*[|｜]\s*tool_calls\s*>")
     json_closer = re.compile(r"</[|｜]?\s*DSML\s*[|｜]\s*tool_calls\s*>", re.IGNORECASE)
     for header in json_header.finditer(text):
         if any(start <= header.start() < end for start, end in fence_ranges):
@@ -332,7 +405,7 @@ def extract_tool_call(
         while position < len(text):
             try:
                 obj, end = decoder.raw_decode(text, position)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return None, text
             if (not isinstance(obj, dict) or set(obj) != {"name", "arguments"}
                     or not isinstance(obj["name"], str) or obj["name"] not in tool_names
@@ -372,14 +445,14 @@ def extract_tool_call(
 
     parsed = []
     spans = []
-    for match in re.finditer(r"(?im)^[ \t]*do:[ \t]*", text):
+    for match in re.finditer(r"(?im)^ {0,3}do:[ \t]*", text):
         if any(start <= match.start() < end for start, end in fence_ranges):
             continue
         if spans and match.start() < spans[-1][1]:
             continue
         try:
             obj, end = decoder.raw_decode(text, match.end())
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             continue
         line_end = text.find("\n", end)
         if line_end < 0:
@@ -402,14 +475,20 @@ def extract_tool_call(
         remainder = "".join(segments)
         return _validate_tool_calls(parsed, tools), remainder if remainder.strip() else ""
 
-    # 尝试 DSML 解析
-    tool_calls, cleaned = parse_dsml_tool_calls(text, tool_names)
+    # DSML XML 路径不带行首缩进限制：只要 DSML 标记落在代码区内，就整体按文本处理，避免执行示例
+    for _marker in re.finditer(r"(?i)<\s*[|｜]{1,2}\s*DSML\s*[|｜]{1,2}|<invoke\b|<tool_calls?\b", text):
+        if any(start <= _marker.start() < end for start, end in fence_ranges):
+            return None, clean_tool_text(text)
+
+    # 尝试 DSML 解析（按声明的参数类型保留字符串原值）
+    string_keys = _declared_string_keys(tools)
+    tool_calls, cleaned = parse_dsml_tool_calls(text, tool_names, string_keys)
 
     # 如果 DSML 解析失败，尝试 CDATA 修复后再试
     if not tool_calls:
         repaired = sanitize_loose_cdata(text)
         if repaired != text:
-            tool_calls, cleaned = parse_dsml_tool_calls(repaired, tool_names)
+            tool_calls, cleaned = parse_dsml_tool_calls(repaired, tool_names, string_keys)
 
     if tool_calls:
         # 标准化为 OpenAI 格式
@@ -573,6 +652,7 @@ def convert_messages_for_deepseek(messages, tools=None, passthrough=False, tool_
             last_role = "assistant"
         elif role == "tool":
             result = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            result = escape_session_markers(result)
             call_id = msg.get("tool_call_id", "")
             payload = json.dumps({"tool_call_id": call_id, "content": result}, ensure_ascii=False)
             parts.append(TOOL + payload + TOOL_END)

@@ -1,6 +1,8 @@
 import base64
 import os
 import random
+import threading
+from collections import deque
 from typing import Dict
 
 _IOS_UAS = [
@@ -33,5 +35,23 @@ def random_ios_headers(locale: str = "zh_CN") -> Dict[str, str]:
     return _random_ios_headers(locale)
 
 
+_recent_device_ids: "deque" = deque(maxlen=400)
+_recent_lock = threading.Lock()
+
+
 def new_device_id() -> str:
+    """生成 device_id：优先取仓库内置的真实指纹池（与上游真实客户端格式一致），池不可用时回退随机 base64。
+
+    近期已发放的 id 会被排除，避免短时间内重复；池耗尽时 get_device_id 自行回退随机值。
+    """
+    try:
+        from app.device_ids import get_device_id
+
+        with _recent_lock:  # 选号与登记放在同一临界区，避免并发拿到同一 id
+            value = get_device_id(exclude=set(_recent_device_ids))
+            if isinstance(value, str) and value:
+                _recent_device_ids.append(value)  # 有界队列自动淘汰最旧，避免整批清空后立刻复用
+                return value
+    except Exception:
+        pass
     return base64.b64encode(os.urandom(32)).decode()

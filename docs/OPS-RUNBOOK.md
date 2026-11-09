@@ -18,27 +18,18 @@ Global `app/lock_guard.upstream_slot()` throttles chat.deepseek.com calls:
 |-----|---------|---------|
 | `DEEPSEEK_MIN_INTERVAL_SEC` | **2.5** | min seconds between upstream chat starts |
 | `DEEPSEEK_MAX_CONCURRENT` | **1** | max concurrent upstream chat calls |
+| `DEEPSEEK_PROXY_API_KEY` | *(empty)* | Bearer/x-api-key for `/v1`; **empty = no auth** |
+| `DEEPSEEK_SLOT_WAIT_TIMEOUT_SEC` | **600** | max wait for the global upstream slot |
+| `DS_STREAM_IDLE_TIMEOUT` | **300** | upstream read-idle timeout (total duration stays unlimited) |
 | `DEEPSEEK_ERROR_COOLDOWN_SEC` | **60** | per-account cooldown after non-mute HTTP errors |
 
 These defaults prioritize mute-risk reduction over throughput. Multi-account pools still share one global gate. Raise interval / keep concurrency=1 if accounts still mute; set `DEEPSEEK_MAX_CONCURRENT>1` only if you accept higher risk.
 
-## Email register risk control (issue #31)
+## Email register (removed in v2.5.0)
 
-`biz_code=11 RISK_DEVICE_DETECTED` is DeepSeek device risk at `/auth-api/v0/users/register`, not a wrong verification code.
+The built-in email/batch registration flow was removed together with `app/registrar.py`; there are no `/api/register*` routes and no registration panel in the admin UI. Import existing accounts instead (cURL/token import), and configure `DEEPSEEK_PROXY_API_KEY` plus HTTPS before exposing the service.
 
-What the bridge does now:
-
-1. Surfaces `biz_code` / `biz_msg` clearly (no more false “注册响应中无 token” for this case).
-2. Uses the **same iOS fingerprint family** for send-code and register (no web→ios flip).
-3. Burns `device_id` on risk reject, rotates, re-sends code, retries **once**.
-4. Logs `proxy=on|OFF` and device_id prefix per account.
-5. Appends local private ids via `DEEPSEEK_DEVICE_IDS_FILE` (one id per line).
-
-What you must do:
-
-- Configure a **clean overseas residential proxy** (admin → 设置 → 代理配置). Datacenter IPs often stay on 11.
-- Do not expect the public `device_ids.py` pool to stay healthy — it is shared across every fork.
-- This does **not** guarantee registration success; upstream risk policy moves.
+`device_ids.py` is still used as the device-identity pool for logins (see `app/identity.py`), so keep it healthy: it is shared across every fork.
 
 ## What this does **not** do
 
@@ -54,7 +45,7 @@ python -u start_bridge8000.py
 
 - API: `http://127.0.0.1:8000/v1`
 - Admin: `http://127.0.0.1:8000/admin` (Basic Auth — configure locally)
-- Optional env: `DEEPSEEK_BRIDGE_PYTHON`, `DEEPSEEK_BRIDGE_ADMIN`, `DEEPSEEK_MIN_INTERVAL_SEC`, `DEEPSEEK_MAX_CONCURRENT`, `DEEPSEEK_ERROR_COOLDOWN_SEC`
+- Optional env: `DEEPSEEK_BRIDGE_PYTHON`, `DEEPSEEK_BRIDGE_ADMIN`, `DEEPSEEK_MIN_INTERVAL_SEC`, `DEEPSEEK_MAX_CONCURRENT`, `DEEPSEEK_ERROR_COOLDOWN_SEC`, `DEEPSEEK_PROXY_API_KEY`, `DEEPSEEK_SLOT_WAIT_TIMEOUT_SEC`, `DS_STREAM_IDLE_TIMEOUT`
 
 ## When chat returns empty / 403
 

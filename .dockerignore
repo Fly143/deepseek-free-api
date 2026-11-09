@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 .git/
 config.json
+.secret_key
+*.bak
+data-gym-cache/
+.venv/
 .anthropic_batches/
 usage.json
 responses.json

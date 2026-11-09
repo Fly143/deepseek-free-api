@@ -23,3 +23,5 @@ _*.py
 proxy.py.bak*
 *.out.log
 *.err.log
+data-gym-cache/
+

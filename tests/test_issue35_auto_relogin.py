@@ -126,27 +126,21 @@ class Issue35AutoReloginTest(unittest.TestCase):
     def _chat(self, body):
         return asyncio.run(proxy.chat(_FakeRequest(body)))
 
-    def test_1_nonstream_relogin_retry(self):
-        """非流式：SSE 登出错误 → 自动重登 → 重试成功"""
+    def test_1_nonstream_no_relogin_or_retry(self):
         _seed_account("test@example.com")
         calls = []
         proxy.cffi_requests.post = _make_fake_post(calls)
-
-        result = self._chat({"model": "deepseek-default",
-                             "messages": [{"role": "user", "content": "hi"}],
-                             "stream": False})
-        self.assertIsInstance(result, proxy.JSONResponse)
-        self.assertEqual(sum(1 for c in calls if c.endswith("/chat/completion")), 2,
-                         f"重试未发生: {calls}")
-        self.assertTrue(any(c.endswith("/users/login") for c in calls), "自动重登未发生")
+        with self.assertRaises(proxy.HTTPException):
+            self._chat({"model": "deepseek-default", "messages": [{"role": "user", "content": "hi"}], "stream": False})
+        self.assertEqual(sum(1 for c in calls if c.endswith("/chat/completion")), 1)
+        self.assertFalse(any(c.endswith("/users/login") for c in calls))
         acc = proxy.config_manager.get_account_by_label("test@example.com")
-        self.assertEqual(acc.token, "T2")
-        self.assertEqual(acc.session_id, "S2")
+        self.assertEqual(acc.token, "OLD")
+        self.assertEqual(acc.session_id, "OLD_SID")
         self.assertTrue(acc.is_valid)
-        self.assertEqual(session_store.get_current_session_id("test@example.com"), "S2")
+        self.assertGreater(acc.cooldown_until, time.time())
 
-    def test_2_stream_relogin_retry(self):
-        """流式：SSE 登出错误 → 自动重登 → 流式重试成功"""
+    def test_2_stream_no_relogin_or_retry(self):
         _seed_account("s@example.com")
         calls = []
         proxy.cffi_requests.post = _make_fake_post(calls)
@@ -156,19 +150,18 @@ class Issue35AutoReloginTest(unittest.TestCase):
                 "model": "deepseek-default",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": True}))
-            chunks = []
-            async for c in result.body_iterator:
-                chunks.append(c)
-            return result, chunks
+            return result, [c async for c in result.body_iterator]
 
         result, chunks = asyncio.run(run())
         self.assertIsInstance(result, proxy.StreamingResponse)
-        self.assertEqual(sum(1 for c in calls if c.endswith("/chat/completion")), 2,
-                         f"重试未发生: {calls}")
+        self.assertTrue(any("error" in chunk for chunk in chunks))
+        self.assertEqual(sum(1 for c in calls if c.endswith("/chat/completion")), 1)
+        self.assertFalse(any(c.endswith("/users/login") for c in calls))
         acc = proxy.config_manager.get_account_by_label("s@example.com")
-        self.assertEqual(acc.token, "T2")
-        self.assertEqual(acc.session_id, "S2")
+        self.assertEqual(acc.token, "OLD")
+        self.assertEqual(acc.session_id, "OLD_SID")
         self.assertTrue(acc.is_valid)
+        self.assertGreater(acc.cooldown_until, time.time())
 
     def test_3_relogin_failure_cooldown(self):
         """重登失败：账号进入冷却（保持 is_valid）而非永久 invalid"""

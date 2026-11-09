@@ -285,7 +285,7 @@ def convert_response(
         content_blocks.extend(_reasoning_to_thinking(reasoning))
 
     # 2. Text block
-    text = content.strip()
+    text = content
     if tool_calls:
         # 有工具调用时，可能也有文本
         if text:
